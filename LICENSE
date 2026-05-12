@@ -1,0 +1,51 @@
+zhac-components — Mixed-license component collection
+
+This repository contains ten ESP-IDF components with a deliberate
+mixed-license layout. Each component directory carries its own
+authoritative `LICENSE` file, and every source file carries an
+`SPDX-License-Identifier:` header.
+
+| Component        | License              | SPDX                |
+|------------------|----------------------|---------------------|
+| zap_common       | Apache License 2.0   | Apache-2.0          |
+| metrics          | Apache License 2.0   | Apache-2.0          |
+| event_bus        | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| hap_protocol     | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| hap_session      | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| hap_json         | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| device_shadow    | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| device_backend   | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| zap_store        | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+| zhc_adapter      | GNU AGPL v3 or later | AGPL-3.0-or-later   |
+
+Canonical license texts live in `LICENSES/`:
+
+- `LICENSES/Apache-2.0.txt`
+- `LICENSES/AGPL-3.0-or-later.txt`
+
+Rationale for the split:
+
+- `zap_common` + `metrics` are portable utilities reused by
+  `embedded-zhc` (also Apache-2.0) and are valuable as a standalone
+  library outside ZHAC. Keeping them permissive preserves that
+  reusability.
+- Everything else is tightly coupled to ZHAC's architecture
+  (HAP wire format, device-shadow persistence, the ZHC bridge)
+  and carries ZHAC's copyleft terms.
+
+Compatibility: Apache-2.0 code can be combined with AGPL-3.0-or-later
+code. A firmware build that links both Apache and AGPL components is
+distributed as a combined work under AGPL-3.0-or-later. The Apache
+components remain Apache-2.0 when used in isolation.
+
+Copyright © 2025–2026 Evgenij Cjura and project contributors.
+
+---
+
+Contributions are accepted only under the Contributor License
+Agreement in `CLA.md`, which grants the project maintainer the
+right to sublicense contributed work under alternative terms —
+including proprietary licenses — for commercial offerings of ZHAC.
+
+"ZHAC" and associated names, logos, and marks are not covered by
+any of the licenses above.

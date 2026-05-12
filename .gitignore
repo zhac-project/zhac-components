@@ -1,0 +1,13 @@
+build/
+build_*/
+node_modules/
+dist/
+.vscode/
+.cache/
+*.o
+*.obj
+*.elf
+*.bin
+managed_components/
+sdkconfig.old
+dependencies.lock

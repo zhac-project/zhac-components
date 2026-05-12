@@ -1,0 +1,52 @@
+zhac-components — Shared ESP-IDF components for ZHAC
+Copyright © 2025–2026 Evgenij Cjura and project contributors.
+
+Per-component licensing is documented in `LICENSE`, in each
+component's own `LICENSE` file, and via SPDX headers on every source
+file. Components are a mix of Apache-2.0, AGPL-3.0-or-later, and
+MIT (vendored `arduinojson`).
+
+================================================================================
+Trademarks
+================================================================================
+
+"ZHAC" and any associated logos, product names, and marks are the
+exclusive property of the project maintainer. The licenses that
+govern this code DO NOT grant any right to use these names or marks.
+Forks and derivative works must choose a different product name and
+branding.
+
+================================================================================
+Third-party components vendored in this repository
+================================================================================
+
+1. ArduinoJson — components/arduinojson/
+   Copyright © 2014-2024 Benoit BLANCHON
+   Licensed under the MIT License.
+   Upstream: https://github.com/bblanchon/ArduinoJson
+   See components/arduinojson/LICENSE
+
+   ArduinoJson is a header-only JSON parser/serializer used by the
+   `hap_json` component. Vendored here so that consumers of
+   `hap_json` (any firmware that pulls it from zhac-components) do
+   not need to re-fetch it separately.
+
+================================================================================
+Third-party dependencies pulled at build time (not vendored)
+================================================================================
+
+- ESP-IDF v6.0 — Apache License 2.0 (Espressif Systems). Components
+  link against the ESP-IDF framework headers.
+- FreeRTOS — MIT License (Amazon Web Services, Inc.). Used by
+  `event_bus`, `device_shadow`, `zap_store`.
+
+================================================================================
+License compatibility
+================================================================================
+
+The MIT-licensed `arduinojson` is compatible with both Apache-2.0 and
+AGPL-3.0-or-later. The Apache-2.0 components (`zap_common`,
+`metrics`) are compatible with the AGPL-3.0-or-later ones in a
+combined firmware build: the combined work is distributed under
+AGPL-3.0-or-later; each upstream component retains its own license
+when used in isolation.

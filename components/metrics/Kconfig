@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: Apache-2.0
+menu "Metrics engine"
+
+config METRICS_ENABLED
+    bool "Enable metrics engine"
+    default y
+    help
+        Master switch. When n, all _METRIC_* macros compile to no-ops
+        and the metrics namespace provides empty stub implementations.
+
+config METRICS_NUM_SHARDS
+    int "Per-core shard count"
+    depends on METRICS_ENABLED
+    default 2
+    range 1 4
+    help
+        One atomic shard per slot avoids cross-core contention. Default
+        covers both P4 and S3 (both are 2-core). Keep small; exporters
+        aggregate shards on read.
+
+config METRICS_ENABLE_MEMORY_METRICS
+    bool "Record heap snapshot metrics"
+    depends on METRICS_ENABLED
+    default y
+
+config METRICS_ENABLE_TEXT_DUMP
+    bool "Enable human-readable metrics dump"
+    depends on METRICS_ENABLED
+    default y
+
+config METRICS_ENABLE_PROMETHEUS_EXPORTER
+    bool "Enable Prometheus text exporter"
+    depends on METRICS_ENABLED
+    default y
+    help
+        Pure formatter — bounded-buffer writer, no heap, no transport.
+        Needed on P4 too since the S3 pulls P4's Prometheus blob via
+        METRICS_REQ / METRICS_RSP for cross-chip /metrics merge.
+
+config METRICS_ENABLE_MQTT_EXPORTER
+    bool "Enable MQTT JSON exporter"
+    depends on METRICS_ENABLED
+    default y if IDF_TARGET_ESP32S3
+    default n
+
+config METRICS_EXPORT_PREFIX
+    string "Prometheus metric name prefix"
+    depends on METRICS_ENABLED
+    default "zhac"
+
+config METRICS_MQTT_INTERVAL_S
+    int "MQTT snapshot publish interval (seconds)"
+    depends on METRICS_ENABLED && METRICS_ENABLE_MQTT_EXPORTER
+    default 60
+    range 10 3600
+
+endmenu

@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: Apache-2.0
+// X-macro metric registry. Included multiple times with different
+// expansions of METRIC_TIMER / METRIC_COUNTER / METRIC_VALUE.
+//
+// Add entries in groups (shared first, then per-chip). The X-macro
+// drives both the MetricId enum and the descriptor table; order here
+// is the enum ordinal order — keep stable.
+//
+// Entries added in later phases land here too.
+
+// ── shared (both chips) ─────────────────────────────────────────────
+METRIC_VALUE(METRIC_HEAP_FREE_BYTES,          "heap_free_bytes",          "Free heap bytes")
+METRIC_VALUE(METRIC_HEAP_MIN_FREE_BYTES,      "heap_min_free_bytes",      "Min-ever free heap bytes")
+METRIC_VALUE(METRIC_HEAP_LARGEST_FREE_BLOCK,  "heap_largest_free_block",  "Largest free heap block bytes")
+METRIC_VALUE(METRIC_HEAP_INTERNAL_FREE_BYTES, "heap_internal_free_bytes", "Free internal heap bytes")
+#if CONFIG_SPIRAM
+METRIC_VALUE(METRIC_HEAP_SPIRAM_FREE_BYTES,   "heap_spiram_free_bytes",   "Free SPIRAM bytes")
+#endif
+
+METRIC_TIMER(METRIC_HAP_RX_HANDLE,            "hap_rx_handle",            "HAP frame RX handle duration")
+METRIC_COUNTER(METRIC_HAP_RX_FRAMES_TOTAL,    "hap_rx_frames_total",      "HAP frames received")
+METRIC_COUNTER(METRIC_HAP_TX_FRAMES_TOTAL,    "hap_tx_frames_total",      "HAP frames transmitted")
+METRIC_COUNTER(METRIC_HAP_CRC_ERRORS,         "hap_crc_errors_total",     "HAP CRC mismatches on RX")
+METRIC_COUNTER(METRIC_HAP_BAD_MAGIC,          "hap_bad_magic_total",      "HAP frames with bad preamble")
+METRIC_COUNTER(METRIC_HAP_VERSION_MISMATCH,   "hap_version_mismatch_total","HAP version-mismatch frames")
+METRIC_COUNTER(METRIC_HAP_TRUNCATED,          "hap_truncated_total",      "HAP frames truncated mid-decode")
+METRIC_COUNTER(METRIC_HAP_TX_DROPS,           "hap_tx_drops_total",       "HAP TX queue full drops (P4 slave)")
+METRIC_COUNTER(METRIC_HAP_RETX,               "hap_retx_total",           "HAP frames retransmitted by session layer")
+METRIC_COUNTER(METRIC_HAP_WINDOW_FULL,        "hap_window_full_total",    "HAP session window-full drops")
+METRIC_COUNTER(METRIC_HAP_LINK_DEAD,          "hap_link_dead_total",      "HAP link-dead transitions (3 retx fails)")
+METRIC_COUNTER(METRIC_HAP_SYNC_ATTEMPTS,      "hap_sync_attempts_total",  "HAP SYNC frames issued at boot/recovery")
+METRIC_COUNTER(METRIC_HAP_DUP_SEQ,            "hap_dup_seq_total",        "HAP duplicate-seq frames suppressed")
+METRIC_COUNTER(METRIC_HAP_RESYNC_BYTES,       "hap_resync_bytes_total",   "HAP bytes skipped during stream resync")
+METRIC_COUNTER(METRIC_HAP_MUTEX_TIMEOUT,      "hap_mutex_timeout_total",  "S3 SPI mutex 50ms timeouts")
+METRIC_COUNTER(METRIC_HAP_HDR_CRC_ERRORS,     "hap_hdr_crc_errors_total", "HAP v3 header-CRC8 mismatches")
+
+// ── P4-origin (compiled on both chips; S3 never records to them) ────
+// Gating these behind #if CONFIG_IDF_TARGET_ESP32P4 is tempting but
+// fragile under preprocessor-caching quirks during incremental
+// builds. Keeping them always-defined costs ~400 B of shard RAM on
+// S3 and emits zero-sample gauges in S3's /metrics output — a small
+// price for build robustness. P4's `zhac_p4_*` prefix keeps the
+// scrape output unambiguous even if the S3 path ever records.
+METRIC_TIMER(METRIC_ZHC_DECODE,               "zhc_decode",               "zhc_adapter try_decode duration")
+METRIC_TIMER(METRIC_ZNP_CALL,                 "znp_call",                 "ZNP SREQ→SRSP duration")
+METRIC_TIMER(METRIC_SHADOW_PROCESS,           "shadow_process",           "device_shadow process duration")
+
+METRIC_COUNTER(METRIC_ZB_RX_FRAMES_TOTAL,     "zb_rx_frames_total",       "Zigbee frames delivered to decoder")
+METRIC_COUNTER(METRIC_ZHC_UNHANDLED_TOTAL,    "zhc_unhandled_total",      "Zigbee frames with no converter match")
+METRIC_COUNTER(METRIC_ZNP_TIMEOUTS_TOTAL,     "znp_timeouts_total",       "ZNP SRSP timeouts")
+METRIC_COUNTER(METRIC_ADAPTER_CACHE_HIT,      "adapter_cache_hit_total",  "zhc_adapter per-ieee def cache hit")
+METRIC_COUNTER(METRIC_ADAPTER_CACHE_MISS,     "adapter_cache_miss_total", "zhc_adapter per-ieee def cache miss")
+
+// Lua engine — defined on both chips (see P4-only note above for the
+// always-defined rationale).
+METRIC_VALUE(METRIC_LUA_HEAP_USED_BYTES,      "lua_heap_used_bytes",      "Lua VM heap live bytes")
+METRIC_VALUE(METRIC_LUA_HEAP_PEAK_BYTES,      "lua_heap_peak_bytes",      "Lua VM heap peak watermark")
+METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE,      "lua_coroutines_live",      "Lua live coroutine count")
+METRIC_COUNTER(METRIC_LUA_ERRORS_TOTAL,       "lua_errors_total",         "Lua coroutine errors")
+METRIC_COUNTER(METRIC_LUA_YIELDS_TOTAL,       "lua_yields_total",         "Lua coroutine yields")
+METRIC_COUNTER(METRIC_LUA_QUEUE_DROPS_TOTAL,  "lua_queue_drops_total",    "Resume-queue sends dropped (queue full)")
