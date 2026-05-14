@@ -89,41 +89,56 @@ bool cron_parse(const char* expr, CronExpr& out) {
     strncpy(buf, expr, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    // Split into exactly 5 fields by whitespace
-    const char* fields[5] = {};
+    // Split into up to 6 fields by whitespace; accept 5 or 6.
+    const char* fields[6] = {};
     char* p = buf;
     int n = 0;
-    while (*p && n < 5) {
+    while (*p && n < 6) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
         fields[n++] = p;
         while (*p && *p != ' ' && *p != '\t') p++;
         if (*p) *p++ = '\0';
     }
-    if (n != 5) return false;
+    if (n != 5 && n != 6) return false;
+    // Reject stray trailing tokens (7+ fields).
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return false;
 
+    // 5-field form fires at second 0 of each matched minute (legacy
+    // minute-resolution behaviour). 6-field form: first field is
+    // seconds 0–59.
+    const bool has_sec = (n == 6);
+    int idx = 0;
     uint64_t bits = 0;
 
+    if (has_sec) {
+        if (!parse_field(fields[idx++], 0, 59, &bits)) return false;
+        out.second_bits = bits;
+    } else {
+        out.second_bits = 1ULL << 0;
+    }
+
     // minute: 0–59
-    if (!parse_field(fields[0], 0, 59, &bits)) return false;
+    if (!parse_field(fields[idx++], 0, 59, &bits)) return false;
     out.minute_bits = bits;
 
     // hour: 0–23
-    if (!parse_field(fields[1], 0, 23, &bits)) return false;
+    if (!parse_field(fields[idx++], 0, 23, &bits)) return false;
     out.hour_bits = (uint32_t)bits;
 
     // day-of-month: 1–31 (bit 1 = 1st). Track `*` for OR semantics.
     bool dom_star = false;
-    if (!parse_field(fields[2], 1, 31, &bits, &dom_star)) return false;
+    if (!parse_field(fields[idx++], 1, 31, &bits, &dom_star)) return false;
     out.day_bits = (uint32_t)bits;
 
     // month: 1–12 (bit 1 = January)
-    if (!parse_field(fields[3], 1, 12, &bits)) return false;
+    if (!parse_field(fields[idx++], 1, 12, &bits)) return false;
     out.month_bits = (uint16_t)bits;
 
     // day-of-week: 0–6 (0 = Sunday). Track `*` for OR semantics.
     bool dow_star = false;
-    if (!parse_field(fields[4], 0, 6, &bits, &dow_star)) return false;
+    if (!parse_field(fields[idx++], 0, 6, &bits, &dow_star)) return false;
     out.wday_bits = (uint8_t)bits;
 
     out.flags = (uint8_t)((dom_star ? CRON_FLAG_DOM_STAR : 0) |
@@ -135,12 +150,15 @@ bool cron_matches(const CronExpr& expr, time_t t) {
     struct tm tm_val{};
     localtime_r(&t, &tm_val);
 
+    int second = tm_val.tm_sec;       // 0–59 (60/61 in leap-sec ticks → ignore)
     int minute = tm_val.tm_min;       // 0–59
     int hour   = tm_val.tm_hour;      // 0–23
     int day    = tm_val.tm_mday;      // 1–31
     int month  = tm_val.tm_mon + 1;   // 1–12
     int wday   = tm_val.tm_wday;      // 0–6 (Sunday = 0)
 
+    if (second > 59) second = 59;     // clamp leap seconds to last regular slot
+    if (!(expr.second_bits & (1ULL << second))) return false;
     if (!(expr.minute_bits & (1ULL << minute))) return false;
     if (!(expr.hour_bits   & (1UL  << hour)))   return false;
     if (!(expr.month_bits  & (1U   << month)))   return false;
@@ -163,8 +181,10 @@ bool cron_matches(const CronExpr& expr, time_t t) {
 }
 
 time_t cron_next(const CronExpr& expr, time_t from_t) {
-    // Start at the next full minute strictly after from_t
-    time_t t = ((from_t / 60) + 1) * 60;
+    // Start at the next second strictly after from_t. For the legacy
+    // 5-field form `second_bits == bit 0`, so the minute-resolution
+    // logic below still selects only :00 second slots.
+    time_t t = from_t + 1;
     const time_t limit = from_t + (time_t)4 * 365 * 24 * 3600;
 
     struct tm tm_val{};
@@ -219,10 +239,18 @@ time_t cron_next(const CronExpr& expr, time_t from_t) {
             continue;
         }
 
-        // Check minute; if wrong, advance by one minute
+        // Check minute; if wrong, advance to top of next minute
         int minute = tm_val.tm_min;
         if (!(expr.minute_bits & (1ULL << minute))) {
-            t += 60;
+            t += (60 - tm_val.tm_sec);  // jump to :00 of next minute
+            continue;
+        }
+
+        // Check second (always — defaults to bit 0 for 5-field form).
+        int second = tm_val.tm_sec;
+        if (second > 59) second = 59;
+        if (!(expr.second_bits & (1ULL << second))) {
+            t += 1;
             continue;
         }
 

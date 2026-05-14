@@ -201,3 +201,60 @@ TEST_CASE("cron: month field filters correctly", "[cron_parser]") {
     TEST_ASSERT_TRUE (cron_matches(e, t_match));
     TEST_ASSERT_FALSE(cron_matches(e, t_miss));
 }
+
+// ── 6-field cron with seconds ────────────────────────────────────────
+
+static time_t make_time_s(int year, int mon, int mday, int hour, int min, int sec) {
+    struct tm t{};
+    t.tm_year = year - 1900;
+    t.tm_mon  = mon - 1;
+    t.tm_mday = mday;
+    t.tm_hour = hour;
+    t.tm_min  = min;
+    t.tm_sec  = sec;
+    t.tm_isdst = -1;
+    return mktime(&t);
+}
+
+TEST_CASE("cron: 5-field form fires only at second :00", "[cron_parser]") {
+    CronExpr e{};
+    TEST_ASSERT_TRUE(cron_parse("* * * * *", e));
+    TEST_ASSERT_EQUAL_UINT64(1ULL << 0, e.second_bits);
+    TEST_ASSERT_TRUE (cron_matches(e, make_time_s(2025, 1, 1, 10, 0,  0)));
+    TEST_ASSERT_FALSE(cron_matches(e, make_time_s(2025, 1, 1, 10, 0, 17)));
+}
+
+TEST_CASE("cron: 6-field */5 * * * * * fires every 5 seconds", "[cron_parser]") {
+    CronExpr e{};
+    TEST_ASSERT_TRUE(cron_parse("*/5 * * * * *", e));
+    for (int s = 0; s < 60; s++) {
+        bool expect = (s % 5 == 0);
+        bool got    = (e.second_bits >> s) & 1;
+        TEST_ASSERT_EQUAL(expect, got);
+    }
+    TEST_ASSERT_TRUE (cron_matches(e, make_time_s(2025, 1, 1, 10, 0,  0)));
+    TEST_ASSERT_TRUE (cron_matches(e, make_time_s(2025, 1, 1, 10, 0,  5)));
+    TEST_ASSERT_TRUE (cron_matches(e, make_time_s(2025, 1, 1, 10, 0, 55)));
+    TEST_ASSERT_FALSE(cron_matches(e, make_time_s(2025, 1, 1, 10, 0,  3)));
+}
+
+TEST_CASE("cron: 6-field 30 0 8 * * 1-5 fires Mon-Fri at 08:00:30", "[cron_parser]") {
+    CronExpr e{};
+    TEST_ASSERT_TRUE(cron_parse("30 0 8 * * 1-5", e));
+    // 2025-01-06 is Monday.
+    TEST_ASSERT_TRUE (cron_matches(e, make_time_s(2025, 1, 6, 8, 0, 30)));
+    TEST_ASSERT_FALSE(cron_matches(e, make_time_s(2025, 1, 6, 8, 0,  0)));
+    TEST_ASSERT_FALSE(cron_matches(e, make_time_s(2025, 1, 6, 8, 0, 31)));
+    // 2025-01-04 is Saturday — should miss.
+    TEST_ASSERT_FALSE(cron_matches(e, make_time_s(2025, 1, 4, 8, 0, 30)));
+}
+
+TEST_CASE("cron: 7-field input is rejected", "[cron_parser]") {
+    CronExpr e{};
+    TEST_ASSERT_FALSE(cron_parse("0 0 0 1 1 1 2025", e));
+}
+
+TEST_CASE("cron: 4-field input is rejected", "[cron_parser]") {
+    CronExpr e{};
+    TEST_ASSERT_FALSE(cron_parse("* * * *", e));
+}

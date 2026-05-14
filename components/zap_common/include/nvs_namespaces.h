@@ -40,12 +40,12 @@ inline constexpr const char* SHADOW         = "zap_shadow";
 inline constexpr uint8_t     SHADOW_VERSION = 6;
 
 // Zigbee coordinator config (channel, network key, panid). Wiped on
-// `zigbee_factory_reset` from `zhac-main-core/main/main.cpp`.
+// `zigbee_factory_reset` from `firmware/p4_core/main/main.cpp`.
 inline constexpr const char* ZIGBEE_CFG     = "zigbee_cfg";
 
 // ── S3 system / network ─────────────────────────────────────────────
 // Misc system flags + the API token. Auth-token rotation goes
-// through `auth_rotate_token()` in `zhac-net-core/main/main.cpp`
+// through `auth_rotate_token()` in `firmware/s3_core/main/main.cpp`
 // (CC-F8 in docs/FINDINGS.md).
 inline constexpr const char* SYS_CFG        = "sys_cfg";
 
@@ -64,7 +64,7 @@ inline constexpr const char* WIFI_CFG       = "wifi_cfg";
 
 // Log sinks: WS-streaming on/off + level, MQTT-streaming on/off +
 // level. Default off after the contention-bug fix described in
-// `zhac-net-core/main/log_ring.cpp`.
+// `firmware/s3_core/main/log_ring.cpp`.
 inline constexpr const char* LOG_CFG        = "log_cfg";
 
 // ── Misc / per-feature opt-in ───────────────────────────────────────

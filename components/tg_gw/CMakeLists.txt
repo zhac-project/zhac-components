@@ -9,5 +9,5 @@ endif()
 idf_component_register(
     SRCS         ${srcs}
     INCLUDE_DIRS "include"
-    REQUIRES     hap_protocol hap_json hap_session esp_http_client nvs_flash mbedtls
+    REQUIRES     hap_protocol hap_json hap_session zap_common esp_http_client nvs_flash mbedtls
 )

@@ -196,11 +196,26 @@ static void task_identity(void*) {
         // Write back match outcome and hand configure off to the deferred
         // queue. The queue dedups on ConfigureState::DONE so a device that
         // was already configured on a prior boot won't be re-bound.
+        // Pin power_source from the matched def's override when set.
+        // z2m mirror: `m.forcePowerSource({powerSource: ...})`. Today
+        // the regular Basic 0x0007 read isn't parsed into ZapDevice
+        // (see follow-up: extend zigbee_parse_basic_identity), so the
+        // override is currently the only way `dev->power_source` gets
+        // a non-zero value. Devices without an override stay at 0
+        // (unknown) until the parse-side follow-up lands.
+        const uint8_t ps_override = supported
+            ? zhac_adapter_power_source_override(snap.model_id,
+                                                  snap.manufacturer_name)
+            : 0;
+
         bool enqueue = false;
         zigbee_pool_lock();
         ZapDevice* d3 = pool_find_by_ieee(ieee);
         if (d3) {
             d3->support_state = new_support;
+            if (ps_override != 0 && d3->power_source != ps_override) {
+                d3->power_source = ps_override;
+            }
             if (supported && d3->configure_state != (uint8_t)ConfigureState::DONE) {
                 d3->configure_state    = (uint8_t)ConfigureState::PENDING;
                 d3->configure_attempts = 0;

@@ -423,22 +423,30 @@ static void dispatch_event(const Event& ev) {
 // ── Cron task ─────────────────────────────────────────────────────────────
 
 static void task_cron(void*) {
-    // Align to next minute boundary
-    time_t now = time(nullptr);
-    uint32_t secs_into_min = (uint32_t)(now % 60);
-    if (secs_into_min > 0)
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)(60 - secs_into_min) * 1000u));
+    // The parser now accepts an optional 6th field (seconds), so the
+    // firing loop ticks once per second instead of once per minute.
+    // Legacy 5-field rules still fire only at second :00 of the
+    // matched minute because cron_parse sets second_bits = bit 0 for
+    // that form. The match check is a handful of bit-ANDs per rule.
+    time_t last_evaluated = 0;  // dedupe so wall-clock skew can't fire a rule twice in one second
 
     for (;;) {
-        now = time(nullptr);
+        time_t now = time(nullptr);
+        if (now == last_evaluated) {
+            // Sub-second drift landed us in the same wall-clock second
+            // we already evaluated. Sleep a fraction and retry rather
+            // than firing twice.
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        last_evaluated = now;
+
         // Same snapshot-then-exec pattern as dispatch_event (LUA-F8):
         // collect the firing cron rules under a timeout-bounded lock,
-        // then drop the lock before action dispatch. Cron has at most
-        // one execution per minute per rule so 16 simultaneous matches
-        // is a generous cap.
+        // then drop the lock before action dispatch.
         if (xSemaphoreTakeRecursive(s_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(TAG, "task_cron: s_mutex contended >2s — minute skipped");
-            vTaskDelay(pdMS_TO_TICKS(60000));
+            ESP_LOGW(TAG, "task_cron: s_mutex contended >2s — tick skipped");
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
         static constexpr uint8_t MAX_CRON_FIRES = 16;
@@ -468,7 +476,9 @@ static void task_cron(void*) {
             xSemaphoreGiveRecursive(s_mutex);
             if (live) execute_rule(snap, "", nullptr);
         }
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        // Sleep ~1 s, but resync to the next wall-clock second so a
+        // drifted RTC adjustment doesn't shift the firing offset.
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -601,6 +611,15 @@ bool simple_rules_enable(uint16_t rule_id, bool enabled) {
     for (uint16_t i = 0; i < s_rule_count; i++) {
         if (s_rules[i].rule_id == rule_id) {
             s_rules[i].enabled = enabled;
+            // Re-resolve the device-name → IEEE binding here. The
+            // initial resolution happens at reload_locked time, but if
+            // the device pool changes afterwards (device re-paired, or
+            // the pool wasn't populated yet at boot), t.ieee can stay
+            // bound to a stale IEEE and the matcher silently drops
+            // every event. The user-visible recovery was previously a
+            // DSL re-save; making enable refresh bindings means a
+            // disable/enable toggle alone is enough to recover.
+            if (enabled) simple_rules_resolve_names(&s_rules[i], 1);
             break;
         }
     }

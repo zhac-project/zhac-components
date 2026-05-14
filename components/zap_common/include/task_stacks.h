@@ -22,7 +22,7 @@ inline constexpr uint32_t kButtons      = 2048;
 inline constexpr uint32_t kHapBench     = 4096;
 
 // ── P4 component tasks ─────────────────────────────────────────────
-inline constexpr uint32_t kHapSlave     = 6144;
+inline constexpr uint32_t kHapSlave     = 8192;
 inline constexpr uint32_t kRuleFlush    = 6144;   // NVS commit + ESP_LOGI
 inline constexpr uint32_t kZapFlush     = 6144;   // ditto — observed free=136B at 3072
 inline constexpr uint32_t kZbIdentity   = 4096;
@@ -31,7 +31,12 @@ inline constexpr uint32_t kZbInterview  = 8192;
 inline constexpr uint32_t kZclAttr      = 8192;
 inline constexpr uint32_t kZnpWorker    = 4096;
 inline constexpr uint32_t kZnpRx        = 4096;
-inline constexpr uint32_t kRuleCron     = 4096;
+// rule_cron: the per-second cron tick path can chain into
+// execute_rule → on_script_run → lua_scheduler_push_run_named, which
+// stack-allocates a full LuaMsg (~256 B union of payload/named).
+// 4 KB was tight even at minute resolution; per-second tripped the
+// stack-protection canary. 8 KB gives ~2× margin.
+inline constexpr uint32_t kRuleCron     = 8192;
 inline constexpr uint32_t kDeviceShadow = 4096;
 inline constexpr uint32_t kTaskLua      = 8192;
 inline constexpr uint32_t kMqttPubP4    = 4096;
@@ -43,12 +48,14 @@ inline constexpr uint32_t kInterviewP4  = 8192;   // alias of kZbInterview when 
 inline constexpr uint32_t kWifi         = 4096;
 inline constexpr uint32_t kHapS3        = 8192;
 inline constexpr uint32_t kHttp         = 8192;
-inline constexpr uint32_t kTimeSync     = 4096;
+inline constexpr uint32_t kTimeSync     = 3072;
 inline constexpr uint32_t kOta          = 8192;
 inline constexpr uint32_t kP4Ota        = 8192;
-inline constexpr uint32_t kStackMonS3   = 4096;
-inline constexpr uint32_t kAlertPersist = 4096;
-inline constexpr uint32_t kMqttPubS3    = 4096;
+inline constexpr uint32_t kStackMonS3   = 3072;
+inline constexpr uint32_t kAlertPersist = 3072;
+inline constexpr uint32_t kMqttPubS3    = 6144;
+inline constexpr uint32_t kTgWorker     = 16384;  // TLS handshake to api.telegram.org
+                                                  // needs ~10 KB for mbedtls SHA + x509.
 
 // Task-name → size map for stack-monitor iteration. nullptr name
 // terminates. Some names appear on both chips (TaskHAP, TaskStackMon)
@@ -97,6 +104,7 @@ inline constexpr Entry kTable[] = {
     {"TaskStackMon",  kStackMonS3},
     {"TaskAlertPrst", kAlertPersist},
     {"mqtt_pub",      kMqttPubS3},
+    {"TgWorker",      kTgWorker},
 #endif
     {nullptr, 0},
 };
