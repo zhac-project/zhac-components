@@ -40,6 +40,15 @@ bool zhac_adapter_has_def(uint64_t ieee,
                            const char* model_id,
                            const char* manufacturer_name);
 
+// Return the matched definition's `power_source_override` byte (ZCL
+// Basic 0x0007 enum value: 0x01 Mains, 0x03 Battery, etc.), or 0 if
+// the device isn't matched or the def has no override. z2m mirror:
+// `m.forcePowerSource({powerSource: ...})`. Callers use this at
+// interview time to pin `ZapDevice.power_source` for devices that
+// misreport their power source on Basic.
+uint8_t zhac_adapter_power_source_override(const char* model_id,
+                                            const char* manufacturer_name);
+
 // Record the input/output cluster list parsed from a device's
 // Simple_Desc_rsp. Called once per endpoint during the interview.
 // Enables cluster-aware fallback exposes for devices that have no

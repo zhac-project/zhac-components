@@ -106,6 +106,14 @@ void hap_session_init(const HapSessionCfg& cfg) {
 }
 
 uint16_t hap_session_next_seq() {
+    if (!s_mutex) {
+        // Called before hap_session_init() — likely a Lua script or
+        // other caller that beat the init order. Returning 0 is
+        // acceptable since the seq space wraps and the peer will
+        // accept it. Log once-ish so the bug surfaces.
+        ESP_LOGE(TAG, "next_seq before init — returning 0");
+        return 0;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint16_t s = s_next_seq++;
     if (s_next_seq == 0) s_next_seq = 1;  // skip 0
@@ -114,6 +122,10 @@ uint16_t hap_session_next_seq() {
 }
 
 bool hap_session_send(const HapFrame& frame) {
+    if (!s_cfg.send) {
+        ESP_LOGE(TAG, "send() before hap_session_init — drop");
+        return false;
+    }
     // SYNC and NO_ACK frames bypass the window — no locking needed for send callback
     if (frame.type == HapMsgType::SYNC || (frame.flags & HAP_FLAG_NO_ACK)) {
         s_cfg.send(frame);
@@ -125,6 +137,10 @@ bool hap_session_send(const HapFrame& frame) {
         return true;
     }
 
+    if (!s_mutex) {
+        ESP_LOGE(TAG, "send() before mutex init — drop seq=%u", frame.seq);
+        return false;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int slot = find_free_slot();
     if (slot < 0) {
@@ -167,6 +183,10 @@ bool hap_session_send(const HapFrame& frame) {
 }
 
 void hap_session_on_receive(const HapFrame& frame) {
+    if (!s_mutex) {
+        ESP_LOGE(TAG, "on_receive before init — drop seq=%u", frame.seq);
+        return;
+    }
     if (frame.type == HapMsgType::ACK) {
         // The slot is keyed on the ORIGINAL outbound frame's seq, which
         // the ACK echoes back in `ack_seq` (set by hap_make_reply). The
@@ -237,6 +257,7 @@ void hap_session_on_receive(const HapFrame& frame) {
 // If measurements ever show retransmit storms blocking REST, the fix is a
 // dedicated TX worker task fed by a queue; we haven't needed it.
 void hap_session_tick() {
+    if (!s_mutex) return;  // tick scheduled before init — no-op until ready
     uint32_t ms = now_ms();
     bool link_dead_fired = false;
 

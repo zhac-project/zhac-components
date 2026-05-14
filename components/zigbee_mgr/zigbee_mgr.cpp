@@ -522,7 +522,13 @@ static void on_af_incoming_msg(const MtFrame& f) {
 // shadow NVS flush); writing per-frame would burn flash.
 static uint64_t zcl_refresh_liveness(ZapDevice* dev, const AfRawFrame& frame) {
     zigbee_pool_lock();
-    dev->last_seen    = (uint32_t)time(nullptr);
+    // last_seen is consumed by the SPA as a Unix epoch — only write
+    // when SNTP has plausibly synced (post 2020-01-01) to avoid
+    // shipping 1970+small_uptime values that render as "55 years ago".
+    const time_t now = time(nullptr);
+    if (now > 1577836800) {
+        dev->last_seen = (uint32_t)now;
+    }
     dev->link_quality = frame.lqi;
     // Opportunistic re-interview: sleepy end-devices (Aqara buttons,
     // door sensors) often miss the wake window during the initial

@@ -685,6 +685,14 @@ extern "C" bool zhac_adapter_has_def(uint64_t ieee,
             != nullptr;
 }
 
+extern "C" uint8_t zhac_adapter_power_source_override(const char* model_id,
+                                                       const char* manufacturer_name) {
+    if (!model_id || !model_id[0]) return 0;
+    const zhc::PreparedDefinition* def =
+        find_definition(model_id, manufacturer_name);
+    return def ? def->power_source_override : 0;
+}
+
 extern "C" void zhac_adapter_register_endpoint(uint64_t ieee,
                                                 uint8_t  endpoint,
                                                 uint16_t profile_id,

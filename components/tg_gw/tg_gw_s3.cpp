@@ -3,13 +3,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "tg_gw.h"
 #include "hap_json.h"
+#include "task_stacks.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 static const char* TAG       = "tg_gw_s3";
 static const char* NVS_NS    = "zhac";
@@ -18,10 +24,26 @@ static const char* NVS_CHAT  = "tg_chat";
 
 static SemaphoreHandle_t s_cfg_mutex = nullptr;
 
+// TG_SEND is offloaded onto a dedicated worker. The HAP frame thread
+// (8 KB stack) cannot host the mbedtls TLS handshake to
+// api.telegram.org — SHA + x509 verify trips the stack canary. The
+// worker has its own 12 KB stack (zhac::stack::kTgWorker) and serialises
+// outgoing HTTPS posts.
+static QueueHandle_t s_tg_q = nullptr;
+static constexpr UBaseType_t kTgQueueDepth = 4;
+
+static void tg_perform_send(const HapTgSend& m);
+static void tg_worker_task(void*);
+
 void tg_gw_init(void) {
     ESP_LOGI(TAG, "tg_gw_s3 init — HTTPS dispatcher for telegram bot api");
     s_cfg_mutex = xSemaphoreCreateMutex();
     configASSERT(s_cfg_mutex);
+    s_tg_q = xQueueCreate(kTgQueueDepth, sizeof(HapTgSend*));
+    configASSERT(s_tg_q);
+    BaseType_t ok = xTaskCreatePinnedToCore(tg_worker_task, "TgWorker",
+                                zhac::stack::kTgWorker, nullptr, 4, nullptr, 0);
+    configASSERT(ok == pdPASS);
 }
 
 // ── NVS helpers ──────────────────────────────────────────────────────────
@@ -99,12 +121,36 @@ static size_t json_escape(const char* in, char* out, size_t cap) {
 }
 
 extern "C" void tg_gw_handle_send(const uint8_t* buf, uint16_t len) {
-    HapTgSend m{};
-    if (!hap_unpack_tg_send(buf, len, &m)) {
-        ESP_LOGW(TAG, "TG_SEND unpack failed len=%u", len);
+    if (!s_tg_q) {
+        ESP_LOGE(TAG, "TG_SEND: worker not initialised");
         return;
     }
+    auto* m = (HapTgSend*)calloc(1, sizeof(HapTgSend));
+    if (!m) {
+        ESP_LOGE(TAG, "TG_SEND: heap alloc failed (%u B)", (unsigned)sizeof(HapTgSend));
+        return;
+    }
+    if (!hap_unpack_tg_send(buf, len, m)) {
+        ESP_LOGW(TAG, "TG_SEND unpack failed len=%u", len);
+        free(m);
+        return;
+    }
+    if (xQueueSend(s_tg_q, &m, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "TG_SEND: queue full (depth=%u) — drop", (unsigned)kTgQueueDepth);
+        free(m);
+    }
+}
 
+static void tg_worker_task(void*) {
+    for (;;) {
+        HapTgSend* m = nullptr;
+        if (xQueueReceive(s_tg_q, &m, portMAX_DELAY) != pdTRUE) continue;
+        tg_perform_send(*m);
+        free(m);
+    }
+}
+
+static void tg_perform_send(const HapTgSend& m) {
     char token[100];
     char default_chat[40];
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);

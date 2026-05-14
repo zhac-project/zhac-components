@@ -220,6 +220,12 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
 
 static ParseResult parse_action(const char* s, RuleAction* a) {
     s = skip_ws(s);
+    // Tail-arg note: actions are extracted as the substring between
+    // `DO ` and `ENDON`, so the last action's last argument keeps the
+    // trailing space before ENDON (e.g. `zigbee.toggle dev state `).
+    // Using copy_token (with delim=' ', which also rtrims) for single-
+    // token args strips that space and prevents lookups like
+    // `attr 'state '` from failing in the runtime.
     if (strncmp(s, "zigbee.set ", 11) == 0) {
         a->type = ActionType::ZIGBEE_SET;
         s += 11; s = skip_ws(s);
@@ -227,8 +233,7 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         s = skip_ws(s);
         s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
         s = skip_ws(s);
-        strncpy(a->arg2, s, sizeof(a->arg2) - 1);
-        a->arg2[sizeof(a->arg2) - 1] = '\0';
+        s = copy_token(s, ' ', a->arg2, sizeof(a->arg2));
         return ParseResult::OK;
     }
     if (strncmp(s, "zigbee.toggle ", 14) == 0) {
@@ -236,8 +241,7 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         s += 14; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
         s = skip_ws(s);
-        strncpy(a->arg1, s, sizeof(a->arg1) - 1);
-        a->arg1[sizeof(a->arg1) - 1] = '\0';
+        s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
         if (a->arg0[0] == '\0' || a->arg1[0] == '\0') return ParseResult::ERR_BAD_ACTION;
         return ParseResult::OK;
     }
@@ -246,15 +250,13 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         s += 8; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
         s = skip_ws(s);
-        strncpy(a->arg1, s, sizeof(a->arg1) - 1);
-        a->arg1[sizeof(a->arg1) - 1] = '\0';
+        s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
         return ParseResult::OK;
     }
     if (strncmp(s, "event ", 6) == 0) {
         a->type = ActionType::EVENT;
-        s += 6;
-        strncpy(a->arg0, skip_ws(s), sizeof(a->arg0) - 1);
-        a->arg0[sizeof(a->arg0) - 1] = '\0';
+        s += 6; s = skip_ws(s);
+        s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
         return ParseResult::OK;
     }
     if (strncmp(s, "timer ", 6) == 0) {
@@ -262,14 +264,18 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         s += 6; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0)); // index
         s = skip_ws(s);
-        strncpy(a->arg1, s, sizeof(a->arg1) - 1); // ms
-        a->arg1[sizeof(a->arg1) - 1] = '\0';
+        s = copy_token(s, ' ', a->arg1, sizeof(a->arg1)); // ms
         return ParseResult::OK;
     }
     if (strncmp(s, "log ", 4) == 0) {
+        // log message is the only multi-word tail; keep rest-of-string
+        // semantics but strip the trailing space inserted before ENDON.
         a->type = ActionType::LOG;
         strncpy(a->arg0, skip_ws(s + 4), sizeof(a->arg0) - 1);
         a->arg0[sizeof(a->arg0) - 1] = '\0';
+        size_t n = strlen(a->arg0);
+        while (n > 0 && (a->arg0[n-1] == ' ' || a->arg0[n-1] == '\t'))
+            a->arg0[--n] = '\0';
         return ParseResult::OK;
     }
     if (strncmp(s, "script.run ", 11) == 0) {

@@ -122,6 +122,27 @@ TEST_CASE("dsl: log action", "[dsl_parser]") {
     TEST_ASSERT_EQUAL_STRING("hello", r.actions[0].arg0);
 }
 
+// Regression: the substring fed to parse_action is sliced between
+// `DO ` and `ENDON`, so the last action's last arg carries the space
+// before ENDON. With strncpy, arg1 became "state " — and the runtime
+// then logged `attr 'state ' on '<dev>' missing` because the shadow
+// lookup keyed on the literal "state " (trailing space) never hit.
+TEST_CASE("dsl: zigbee.toggle action — no trailing space leak", "[dsl_parser]") {
+    ParsedRule r{};
+    TEST_ASSERT_EQUAL(ParseResult::OK,
+        dsl_parse("ON sw#action=single DO zigbee.toggle tuya_socket state ENDON", 15, &r));
+    TEST_ASSERT_EQUAL(ActionType::ZIGBEE_TOGGLE, r.actions[0].type);
+    TEST_ASSERT_EQUAL_STRING("tuya_socket", r.actions[0].arg0);
+    TEST_ASSERT_EQUAL_STRING("state",       r.actions[0].arg1);
+}
+
+TEST_CASE("dsl: zigbee.set tail arg2 — no trailing space leak", "[dsl_parser]") {
+    ParsedRule r{};
+    TEST_ASSERT_EQUAL(ParseResult::OK,
+        dsl_parse("ON System#Boot DO zigbee.set kitchen state 1 ENDON", 16, &r));
+    TEST_ASSERT_EQUAL_STRING("1", r.actions[0].arg2);
+}
+
 // ── Multi-action ──────────────────────────────────────────────────────────
 
 TEST_CASE("dsl: two actions separated by semicolon", "[dsl_parser]") {
