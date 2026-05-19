@@ -79,7 +79,7 @@ void zap_store_init() {
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "zap_store init OK (NVS v0, schema=%u)", ZAP_STORE_SCHEMA_VERSION);
+    ESP_LOGI(TAG, "zap_store init OK (schema=%u)", ZAP_STORE_SCHEMA_VERSION);
 }
 
 bool zap_store_is_ready() { return s_ready; }
@@ -120,17 +120,28 @@ bool zap_store_save_device(const ZapDevice* dev) {
     saved_dev.crc32 = 0;
     saved_dev.crc32 = zap_device_crc(&saved_dev);
 
+    // For a new device, bump "cnt" BEFORE writing the blob so that a power
+    // loss between the two writes leaves a referenced-but-unwritten slot
+    // (load_devices skips it via the nvs_get_blob != ESP_OK branch or the
+    // CRC32 check) rather than a written-but-unreferenced blob (which the
+    // load loop would never read because the count stops short). Without
+    // this order the new-device record is silently lost on crash —
+    // device rejoins + re-interviews, but friendly name + configure state
+    // are gone until the new interview lands.
     dev_key(key, idx);
+    if (found_idx < 0) {
+        esp_err_t cnt_err = nvs_set_u16(h, "cnt", count + 1);
+        if (cnt_err != ESP_OK) {
+            ESP_LOGE(TAG, "nvs_set_u16 cnt: %s", esp_err_to_name(cnt_err));
+            nvs_close(h);
+            return false;
+        }
+    }
     esp_err_t err = nvs_set_blob(h, key, &saved_dev, sizeof(saved_dev));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_set_blob: %s", esp_err_to_name(err));
         nvs_close(h);
         return false;
-    }
-
-    if (found_idx < 0) {
-        count++;
-        nvs_set_u16(h, "cnt", count);
     }
 
     err = nvs_commit(h);
@@ -261,3 +272,4 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
     ESP_LOGI(TAG, "Loaded %u devices from NVS", loaded);
     return loaded;
 }
+

@@ -34,6 +34,10 @@ METRIC_COUNTER(METRIC_HAP_DUP_SEQ,            "hap_dup_seq_total",        "HAP d
 METRIC_COUNTER(METRIC_HAP_RESYNC_BYTES,       "hap_resync_bytes_total",   "HAP bytes skipped during stream resync")
 METRIC_COUNTER(METRIC_HAP_MUTEX_TIMEOUT,      "hap_mutex_timeout_total",  "S3 SPI mutex 50ms timeouts")
 METRIC_COUNTER(METRIC_HAP_HDR_CRC_ERRORS,     "hap_hdr_crc_errors_total", "HAP v3 header-CRC8 mismatches")
+// F-07: visibility for silent drops on the S3 MQTT publish queue. Drop
+// path is intentionally non-blocking (log-pipeline back-pressure
+// hazard), but operators need to detect broker stalls.
+METRIC_COUNTER(METRIC_MQTT_DROPPED_MSGS,      "mqtt_dropped_msgs_total",  "MQTT publish-queue drops (broker stall or saturation)")
 
 // ── P4-origin (compiled on both chips; S3 never records to them) ────
 // Gating these behind #if CONFIG_IDF_TARGET_ESP32P4 is tempting but

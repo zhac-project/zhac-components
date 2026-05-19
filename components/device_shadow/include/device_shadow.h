@@ -73,8 +73,19 @@ struct DeviceShadowEntry {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-// Lifecycle — call from zigbee_mgr_init() after zap_store_init().
+// Lifecycle — init only (mutex, queues, NVS version guard, shadow alloc,
+// task spawn). Does NOT load device entries. Call after zap_store_init().
+// Pair with device_shadow_restore_from_pool() once the device pool has
+// been populated (e.g. via zigbee_pool_restore_persisted()) to seed the
+// per-device shadow entries from the persisted NVS attr cache.
 void device_shadow_init();
+
+// Restore shadow entries (config + attrs + last_seen) for each device
+// in the supplied pool slice. Caller must hold the pool lock for the
+// duration of the call (the pool array is iterated in place). Fires a
+// DEVICE_JOIN event per restored device so downstream subscribers can
+// rebuild their state. Returns the number of entries restored.
+uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count);
 
 // Called by zigbee_mgr / zhc_adapter_shadow_bridge to register a decoded
 // attribute against a device.

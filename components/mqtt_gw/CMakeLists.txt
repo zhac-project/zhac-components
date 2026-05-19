@@ -4,7 +4,8 @@ idf_build_get_property(target IDF_TARGET)
 
 if(target STREQUAL "esp32s3")
     set(MQTT_GW_SRCS "mqtt_gw_s3.cpp")
-    set(MQTT_GW_REQS mqtt freertos zap_common)
+    # `metrics` carries METRIC_MQTT_DROPPED_MSGS (F-07).
+    set(MQTT_GW_REQS mqtt freertos zap_common metrics)
 else()
     set(MQTT_GW_SRCS "mqtt_gw_p4.cpp")
     set(MQTT_GW_REQS hap_slave hap_session hap_json hap_protocol freertos)

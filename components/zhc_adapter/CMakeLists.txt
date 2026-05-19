@@ -152,6 +152,7 @@ idf_component_register(
     REQUIRES
         esp_timer
         log
+        freertos
     PRIV_REQUIRES
         metrics
 )

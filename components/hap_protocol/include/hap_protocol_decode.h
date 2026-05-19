@@ -20,6 +20,9 @@ inline HapDecodeResult hap_decode_with_counters(
         _METRIC_COUNTER_INC(METRIC_HAP_VERSION_MISMATCH, 1);
     else if (r == HAP_DECODE_BAD_HDR_CRC)
         _METRIC_COUNTER_INC(METRIC_HAP_HDR_CRC_ERRORS, 1);
+    // HAP_DECODE_RESYNC: no per-failure counter — RESYNC_BYTES below
+    // captures the data loss, and the upstream error metric was already
+    // bumped when the original failed decode happened.
     if (consumed && *consumed > 0)
         _METRIC_COUNTER_INC(METRIC_HAP_RESYNC_BYTES, *consumed);
     return r;

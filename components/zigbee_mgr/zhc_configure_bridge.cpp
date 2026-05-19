@@ -5,10 +5,11 @@
 // join walks the PreparedDefinition's bindings[] + reports[] arrays
 // and fires one of these bridge fns per entry.
 //
-// v1 covers bind (ZDO_BIND_REQ via the existing helper). Reporting
-// configuration is stubbed as a no-op for now — most sleepy
-// end-devices in our registry ship with sensible defaults or rely on
-// host-side polling (mcuSyncTime etc.).
+// Bind goes through ZDO_BIND_REQ; report goes through ZCL Configure
+// Reporting (cmd 0x06); cmd/read use the matching ZCL helpers in
+// zcl_commands.cpp. Battery sensors usually self-report on a vendor
+// cadence so reporting setup is harmless when redundant; mains-powered
+// devices (thermostats, metering plugs) depend on it.
 
 #include "zhc_adapter.h"
 #include "zigbee_mgr.h"
@@ -37,19 +38,29 @@ extern "C" bool zhc_cfg_bind_af(uint64_t ieee, uint8_t ep,
     return zigbee_zdo_bind(dev->nwk_addr, ieee, ep, cluster, coord, 1);
 }
 
-extern "C" bool zhc_cfg_report_af(uint64_t /*ieee*/, uint8_t /*ep*/,
+extern "C" bool zhc_cfg_report_af(uint64_t ieee, uint8_t ep,
                                     uint16_t cluster,
-                                    uint16_t /*attr_id*/,
-                                    uint8_t  /*attr_type*/,
-                                    uint16_t /*min_interval*/,
-                                    uint16_t /*max_interval*/,
-                                    uint32_t /*reportable_change*/,
-                                    uint16_t /*manu_code*/) {
-    // v1: log + accept. Wire the real ZCL configureReporting frame
-    // here when we have a device that needs it (thermostats, metering
-    // plugs that don't auto-report).
-    ESP_LOGD(TAG, "report (stub): cluster=0x%04x", cluster);
-    return true;
+                                    uint16_t attr_id,
+                                    uint8_t  attr_type,
+                                    uint16_t min_interval,
+                                    uint16_t max_interval,
+                                    uint32_t reportable_change,
+                                    uint16_t manu_code) {
+    // Build + ship a ZCL Configure Reporting frame for ONE attribute.
+    // Previously this was a no-op stub which made every def's `reports[]`
+    // silently inert. zhc_cfg_bind_af above resolves nwk from the pool
+    // the same way — reusing the lookup keeps the IEEE→nwk decoupling
+    // out of the device cpps.
+    const ZapDevice* dev = pool_find_by_ieee(ieee);
+    if (!dev) {
+        ESP_LOGW(TAG, "report: unknown ieee=0x%016llx",
+                 static_cast<unsigned long long>(ieee));
+        return false;
+    }
+    return zigbee_zcl_configure_report(dev->nwk_addr, ep, cluster,
+                                        attr_id, attr_type,
+                                        min_interval, max_interval,
+                                        reportable_change, manu_code);
 }
 
 // ── Declarative step transports ─────────────────────────────────────

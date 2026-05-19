@@ -6,15 +6,28 @@
 
 static constexpr uint8_t  HAP_PREAMBLE[4]    = {0xAA, 0x55, 0xFE, 0x04};
 static constexpr uint8_t  HAP_VERSION        = 0x04;
-static constexpr size_t   HAP_FRAME_OVERHEAD = 15;   // 13 hdr+CRC8 + 2 payload CRC16
+static constexpr size_t   HAP_FRAME_OVERHEAD = 15;   // 13 hdr+HDR_CRC16 + 2 payload CRC16
 static constexpr size_t   HAP_MAX_PAYLOAD    = 4096;
 static constexpr size_t   HAP_MAX_FRAME_SIZE = HAP_FRAME_OVERHEAD + HAP_MAX_PAYLOAD;
 
-// Wire layout (v3):
-// [0..3] PREAMBLE (0xAA 0x55 0xFE 0x03 — magic16 + sentinel + version)
-// [4] TYPE  [5] FLAGS  [6..7] SEQ (LE)  [8..9] ACK_SEQ (LE)  [10..11] LEN (LE)
-// [12] HDR_CRC8 (poly 0x07, init 0x00, over bytes 0..11)
-// [13..13+LEN-1] PAYLOAD  [last 2] PAYLOAD_CRC16 (CCITT, over payload only)
+// Catch silent skew between the PREAMBLE byte 3 and HAP_VERSION: bumping
+// one without the other is the textbook way to brick wire-compat between
+// chips that were flashed at different commits. See README.md.
+static_assert(HAP_PREAMBLE[3] == HAP_VERSION,
+              "PREAMBLE[3] must equal HAP_VERSION — bump both together");
+
+// Wire layout (v4 — single-frame / non-DMA form). The v4 two-stage SPI DMA
+// form uses a different stage-1 header (16 B, CRC16 at [13..14]); see
+// README.md and the OFF_S1_* / HAP_STAGE1_LEN constants below.
+// [0..3]   PREAMBLE  (0xAA 0x55 0xFE 0x04 — magic16 + sentinel + version)
+// [4]      TYPE
+// [5]      FLAGS
+// [6..7]   SEQ       (LE)
+// [8..9]   ACK_SEQ   (LE)
+// [10..11] LEN       (LE)
+// [12]     HDR_CRC8  (CCITT, poly 0x07, init 0x00, over bytes 0..11)
+// [13..13+LEN-1] PAYLOAD
+// [last 2] PAYLOAD_CRC16 (CCITT, poly 0x1021, init 0xFFFF, over payload only)
 //
 // ACK_SEQ = 0 means "no correlation" (legacy/unsolicited frames). When a
 // frame is a response to a specific request, ACK_SEQ echoes the request's
@@ -64,6 +77,16 @@ enum class HapMsgType : uint8_t {
     INTERVIEW_REQ     = 0x2B,  // S3→P4: {"ieee":"0x..."} fire-and-forget
     DEVICE_OPTIONS_SET     = 0x2C,  // S3→P4: {"ieee":"0x...","occupancy_timeout":N}
     DEVICE_OPTIONS_SET_ACK = 0x2D,  // P4→S3: {"ok":true/false}
+    CONFIGURE_REQ          = 0x2E,  // S3→P4: {"ieee":"0x..."} fire-and-forget;
+                                    // P4 re-runs run_configure (bindings +
+                                    // reports + config_steps) without
+                                    // redoing the full ZNP interview. Use
+                                    // after a firmware update adds new
+                                    // wiring (e.g. read-on-join attrs) to
+                                    // an existing paired device's def.
+                                    // Payload shape is identical to
+                                    // INTERVIEW_REQ — same hap_json
+                                    // encoder/decoder pair serves both.
     RULE_CREATE       = 0x30, RULE_DELETE       = 0x31,
     RULE_EXEC_RESULT  = 0x32, RULE_LIST_REQ    = 0x33,
     RULE_LIST_RSP     = 0x34, RULE_UPDATE       = 0x35,
@@ -124,6 +147,12 @@ enum HapDecodeResult {
     HAP_DECODE_TRUNCATED   = 4,
     HAP_DECODE_OVERFLOW    = 5,
     HAP_DECODE_BAD_HDR_CRC = 6,
+    // hap_decode_stream-only: the current head was bad but a candidate
+    // preamble was located further into the buffer. `*consumed` is the
+    // byte count the caller must skip; the caller should treat this the
+    // same as HAP_DECODE_CRC_ERROR for retry purposes but does NOT need
+    // to log "CRC error at offset 0" — that diagnostic would be wrong.
+    HAP_DECODE_RESYNC      = 7,
 };
 
 // Encode frame into buf. Returns total bytes written, 0 on overflow.

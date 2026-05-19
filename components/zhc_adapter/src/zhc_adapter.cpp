@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "metrics/metrics_macros.h"
 
 #include "definitions/lumi/_shared.hpp"
@@ -518,8 +521,25 @@ zhac_configure_report_fn_t g_cfg_report = nullptr;
 zhac_configure_cmd_fn_t    g_cfg_cmd    = nullptr;
 zhac_configure_read_fn_t   g_cfg_read   = nullptr;
 zhac_configure_sleep_fn_t  g_cfg_sleep  = nullptr;
-std::uint64_t              g_cfg_ieee   = 0;    // set per configure call
-std::uint16_t              g_cfg_nwk    = 0;    // set per configure call
+// Per-bridge-call addressing. The zhc library's bridge function-pointer
+// types only carry (idx, ep, cluster, ...) — they have no slot for
+// device IEEE/NWK — so we cannot push the address through ctx without
+// changing the upstream typedefs. Until the library API gains that, we
+// fall back to module-level globals guarded by a FreeRTOS mutex.
+//
+// On dual-core ESP32-P4 the configure task (zhac_adapter_configure) and
+// the ZCL decode task (try_decode + zhac_adapter_set_runtime_addr) can
+// run in parallel. Without the mutex the configure-task's globals could
+// be overwritten mid-bridge by a ZCL frame from a different device,
+// causing a configure_cmd_bridge call to deliver the right command to
+// the wrong destination. Holding the mutex from "set globals" through
+// "consume globals in bridges" through "clear globals" makes the
+// configure call atomic with respect to set_runtime_addr.
+std::uint64_t              g_cfg_ieee   = 0;
+std::uint16_t              g_cfg_nwk    = 0;
+SemaphoreHandle_t          g_cfg_addr_mtx = nullptr;
+struct CfgAddrInit { CfgAddrInit() { g_cfg_addr_mtx = xSemaphoreCreateMutex(); } };
+CfgAddrInit                g_cfg_addr_init;
 
 bool configure_bind_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
                             std::uint16_t cluster) {
@@ -601,12 +621,14 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
     ctx.configure_sleep  = g_cfg_sleep  ? &configure_sleep_bridge  : nullptr;
 
+    // Hold the addr mutex across the whole bridge-consuming section so a
+    // parallel zhac_adapter_set_runtime_addr (from the ZCL decode task on
+    // the other P4 core) can't rewrite g_cfg_ieee / g_cfg_nwk mid-call
+    // and route this device's bridge ZCL frames to a different node.
+    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
     g_cfg_ieee = ieee;
     g_cfg_nwk  = nwk;
     bool ok = zhc::run_configure(*def, ctx);
-    // Supplement covers clusters the primary def didn't bind. Treat a
-    // failing supplement run as non-fatal — primary already succeeded
-    // which is enough for "supported".
     if (supp) {
         const bool supp_ok = zhc::run_configure(*supp, ctx);
         ESP_LOGI(TAG, "[configure] supplement ieee=0x%016llx %s",
@@ -632,7 +654,7 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
             }
         }
         if (has_tuya_cluster) {
-            (void)g_cfg_cmd(g_cfg_ieee, g_cfg_nwk, tuya_ep, 0xEF00,
+            (void)g_cfg_cmd(ieee, nwk, tuya_ep, 0xEF00,
                              0x03, nullptr, 0, 0);
             ESP_LOGI(TAG, "[configure] Tuya DATA_QUERY sent ieee=0x%016llx ep=%u",
                       static_cast<unsigned long long>(ieee), tuya_ep);
@@ -641,6 +663,7 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
 
     g_cfg_ieee = 0;
     g_cfg_nwk  = 0;
+    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
     return ok;
 }
 
@@ -988,7 +1011,13 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     ctx.configure_report = g_cfg_report ? &configure_report_bridge : nullptr;
     ctx.configure_cmd    = g_cfg_cmd    ? &configure_cmd_bridge    : nullptr;
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
-    ctx.device_nwk       = g_cfg_nwk;
+
+    // Hold the addr mutex from the snapshot of g_cfg_nwk through the
+    // full dispatch — the bridges below consume g_cfg_ieee/g_cfg_nwk
+    // (no per-call context for them), and a parallel configure on the
+    // other core would otherwise rewrite the globals mid-dispatch.
+    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
+    ctx.device_nwk = g_cfg_nwk;
 
     auto result = zhc::dispatch_from_zigbee(msg, dp_span, *def, raw, ctx);
 
@@ -1000,6 +1029,7 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     if (!result.any_matched && supp) {
         result = zhc::dispatch_from_zigbee(msg, dp_span, *supp, raw, ctx);
         if (result.any_matched) {
+            if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
             log_payload(ieee, *supp, result, cluster_id, &msg, zcl, zcl_len);
             fire_shadow_updates(ieee, result);
             return true;
@@ -1019,6 +1049,7 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         ESP_LOGI(TAG, "[zhc-lib] mcuVersionResp seen ieee=0x%016llx — sent dataQuery",
                  static_cast<unsigned long long>(ieee));
     }
+    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
 
     log_payload(ieee, *def, result, cluster_id, &msg, zcl, zcl_len);
     if (result.any_matched) fire_shadow_updates(ieee, result);
@@ -1116,8 +1147,13 @@ extern "C" void zhac_adapter_register_send(zhac_af_send_fn_t fn) {
 }
 
 extern "C" void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk) {
+    // Mutex pairs with the configure-call section: blocks while a configure
+    // is in-flight on the other core so we can't overwrite its IEEE/NWK
+    // mid-bridge. Brief contention only — both producers are short-lived.
+    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
     g_cfg_ieee = ieee;
     g_cfg_nwk  = nwk;
+    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
 }
 
 extern "C" bool zhac_adapter_send_bool(uint64_t ieee,

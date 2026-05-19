@@ -100,6 +100,23 @@ bool zigbee_zcl_read(uint16_t nwk_addr, uint8_t endpoint,
                       const uint8_t* attr_ids_le, uint8_t attr_count,
                       uint16_t manu_code = 0);
 
+// ZCL Configure Reporting (cmd 0x06) for ONE attribute. Builds a
+// single-record send-direction frame:
+//   direction=0x00 attr_id type min_interval max_interval reportable_change
+// The reportable_change field width is derived from `attr_type` (1 B
+// for u8/s8, 2 B for u16/s16, 4 B for u32/s32, omitted entirely for
+// discrete types Bool/ENUM/bitmap). `manu_code` non-zero wraps the
+// frame manufacturer-specific. Returns true when ZNP's SRSP status is
+// 0; the device's per-attribute response lands later via AF_INCOMING
+// and traverses the normal decode pipeline.
+bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
+                                  uint16_t cluster_id, uint16_t attr_id,
+                                  uint8_t  attr_type,
+                                  uint16_t min_interval,
+                                  uint16_t max_interval,
+                                  uint32_t reportable_change,
+                                  uint16_t manu_code = 0);
+
 // Generic ZCL Write Attributes — profile-wide (FC=0x00) write of a
 // single attribute. `value` points at the on-wire byte buffer for
 // `type` (e.g. 8 LE bytes for `0xF0`/IEEE Address). Returns true when

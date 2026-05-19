@@ -144,16 +144,24 @@ void rule_store_flush_now() {
 
 // Overlay APIs — consult dirty table before falling through to NVS so
 // readers see the latest edit regardless of flush timing.
-extern "C" bool rule_store_load_overlay(uint16_t rule_id, RuleSlot* out) {
+//
+// F-02 fix: distinguish "found-as-tombstone" from "not in overlay" via
+// out_tombstoned (NULL allowed). Both still return false, but the
+// caller (rule_store_load) checks the flag to skip the NVS fallthrough
+// — otherwise a deleted rule reappears until flush_task fires (~5 s),
+// and permanently if power is cut before flush.
+extern "C" bool rule_store_load_overlay(uint16_t rule_id, RuleSlot* out,
+                                         bool* out_tombstoned) {
+    if (out_tombstoned) *out_tombstoned = false;
     if (!s_dirty || !s_mtx) return false;
     bool hit = false;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     int idx = find_slot_locked(rule_id);
     if (idx >= 0) {
         if (s_dirty[idx].state == TOMBSTONE) {
-            hit = true;
+            if (out_tombstoned) *out_tombstoned = true;
             xSemaphoreGive(s_mtx);
-            return hit && false;  // "found but deleted" — caller must treat as miss
+            return false;
         }
         if (s_dirty[idx].state == WRITE) {
             *out = s_dirty[idx].slot;

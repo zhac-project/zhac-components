@@ -163,20 +163,26 @@ bool cron_matches(const CronExpr& expr, time_t t) {
     if (!(expr.hour_bits   & (1UL  << hour)))   return false;
     if (!(expr.month_bits  & (1U   << month)))   return false;
 
-    // POSIX/Vixie cron DOM/DOW semantics (LUA-F4): if either field is
-    // `*` AND today's value matches; otherwise OR them so a restricted
-    // pair like "1 * 1" fires on the 1st of the month *and* every
-    // Monday — not only on Mondays that fall on the 1st.
+    // POSIX/Vixie cron DOM/DOW semantics (F-06): a `*` field matches
+    // every value of that field, so the constraint is vacuous and the
+    // OTHER side becomes the gate. The 4-quadrant table:
+    //   both *      → match (no day restriction)
+    //   only DOM *  → use DOW match
+    //   only DOW *  → use DOM match
+    //   neither *   → OR them (POSIX: `0 8 1 * 1` fires every 1st AND
+    //                 every Monday, not only Mondays that fall on 1st)
+    // Old code inverted this and ANDed when either was `*`.
     bool dom_match = (expr.day_bits  & (1UL << day))  != 0;
     bool dow_match = (expr.wday_bits & (1U  << wday)) != 0;
     bool dom_star  = (expr.flags & CRON_FLAG_DOM_STAR) != 0;
     bool dow_star  = (expr.flags & CRON_FLAG_DOW_STAR) != 0;
 
-    if (dom_star || dow_star) {
-        if (!dom_match || !dow_match) return false;     // AND when either is wildcard
-    } else {
-        if (!dom_match && !dow_match) return false;     // OR when both restricted
-    }
+    bool day_ok;
+    if (dom_star && dow_star)      day_ok = true;
+    else if (dom_star)             day_ok = dow_match;
+    else if (dow_star)             day_ok = dom_match;
+    else                           day_ok = dom_match || dow_match;
+    if (!day_ok) return false;
     return true;
 }
 
@@ -205,17 +211,20 @@ time_t cron_next(const CronExpr& expr, time_t from_t) {
             continue;
         }
 
-        // Check DOM/DOW with POSIX OR semantics (LUA-F4): only restrict
-        // when both fields are non-`*`; otherwise the wildcard side is
-        // satisfied automatically and we AND with the restricted side.
+        // Check DOM/DOW with POSIX OR semantics (F-06): see cron_matches
+        // above for the 4-quadrant table. Wildcard side is vacuous, so
+        // the restricted side gates; both restricted → OR.
         int day  = tm_val.tm_mday;
         int wday = tm_val.tm_wday;
         bool dom_match = (expr.day_bits  & (1UL << day))  != 0;
         bool dow_match = (expr.wday_bits & (1U  << wday)) != 0;
         bool dom_star  = (expr.flags & CRON_FLAG_DOM_STAR) != 0;
         bool dow_star  = (expr.flags & CRON_FLAG_DOW_STAR) != 0;
-        bool day_ok = (dom_star || dow_star) ? (dom_match && dow_match)
-                                              : (dom_match || dow_match);
+        bool day_ok;
+        if (dom_star && dow_star)      day_ok = true;
+        else if (dom_star)             day_ok = dow_match;
+        else if (dow_star)             day_ok = dom_match;
+        else                           day_ok = dom_match || dow_match;
         if (!day_ok) {
             tm_val.tm_mday++;
             tm_val.tm_hour  = 0;

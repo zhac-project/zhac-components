@@ -4,6 +4,38 @@
 #include <stdbool.h>
 #include "zap_common.h"
 
+// ── Schema migration & namespace contract ────────────────────────────────
+//
+// Two independent version axes coexist here:
+//
+//   1. NVS namespace name — a *string* identifier ("zap_v0" today, kept
+//      frozen for backwards compatibility with already-deployed devices).
+//      Renaming the namespace orphans the previous keys until the next
+//      `nvs_flash_erase()` — DO NOT rename without an explicit migration
+//      step that walks the old namespace and rewrites under the new one.
+//
+//   2. `ZAP_STORE_SCHEMA_VERSION` — an integer stored under key
+//      "schema_ver" inside the namespace. Bumped whenever the on-flash
+//      `ZapDevice` layout changes. A mismatch at boot calls
+//      `nvs_erase_all()` on the namespace and writes the new version
+//      (devices re-pair) — this is the salvage-free migration path.
+//
+// When to do what:
+//   - Layout-only change (new field, reordered field, widened field):
+//     bump SCHEMA_VERSION, document the version delta in the inline
+//     comment chain, and accept that devices will be wiped on first
+//     boot of the new firmware. CRC32 catches any read of stale blobs
+//     that slip through.
+//   - Layout change with salvage (e.g. you can re-derive new fields
+//     from old): bump SCHEMA_VERSION and add a migration handler in
+//     `zap_store_init()` between the version check and the
+//     `nvs_erase_all()` — read old blobs, transform, write back, then
+//     update "schema_ver". Skip the erase.
+//   - Adding a parallel data store (e.g. groups, scenes): use a NEW
+//     NVS namespace ("zap_groups", "zap_scenes"), do NOT extend
+//     "zap_v0". Keeping unrelated keys in separate namespaces makes
+//     selective wipe and schema evolution independent per dataset.
+
 // Initialise NVS — call once from app_main before any other zap_store calls.
 void zap_store_init();
 

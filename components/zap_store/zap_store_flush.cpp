@@ -122,9 +122,16 @@ void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {
         xSemaphoreGive(s_mtx);
         // Dirty-table full: force immediate persist as fallback to avoid
         // losing the write. Rare — 64 concurrent dirty devices is a lot.
+        // Stack-snapshot the device first: callers from the interview
+        // path pass `dev` into the live pool, and the flush-mutex release
+        // above can race with a `pool_remove` (swap-with-last) that
+        // relocates the entry at `dev` to a different device — passing
+        // the raw pointer to save_device would then write the wrong
+        // record under our IEEE.
+        ZapDevice snap = *dev;
         ESP_LOGW(TAG, "dirty table full — immediate save ieee=0x%016llx",
-                 (unsigned long long)dev->ieee_addr);
-        zap_store_save_device(dev);
+                 (unsigned long long)snap.ieee_addr);
+        zap_store_save_device(&snap);
         return;
     }
     // If entry exists, upgrade priority (HIGH wins) but keep original

@@ -106,16 +106,19 @@ bool rule_store_save(const RuleSlot* slot) {
     return ok;
 }
 
-// Writeback-overlay forward decl. Returns true if the rule is present in
-// the pending-commit table AND is a WRITE (not tombstone). Populates out.
-extern "C" bool rule_store_load_overlay(uint16_t rule_id, RuleSlot* out);
+// Writeback-overlay forward decl. Returns true on WRITE hit (out filled).
+// On TOMBSTONE hit, returns false and (if non-NULL) sets *out_tombstoned.
+extern "C" bool rule_store_load_overlay(uint16_t rule_id, RuleSlot* out,
+                                         bool* out_tombstoned);
 
 bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
     // Check PSRAM overlay first so a just-saved rule is readable before
-    // its NVS commit lands. Tombstoned rules return false from overlay
-    // (deleted) and we still fall through to NVS — harmless because
-    // NVS will also return false once tombstone is flushed.
-    if (rule_store_load_overlay(rule_id, out)) return true;
+    // its NVS commit lands. F-02: a tombstoned but not-yet-flushed rule
+    // must NOT fall through to NVS, otherwise the deleted rule reappears
+    // until the next flush tick (up to ~5 s) and permanently on power-cut.
+    bool tombstoned = false;
+    if (rule_store_load_overlay(rule_id, out, &tombstoned)) return true;
+    if (tombstoned) return false;
     if (!s_nvs) return false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = rule_store_load_unlocked(rule_id, out);
