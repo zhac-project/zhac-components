@@ -951,8 +951,11 @@ static bool coordinator_start() {
 }
 
 // ── ZNP Init Sequence (TDD Section 6.3) ──────────────────────────────────
+// Caller is now responsible for `zigbee_pool_init()` + restore + any
+// other consumers (device_shadow) BEFORE this call. Boot ordering moved
+// up so `device_shadow_init` can iterate the already-loaded pool instead
+// of re-reading NVS (03-F06).
 bool zigbee_mgr_init() {
-    zigbee_pool_init();
     // Legacy `zcl_converter_register_generated()` removed; decode and
     // encode flow through the zhc library (see zhc_adapter.h).
     znp_driver_init();

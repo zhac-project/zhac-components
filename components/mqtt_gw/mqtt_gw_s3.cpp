@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "task_stacks.h"
+#include "metrics/metrics_macros.h"
 
 static const char* TAG = "mqtt_gw_s3";
 
@@ -53,10 +54,16 @@ static void restart_client() {
         esp_mqtt_client_destroy(s_client);
         s_client = nullptr;
     }
+    // F-09: refuse to start the client without an explicit broker URL.
+    // The Kconfig fallback used to silently connect to whatever URL the
+    // developer baked into local sdkconfig — supply-chain hazard.
+    if (s_broker_url[0] == '\0') {
+        ESP_LOGI(TAG, "mqtt restart skipped — no broker URL configured");
+        return;
+    }
     ensure_default_client_id();
     esp_mqtt_client_config_t cfg{};
-    cfg.broker.address.uri           = s_broker_url[0] ? s_broker_url
-                                                       : CONFIG_MQTT_BROKER_URL;
+    cfg.broker.address.uri           = s_broker_url;
     cfg.credentials.client_id        = s_client_id;
     // Bump esp-mqtt's internal task stack from the 6 KB default. Two
     // problem paths trip it:
@@ -396,6 +403,10 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     item->payload[payload_len] = '\0';
 
     if (xQueueSend(s_pubq, &item, 0) != pdTRUE) {
+        // F-07: surface drops so operators can detect broker stalls or
+        // log-storm saturation. Still no ESP_LOG here — log-pipeline
+        // recursion is the original reason for the silent drop.
+        _METRIC_COUNTER_INC(METRIC_MQTT_DROPPED_MSGS, 1);
         free(item->topic);
         free(item->payload);
         free(item);

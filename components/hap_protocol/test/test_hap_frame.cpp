@@ -119,7 +119,11 @@ TEST_CASE("HAP stream decode skips corrupted prefix", "[hap]") {
     HapFrame rx{};
     size_t consumed = 0;
     HapDecodeResult r = hap_decode_stream(buf, 50 + flen, rx, &consumed);
-    TEST_ASSERT_EQUAL(HAP_DECODE_BAD_MAGIC, r);
+    // Before F-09: returned BAD_MAGIC with consumed=50. That conflated
+    // "garbage at offset 0" with "found a valid candidate at offset 50".
+    // RESYNC now reports the latter explicitly; callers handle both the
+    // same way (skip `consumed`, retry).
+    TEST_ASSERT_EQUAL(HAP_DECODE_RESYNC, r);
     TEST_ASSERT_EQUAL(50u, consumed);
 
     HapDecodeResult r2 = hap_decode_stream(buf + consumed, flen, rx, &consumed);

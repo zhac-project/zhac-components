@@ -258,3 +258,69 @@ TEST_CASE("cron: 4-field input is rejected", "[cron_parser]") {
     CronExpr e{};
     TEST_ASSERT_FALSE(cron_parse("* * * *", e));
 }
+
+// ── F-06: DOM/DOW POSIX 4-quadrant semantics ─────────────────────────────
+// Reference table (cron(8) / Vixie cron):
+//   both `*`     → match (no day restriction)
+//   only DOM `*` → DOW gates alone
+//   only DOW `*` → DOM gates alone
+//   both set     → OR (fire if EITHER matches)
+//
+// 2025-05-01 is a Thursday (wday=4). 2025-05-05 is a Monday (wday=1).
+// 2025-05-12 is a Monday but day=12. 2025-05-02 is Friday day=2.
+
+TEST_CASE("cron F-06: * * * * * fires any day", "[cron_parser]") {
+    CronExpr e{};
+    cron_parse("* * * * *", e);
+    TEST_ASSERT_TRUE(cron_matches(e, make_time(2025, 5,  1, 12, 0, 0)));
+    TEST_ASSERT_TRUE(cron_matches(e, make_time(2025, 5,  5, 12, 0, 0)));
+}
+
+TEST_CASE("cron F-06: * * 1 * * fires only on day 1 of month (DOW *)", "[cron_parser]") {
+    CronExpr e{};
+    cron_parse("* * 1 * *", e);
+    // 2025-05-01 is the 1st — match.
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5,  1, 12, 0, 0)));
+    // 2025-05-05 is Monday but day 5 — must miss.
+    TEST_ASSERT_FALSE(cron_matches(e, make_time(2025, 5,  5, 12, 0, 0)));
+    // 2025-05-12 is Monday but day 12 — must miss.
+    TEST_ASSERT_FALSE(cron_matches(e, make_time(2025, 5, 12, 12, 0, 0)));
+}
+
+TEST_CASE("cron F-06: * * * * 1 fires only on Mondays (DOM *)", "[cron_parser]") {
+    CronExpr e{};
+    cron_parse("* * * * 1", e);
+    // 2025-05-05 is Monday — match.
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5,  5, 12, 0, 0)));
+    // 2025-05-12 is Monday — match.
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5, 12, 12, 0, 0)));
+    // 2025-05-01 is Thursday — must miss.
+    TEST_ASSERT_FALSE(cron_matches(e, make_time(2025, 5,  1, 12, 0, 0)));
+}
+
+TEST_CASE("cron F-06: * * 1 * 1 POSIX OR — fires day 1 OR Monday", "[cron_parser]") {
+    CronExpr e{};
+    cron_parse("* * 1 * 1", e);
+    // 2025-05-01 is Thursday day 1 — match (DOM hits).
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5,  1, 12, 0, 0)));
+    // 2025-05-05 is Monday day 5 — match (DOW hits).
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5,  5, 12, 0, 0)));
+    // 2025-05-12 is Monday day 12 — match (DOW hits).
+    TEST_ASSERT_TRUE (cron_matches(e, make_time(2025, 5, 12, 12, 0, 0)));
+    // 2025-05-02 is Friday day 2 — must miss (neither matches).
+    TEST_ASSERT_FALSE(cron_matches(e, make_time(2025, 5,  2, 12, 0, 0)));
+}
+
+TEST_CASE("cron F-06: cron_next for * * 1 * 1 advances to next matching day", "[cron_parser]") {
+    CronExpr e{};
+    cron_parse("0 0 1 * 1", e);  // 00:00 on day 1 OR Mondays
+    // Start Wed 2025-04-30 12:00. Next match: Thu 2025-05-01 00:00 (day 1).
+    time_t start = make_time(2025, 4, 30, 12, 0, 0);
+    time_t next = cron_next(e, start);
+    TEST_ASSERT_NOT_EQUAL(0, next);
+    struct tm tm_n{}; localtime_r(&next, &tm_n);
+    TEST_ASSERT_EQUAL(2025 - 1900, tm_n.tm_year);
+    TEST_ASSERT_EQUAL(5 - 1,       tm_n.tm_mon);
+    TEST_ASSERT_EQUAL(1,           tm_n.tm_mday);
+    TEST_ASSERT_EQUAL(0,           tm_n.tm_hour);
+}

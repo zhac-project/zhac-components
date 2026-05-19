@@ -23,11 +23,23 @@
 // `zigbee_pool_lock()` / `zigbee_pool_unlock()` around the block. The
 // mutex is recursive, so nested calls through the public API are safe.
 
-extern ZapDevice* s_pool;
-extern uint16_t   s_pool_count;
+// Pool storage (s_pool, s_pool_count) is implementation-private — moved out
+// of the public header so contributors can't bypass the concurrency
+// contract by indexing directly into the array. Use pool_all() / pool_count()
+// (still inline but consuming non-extern internal accessors) for iteration,
+// always under zigbee_pool_lock().
 
 // Allocate pool in PSRAM — call once before any other pool function.
 void zigbee_pool_init();
+
+// Load every NVS-persisted device into the in-memory pool. Must be
+// called AFTER `zigbee_pool_init()` and `zap_store_init()`. Used at
+// boot to restore the device snapshot so paired devices keep working
+// across coordinator restarts — z2m behaviour, no re-pair required.
+// Combined with the ZNP-side NV preservation (CC2652 keeps PAN ID +
+// NWK key + child table across resets) this gives full restart parity.
+// Returns the count loaded; 0 on first boot or zap_store-not-ready.
+uint16_t zigbee_pool_restore_persisted();
 
 // Advisory lock — held across multiple pool calls that must be atomic.
 void zigbee_pool_lock();
@@ -51,5 +63,14 @@ ZapDevice* pool_add();
 void pool_remove(uint16_t idx);
 
 // Direct accessors. Callers that iterate must hold zigbee_pool_lock().
-inline ZapDevice* pool_all()   { return s_pool; }
-inline uint16_t   pool_count() { return s_pool_count; }
+// Implemented in zigbee_pool.cpp so the underlying storage stays private.
+ZapDevice* pool_all();
+uint16_t   pool_count();
+
+// Active count — pool_count() minus tombstoned (zap_dev_is_removed)
+// entries. Use for any externally-reported number (HEARTBEAT.device_count,
+// SYNC_ACK device_count, /api/status info.device_count) so the SPA's
+// Info page agrees with the Devices page list (which already filters
+// removed entries). pool_count() stays for iteration bounds + internal
+// allocation accounting.
+uint16_t pool_count_active();

@@ -387,35 +387,39 @@ void device_shadow_init() {
         heap_caps_calloc(ZAP_MAX_DEVICES, sizeof(DeviceShadowEntry), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     configASSERT(s_shadow);
 
-    auto* pool = static_cast<ZapDevice*>(
-        heap_caps_malloc(sizeof(ZapDevice) * ZAP_MAX_DEVICES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    configASSERT(pool);
-    uint16_t cnt = zap_store_load_devices(pool, ZAP_MAX_DEVICES);
-    ESP_LOGI(TAG, "boot restore: %d devices", cnt);
+    xTaskCreatePinnedToCore(task_shadow, "task_shadow", zhac::stack::kDeviceShadow, nullptr, 4, nullptr, 1);
+    ESP_LOGI(TAG, "device_shadow init OK");
+}
 
-    for (uint16_t i = 0; i < cnt; i++) {
-        DeviceShadowEntry* e = find_or_create_entry(pool[i].ieee_addr);
+uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) {
+    uint16_t restored = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        const ZapDevice* d = &pool[i];
+        DeviceShadowEntry* e = find_or_create_entry(d->ieee_addr);
         if (!e) continue;
-        nvs_load_config(pool[i].ieee_addr, &e->config);
+        nvs_load_config(d->ieee_addr, &e->config);
         uint8_t ac = 0;
-        if (nvs_load_attrs(pool[i].ieee_addr, e->attrs, &ac)) e->attr_count = ac;
-        // Restore last_seen from synthetic attr → ZapDevice
+        if (nvs_load_attrs(d->ieee_addr, e->attrs, &ac)) e->attr_count = ac;
+        // Restore last_seen from synthetic attr → ZapDevice. Deferred via
+        // mark_dirty(LOW) so the flush task batches the write outside the
+        // boot critical path.
         for (uint8_t j = 0; j < e->attr_count; j++) {
             if (strncmp(e->attrs[j].key, KEY_LAST_SEEN, ATTR_KEY_MAX) == 0) {
-                pool[i].last_seen = (uint32_t)e->attrs[j].int_val;
-                zap_store_save_device(&pool[i]);
+                ZapDevice patched = *d;
+                patched.last_seen = (uint32_t)e->attrs[j].int_val;
+                zap_store_mark_dirty(&patched, ZAP_PERSIST_LOW);
                 break;
             }
         }
         Event ev{};
         ev.type = EventType::DEVICE_JOIN;
-        memcpy(ev.data, &pool[i].ieee_addr, sizeof(pool[i].ieee_addr));
+        uint64_t ieee = d->ieee_addr;
+        memcpy(ev.data, &ieee, sizeof(ieee));
         event_bus_publish(ev);
+        restored++;
     }
-
-    heap_caps_free(pool);
-    xTaskCreatePinnedToCore(task_shadow, "task_shadow", zhac::stack::kDeviceShadow, nullptr, 4, nullptr, 1);
-    ESP_LOGI(TAG, "device_shadow init OK, %d devices restored", cnt);
+    ESP_LOGI(TAG, "boot restore: %u devices", restored);
+    return restored;
 }
 
 void device_shadow_process(const ZapDevice* dev,

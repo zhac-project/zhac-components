@@ -91,7 +91,11 @@ HapDecodeResult hap_decode_stream(const uint8_t* buf, size_t len,
             buf[i+1] == HAP_PREAMBLE[1] &&
             buf[i+2] == HAP_PREAMBLE[2]) {
             if (consumed) *consumed = i;
-            return r;
+            // Caller should NOT log "CRC error at offset 0" — the truth
+            // is "garbage skipped, fresh candidate preamble at offset i".
+            // HAP_DECODE_RESYNC is documented as equivalent to a CRC
+            // error for retry purposes (just clearer semantics).
+            return HAP_DECODE_RESYNC;
         }
     }
     if (consumed) *consumed = (len > 3) ? (len - 3) : 0;

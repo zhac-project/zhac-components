@@ -30,7 +30,13 @@
 
 static const char* TAG = "zigbee_configure";
 
-static constexpr uint8_t  CONFIGURE_QUEUE_DEPTH = 16;
+// Sized to ZAP_MAX_DEVICES so a mass-rejoin storm (coordinator restart with
+// 20+ paired routers) never drops a configure. Each slot is 8 B; 200 × 8 =
+// 1.6 KB, negligible on PSRAM. Previously depth=16 silently dropped
+// always-on routers (Tuya, Hue) that never rejoin again — they stayed in
+// ConfigureState::PENDING with no bindings, no reports, and a UI that
+// claimed "supported" while the device was inert.
+static constexpr uint16_t CONFIGURE_QUEUE_DEPTH = ZAP_MAX_DEVICES;
 static constexpr uint8_t  MAX_ATTEMPTS          = 5;
 static constexpr uint32_t BACKOFF_SECS[MAX_ATTEMPTS] = { 1, 5, 30, 120, 600 };
 
@@ -181,9 +187,14 @@ static void task_configure(void*) {
 void zigbee_configure_enqueue(uint64_t ieee) {
     if (!s_q) return;
     if (xQueueSend(s_q, &ieee, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "configure queue full — dropping ieee=0x%016llx "
-                 "(will retry on next rejoin/report)",
+        // Always-on routers (Tuya dimmers, Hue) never rejoin once joined,
+        // so the previous "retry on next rejoin" path stranded them
+        // permanently in ConfigureState::PENDING. Schedule a 1 s retry
+        // (attempts=0 → BACKOFF_SECS[0]=1) so the work is eventually
+        // serviced once the queue drains.
+        ESP_LOGW(TAG, "configure queue full ieee=0x%016llx — retry in 1s",
                  (unsigned long long)ieee);
+        schedule_retry(ieee, 0);
     }
 }
 

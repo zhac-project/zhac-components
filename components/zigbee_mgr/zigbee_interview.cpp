@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include <cstring>
+#include <atomic>
 #include "zcl_seq.h"
 #include "zhc_adapter.h"
 #include "zigbee_mgr.h"
@@ -39,14 +40,14 @@ static MtFrame           s_rsp_frame;
 // context, signals via xSemaphoreGive). Sized to ZNP MT max payload.
 // PSRAM-resident — interview path is infrequent; sequential memcpy fine.
 EXT_RAM_BSS_ATTR static uint8_t s_rsp_buf[MT_MAX_PAYLOAD];
-static volatile uint8_t  s_expected_rsp_cmd1 = 0xFF;  // 0xFF = not waiting
-// Source NWK address we're waiting a response from. 0xFFFF means "don't
-// correlate" (e.g. legacy call sites). Adding this filter closes the race
-// where a delayed ZDO response from device A unblocks device B's wait for
-// the same cmd1 (QWEN §2 / CODEX §1). All TI Z-Stack ZDO AREQs we listen
-// to (NODE_DESC_RSP, ACTIVE_EP_RSP, SIMPLE_DESC_RSP, BIND_RSP) carry the
-// source address in payload[0..1] LE.
-static volatile uint16_t s_expected_src_nwk = 0xFFFF;
+// std::atomic (not volatile) — volatile inhibits compiler reordering but
+// not Xtensa LX7 CPU out-of-order. store_rsp() runs in the ZNP RX task and
+// reads both fields back-to-back, so a publisher that armed the filter
+// after flushing the semaphore must ensure the filter writes are visible
+// before any ZDO AREQ delivered into store_rsp() — std::memory_order_release
+// pairs with acquire-loads in store_rsp() for that handshake.
+static std::atomic<uint8_t>  s_expected_rsp_cmd1{0xFF};   // 0xFF = not waiting
+static std::atomic<uint16_t> s_expected_src_nwk {0xFFFF}; // 0xFFFF = no nwk filter
 
 // Basic cluster read response interceptor
 static SemaphoreHandle_t s_basic_sem = nullptr;
@@ -78,11 +79,13 @@ static inline void interview_wake_notify() {
 }
 
 static void store_rsp(const MtFrame& f) {
-    if (f.cmd1 != s_expected_rsp_cmd1) return;   // wrong cmd1
-    if (s_expected_src_nwk != 0xFFFF) {
-        if (f.payload_len < 2) return;           // truncated
-        uint16_t src = le16(f.payload);          // TI ZDO AREQ: src_nwk in [0..1] LE
-        if (src != s_expected_src_nwk) return;   // not our device
+    const uint8_t  want_cmd1 = s_expected_rsp_cmd1.load(std::memory_order_acquire);
+    if (f.cmd1 != want_cmd1) return;            // wrong cmd1
+    const uint16_t want_nwk  = s_expected_src_nwk.load(std::memory_order_acquire);
+    if (want_nwk != 0xFFFF) {
+        if (f.payload_len < 2) return;          // truncated
+        uint16_t src = le16(f.payload);         // TI ZDO AREQ: src_nwk in [0..1] LE
+        if (src != want_nwk) return;            // not our device
     }
     s_rsp_frame.cmd0        = f.cmd0;
     s_rsp_frame.cmd1        = f.cmd1;
@@ -95,13 +98,18 @@ static void store_rsp(const MtFrame& f) {
 
 static bool wait_rsp(uint8_t expected_cmd1, uint16_t expected_src_nwk,
                      uint32_t ms) {
-    // Flush any stale give from a previous timed-out step.
-    xSemaphoreTake(s_rsp_sem, 0);
-    s_expected_rsp_cmd1 = expected_cmd1;
-    s_expected_src_nwk  = expected_src_nwk;
+    // Arm filter BEFORE flushing the semaphore. The opposite order leaves
+    // a micro-window (one task slice + RX-FIFO drain ≈ 700 µs at 115200
+    // baud) where ZDO AREQs are still gated by the previous wait's filter
+    // (cmd1 still 0xFF after reset) and any matching response delivered
+    // into store_rsp() is dropped. Symptom: spurious 3 s interview
+    // timeouts under load.
+    s_expected_rsp_cmd1.store(expected_cmd1,    std::memory_order_release);
+    s_expected_src_nwk .store(expected_src_nwk, std::memory_order_release);
+    xSemaphoreTake(s_rsp_sem, 0);   // flush any stale give from previous step
     bool ok = xSemaphoreTake(s_rsp_sem, pdMS_TO_TICKS(ms)) == pdTRUE;
-    s_expected_rsp_cmd1 = 0xFF;
-    s_expected_src_nwk  = 0xFFFF;
+    s_expected_rsp_cmd1.store(0xFF,   std::memory_order_release);
+    s_expected_src_nwk .store(0xFFFF, std::memory_order_release);
     return ok;
 }
 
@@ -220,18 +228,23 @@ static bool interview_read_basic(ZapDevice* dev, uint16_t nwk) {
 
 // Returns true on success, false if a ZDO step failed (caller may retry).
 static bool do_interview(uint64_t ieee, uint16_t nwk) {
-    bool is_rejoin = (pool_find_by_ieee(ieee) != nullptr);
-    if (is_rejoin)
-        ESP_LOGI(TAG, "Device rejoin ieee=0x%016llx nwk=0x%04x", (unsigned long long)ieee, nwk);
-
+    // Find-or-create + initial state writes under one lock. Without the
+    // advisory lock, a concurrent `zigbee_pool_remove(ieee)` from a user
+    // delete can land between the two formerly-separate lookups (TOCTOU):
+    // call 1 returns non-null → is_rejoin=true, call 2 returns null → we
+    // fall through to pool_add() but still treat the slot as a rejoin and
+    // skip the support_state reset. The single locked lookup also halves
+    // the hash work.
+    zigbee_pool_lock();
     ZapDevice* dev = pool_find_by_ieee(ieee);
+    bool is_rejoin = (dev != nullptr);
     if (!dev) dev = pool_add();
-    if (!dev) return false;
-
+    if (!dev) {
+        zigbee_pool_unlock();
+        return false;
+    }
     dev->ieee_addr = ieee;
     dev->nwk_addr  = nwk;
-    zigbee_pool_mark_dirty();  // nwk may have changed on rejoin — rebuild hash index
-
     // Reset interview progress for this attempt. support_state is preserved
     // across rejoins when the IEEE matches — a device we already know how
     // to drive does not lose its converter binding if it rejoins (Q2).
@@ -241,6 +254,11 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     if (!is_rejoin) {
         dev->support_state  = static_cast<uint8_t>(SupportState::UNKNOWN);
     }
+    zigbee_pool_unlock();
+    zigbee_pool_mark_dirty();  // nwk may have changed on rejoin — rebuild hash index
+
+    if (is_rejoin)
+        ESP_LOGI(TAG, "Device rejoin ieee=0x%016llx nwk=0x%04x", (unsigned long long)ieee, nwk);
 
     // 1. ZDO_NODE_DESC_REQ
     {
@@ -582,6 +600,18 @@ static void on_tc_dev_ind(const MtFrame& f) {
     // nwk, while task_interview later pops a stale-nwk JoinEvent from
     // the queue and re-creates the entry under the OLD nwk — symptom:
     // "AF_INCOMING from unknown nwk=…" loops on a live device.
+    // Lock spans the full find-then-mutate sequence. Previously the
+    // pool_find_by_ieee released the mutex on return, and a concurrent
+    // pool_remove (swap-with-last from a user delete or ZDO_LEAVE_IND)
+    // could relocate the entry at `d` between the lookup and the write
+    // below — d->nwk_addr would then clobber a different device's record.
+    // The mutex is recursive so the public mark_dirty / dev_clear_removed
+    // calls below remain safe.
+    bool seeded   = false;
+    bool refreshed = false;
+    uint16_t old_nwk = 0;
+    bool cleared_removed = false;
+    zigbee_pool_lock();
     ZapDevice* d = pool_find_by_ieee(ev.ieee);
     if (!d) {
         d = pool_add();
@@ -589,23 +619,30 @@ static void on_tc_dev_ind(const MtFrame& f) {
             d->ieee_addr = ev.ieee;
             d->nwk_addr  = ev.nwk;
             d->interview_state = static_cast<uint8_t>(InterviewState::NONE);
-            zigbee_pool_mark_dirty();
-            ESP_LOGI(TAG, "Pool seeded on join ieee=0x%016llx nwk=0x%04x",
-                     (unsigned long long)ev.ieee, ev.nwk);
+            seeded = true;
         }
     } else if (d->nwk_addr != ev.nwk) {
-        ESP_LOGI(TAG, "Rejoin nwk refresh ieee=0x%016llx %04x → %04x",
-                 (unsigned long long)ev.ieee, d->nwk_addr, ev.nwk);
+        old_nwk = d->nwk_addr;
         d->nwk_addr = ev.nwk;
-        zigbee_pool_mark_dirty();
+        refreshed = true;
     }
-    if (d) {
-        // Clear the soft-remove flag — device is back on the network.
-        if (zap_dev_is_removed(d)) {
-            ESP_LOGI(TAG, "Rejoin clears ZAP_DEV_REMOVED ieee=0x%016llx",
-                     (unsigned long long)ev.ieee);
-            zap_dev_clear_removed(d);
-        }
+    if (d && zap_dev_is_removed(d)) {
+        zap_dev_clear_removed(d);
+        cleared_removed = true;
+    }
+    zigbee_pool_unlock();
+
+    if (seeded || refreshed) zigbee_pool_mark_dirty();
+    if (seeded) {
+        ESP_LOGI(TAG, "Pool seeded on join ieee=0x%016llx nwk=0x%04x",
+                 (unsigned long long)ev.ieee, ev.nwk);
+    } else if (refreshed) {
+        ESP_LOGI(TAG, "Rejoin nwk refresh ieee=0x%016llx %04x → %04x",
+                 (unsigned long long)ev.ieee, old_nwk, ev.nwk);
+    }
+    if (cleared_removed) {
+        ESP_LOGI(TAG, "Rejoin clears ZAP_DEV_REMOVED ieee=0x%016llx",
+                 (unsigned long long)ev.ieee);
     }
     // Rejoin is itself a wake signal — kicks task_interview if it's
     // currently sleeping between attempts for this device.

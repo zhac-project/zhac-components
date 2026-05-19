@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // components/zigbee_mgr/zigbee_pool.cpp
 #include "zigbee_pool.h"
+#include "zigbee_mgr.h"
+#include "zhc_adapter.h"
+#include "zap_store.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -9,8 +12,15 @@
 #include <cstring>
 #include <cstdlib>
 
-ZapDevice* s_pool       = nullptr;
-uint16_t   s_pool_count = 0;
+// Internal linkage — was previously extern in the public header, which let
+// every TU bypass the pool mutex by indexing the array directly.
+static ZapDevice* s_pool       = nullptr;
+static uint16_t   s_pool_count = 0;
+
+// Out-of-line accessors so external iteration paths keep working without
+// re-exposing the raw storage. Callers must hold zigbee_pool_lock().
+ZapDevice* pool_all()   { return s_pool; }
+uint16_t   pool_count() { return s_pool_count; }
 
 // Recursive so callers that hold zigbee_pool_lock() externally can still
 // invoke the public functions without self-deadlocking.
@@ -140,4 +150,72 @@ void zigbee_pool_mark_dirty() {
     lock();
     s_hash_dirty = true;
     unlock();
+}
+
+// ── Restore persisted devices from NVS ──────────────────────────────
+//
+// z2m-equivalent: at startup z2m loads `database.db` and presents
+// every paired device as already-known so reports decode from frame
+// one without re-pairing. ZHAC keeps the per-device snapshot in NVS
+// via `zap_store_save_device` (called from interview + rename + state
+// changes), but until this restore step landed the in-memory pool was
+// empty after every reboot and AF_INCOMING frames from existing
+// devices dropped as "unknown ieee".
+//
+// Combined with the ZNP-side NV preservation (CC2652 keeps PAN ID,
+// NWK key, child table, etc. across resets), this gives full z2m-
+// equivalent restart semantics: the coordinator keeps the network,
+// the ESP32 keeps the device snapshots, devices keep talking.
+//
+// Returns the device count loaded; 0 on first boot or when zap_store
+// hasn't been initialised yet.
+// Active count = pool slots minus tombstoned (zap_dev_is_removed)
+// entries. `pool_count()` returns the raw slot count which includes
+// soft-removed devices kept around for re-pair fast-path. External
+// reports (HEARTBEAT, SYNC_ACK, /api/status) should use this so the
+// SPA's Info-page number matches the Devices-page list (which already
+// filters via `if (zap_dev_is_removed) continue`).
+uint16_t pool_count_active() {
+    lock();
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < s_pool_count; i++) {
+        if (!zap_dev_is_removed(&s_pool[i])) n++;
+    }
+    unlock();
+    return n;
+}
+
+uint16_t zigbee_pool_restore_persisted() {
+    if (!zap_store_is_ready()) {
+        ESP_LOGW("zigbee_pool", "restore skipped — zap_store not ready");
+        return 0;
+    }
+    lock();
+    const uint16_t n = zap_store_load_devices(s_pool, ZAP_MAX_DEVICES);
+    s_pool_count  = n;
+    s_hash_dirty  = true;   // first lookup rebuilds ieee/nwk indices
+    unlock();
+    ESP_LOGI("zigbee_pool",
+              "restored %u device%s from NVS — network preserved across reboot",
+              n, n == 1 ? "" : "s");
+    return n;
+}
+
+// Hard-remove (was in zcl_commands.cpp, where it touched s_pool / s_pool_count
+// directly via the extern declarations — those have been removed so the
+// implementation moves here, next to the storage it manipulates.)
+bool zigbee_pool_remove(uint64_t ieee) {
+    lock();
+    int16_t found = -1;
+    for (uint16_t i = 0; i < s_pool_count; i++) {
+        if (s_pool[i].ieee_addr == ieee) { found = (int16_t)i; break; }
+    }
+    if (found < 0) { unlock(); return false; }
+    pool_remove(static_cast<uint16_t>(found));   // swap-with-last under same lock (recursive)
+    unlock();
+    // Drop the adapter's cached def pointer so if a new device ever claims
+    // this ieee again we don't serve the old port.
+    zhac_adapter_invalidate_def_cache(ieee);
+    ESP_LOGI("zigbee_pool", "pool_remove ieee=0x%016llX", (unsigned long long)ieee);
+    return true;
 }

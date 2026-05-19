@@ -4,8 +4,12 @@ menu "MQTT Gateway"
 
 config MQTT_BROKER_URL
     string "MQTT broker URL"
-    default "mqtt://localhost"
+    default ""
     help
         URI of the MQTT broker (e.g. mqtt://192.168.1.100:1883).
+        F-09: default left empty so a fresh checkout does not silently
+        connect to whatever URL the original developer baked into a
+        local sdkconfig. Set per-deployment via menuconfig or the
+        runtime API. Empty value → MQTT client is not started.
 
 endmenu

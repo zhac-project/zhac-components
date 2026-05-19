@@ -533,6 +533,139 @@ bool zigbee_zcl_write_attr(uint16_t nwk_addr, uint8_t endpoint,
     return true;
 }
 
+// ── zigbee_zcl_configure_report ─────────────────────────────────────
+//
+// ZCL Configure Reporting (cmd 0x06) for ONE attribute.
+//
+// Wire format per ZCL §2.5.7:
+//   FC | TSN | CMD=0x06 | [manu_code if manu_code != 0]
+//   record: direction(1=0x00 send reports TO us)
+//           attr_id(2 LE)
+//           attr_type(1)
+//           min_interval(2 LE seconds)
+//           max_interval(2 LE seconds)
+//           reportable_change(N — ANALOG types only; OMITTED for discrete)
+//
+// Reportable-change field width follows the attribute data type:
+//   analog  (u8/s8 0x20/0x28, u16/s16 0x21/0x29, u32/s32 0x23/0x2B,
+//            float32 0x38/0x39, …)  → 1/2/4 bytes matching the type
+//   discrete (Bool 0x10, ENUM8 0x30, ENUM16 0x31, bitmap 0x18..0x1F)
+//                                      → no change field at all
+//
+// SRSP success means ZNP queued the AF_DATA_REQUEST; the device's
+// Configure Reporting Response with per-attribute status codes lands
+// later as AF_INCOMING_MSG and traverses the normal decode pipeline.
+// Matches z2m's `reporting.*` helpers — they don't await the response.
+bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
+                                  uint16_t cluster_id, uint16_t attr_id,
+                                  uint8_t  attr_type,
+                                  uint16_t min_interval,
+                                  uint16_t max_interval,
+                                  uint32_t reportable_change,
+                                  uint16_t manu_code) {
+    // Type → reportable-change byte width.
+    // 0     = discrete type, no change field follows
+    // 1/2/3/4 = analog field width
+    // 0xFF  = unsupported type (caller-visible failure rather than
+    //         silently truncating)
+    auto change_width = [](uint8_t t) -> uint8_t {
+        switch (t) {
+            // Discrete types — no reportable_change.
+            case 0x10:                              // Bool
+            case 0x18: case 0x19: case 0x1A: case 0x1B:
+            case 0x1C: case 0x1D: case 0x1E: case 0x1F:  // bitmap8..bitmap64
+            case 0x30: case 0x31:                   // ENUM8 / ENUM16
+                return 0;
+            // 1-byte analog.
+            case 0x20: case 0x28:                   // u8, s8
+                return 1;
+            // 2-byte analog.
+            case 0x21: case 0x29: case 0x38:        // u16, s16, semi-float
+                return 2;
+            // 3-byte analog (uncommon).
+            case 0x22: case 0x2A:                   // u24, s24
+                return 3;
+            // 4-byte analog.
+            case 0x23: case 0x2B: case 0x39:        // u32, s32, float32
+                return 4;
+            default:
+                return 0xFF;
+        }
+    };
+    const uint8_t chg_w = change_width(attr_type);
+    if (chg_w == 0xFF) return false;
+
+    const std::size_t hdr_len = manu_code ? 5u : 3u;
+    const std::size_t rec_len = 1u /*direction*/ + 2u /*attr_id*/ +
+                                 1u /*type*/ + 2u /*min*/ + 2u /*max*/ +
+                                 chg_w;
+    const std::size_t body_len = hdr_len + rec_len;
+    if (body_len > kAfPayloadMax) return false;
+
+    const uint8_t seq = zcl_seq_next();
+    uint8_t zcl_frame[kAfPayloadMax];
+    std::size_t pos = 0;
+    if (manu_code) {
+        zcl_frame[pos++] = 0x04;   // FC: profile-wide, manu-specific, C→S
+        zcl_frame[pos++] = static_cast<uint8_t>(manu_code & 0xFF);
+        zcl_frame[pos++] = static_cast<uint8_t>((manu_code >> 8) & 0xFF);
+        zcl_frame[pos++] = seq;
+        zcl_frame[pos++] = 0x06;   // CMD_CONFIGURE_REPORTING
+    } else {
+        zcl_frame[pos++] = 0x00;   // FC: profile-wide, C→S
+        zcl_frame[pos++] = seq;
+        zcl_frame[pos++] = 0x06;
+    }
+    zcl_frame[pos++] = 0x00;       // direction: 0 = device reports TO us
+    zcl_frame[pos++] = static_cast<uint8_t>(attr_id & 0xFF);
+    zcl_frame[pos++] = static_cast<uint8_t>((attr_id >> 8) & 0xFF);
+    zcl_frame[pos++] = attr_type;
+    zcl_frame[pos++] = static_cast<uint8_t>(min_interval & 0xFF);
+    zcl_frame[pos++] = static_cast<uint8_t>((min_interval >> 8) & 0xFF);
+    zcl_frame[pos++] = static_cast<uint8_t>(max_interval & 0xFF);
+    zcl_frame[pos++] = static_cast<uint8_t>((max_interval >> 8) & 0xFF);
+    for (uint8_t i = 0; i < chg_w; ++i) {
+        zcl_frame[pos++] = static_cast<uint8_t>(
+            (reportable_change >> (8 * i)) & 0xFF);
+    }
+
+    uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
+    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
+    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
+    af_pl[2] = endpoint;
+    af_pl[3] = 0x01;
+    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
+    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
+    af_pl[6] = seq;
+    af_pl[7] = 0x00;   // options
+    af_pl[8] = 0x0F;   // radius
+    af_pl[9] = static_cast<uint8_t>(body_len);
+    std::memcpy(af_pl + kAfHeaderLen, zcl_frame, body_len);
+
+    MtFrame req{}, rsp{};
+    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
+    req.payload = af_pl;
+    req.payload_len = static_cast<uint16_t>(kAfHeaderLen + body_len);
+    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
+        ESP_LOGW(TAG, "configure_report: no SRSP nwk=0x%04x cluster=0x%04x attr=0x%04x",
+                 nwk_addr, cluster_id, attr_id);
+        return false;
+    }
+    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
+        ESP_LOGW(TAG, "configure_report: status=0x%02x nwk=0x%04x cluster=0x%04x",
+                 rsp.payload_len ? rsp.payload[0] : 0xFF,
+                 nwk_addr, cluster_id);
+        return false;
+    }
+    ESP_LOGI(TAG,
+              "configure_report -> nwk=0x%04x ep=%u cluster=0x%04x "
+              "attr=0x%04x type=0x%02x min=%us max=%us chg=%lu",
+              nwk_addr, endpoint, cluster_id, attr_id, attr_type,
+              min_interval, max_interval,
+              static_cast<unsigned long>(reportable_change));
+    return true;
+}
+
 // Shared core. When `confirm_timeout_ms > 0`, reserves a confirm ring
 // slot BEFORE the SREQ is queued (so a racing AREQ isn't dropped) and
 // blocks on it after SRSP success. Caller can opt out by passing 0.
@@ -788,16 +921,6 @@ bool zigbee_miboxer_fut089z_finalize(uint16_t nwk_addr, uint8_t dst_ep) {
     return z && s;
 }
 
-bool zigbee_pool_remove(uint64_t ieee) {
-    for (uint16_t i = 0; i < s_pool_count; i++) {
-        if (s_pool[i].ieee_addr == ieee) {
-            pool_remove(i);
-            // Drop the adapter's cached def pointer so if a new device
-            // ever claims this ieee again we don't serve the old port.
-            zhac_adapter_invalidate_def_cache(ieee);
-            ESP_LOGI(TAG, "pool_remove ieee=0x%016llX", (unsigned long long)ieee);
-            return true;
-        }
-    }
-    return false;
-}
+// zigbee_pool_remove implementation moved to zigbee_pool.cpp where the
+// underlying storage (s_pool / s_pool_count) lives. Direct extern access
+// was removed from zigbee_pool.h to enforce the mutex contract.

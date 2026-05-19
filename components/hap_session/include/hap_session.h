@@ -28,7 +28,8 @@ bool hap_session_send(const HapFrame& frame);
 // Feed a decoded frame from the transport. Routes ACKs, SYNCs, and data frames.
 void hap_session_on_receive(const HapFrame& frame);
 
-// Call every ~10 ms from TaskHAP. Checks 100 ms ACK timeouts, retransmits up to 3x.
+// Call every ~10 ms from TaskHAP. Checks ~1000 ms ACK timeouts, retransmits
+// up to 5× (total budget ~5 s). See hap_session.cpp ACK_TIMEOUT_MS / MAX_RETRIES.
 void hap_session_tick();
 
 // Returns and auto-increments the next outgoing sequence number.
