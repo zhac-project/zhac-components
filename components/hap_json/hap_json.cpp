@@ -1011,18 +1011,20 @@ bool hap_json_decode_interview_req(const uint8_t* payload, uint16_t len,
 
 // ── DEVICE_OPTIONS_SET / DEVICE_OPTIONS_SET_ACK ──────────────────────────
 // Propagates per-device DeviceConfig knobs that live on P4's device_shadow
-// from the S3-side /api/devices/<ieee>/options endpoint. Today only
-// `occupancy_timeout` is carried; add more fields here as they land.
+// from the S3-side /api/devices/<ieee>/options endpoint. Carries
+// `occupancy_timeout`, `debounce_ms`, and `throttle_ms` (all optional).
 
 bool hap_json_encode_device_options_set(uint8_t* buf, size_t cap, uint16_t* out_len,
                                          uint64_t ieee,
                                          const int32_t* occupancy_timeout_s,
-                                         const int32_t* debounce_ms) {
+                                         const int32_t* debounce_ms,
+                                         const int32_t* throttle_ms) {
     JsonDocument doc;
     char s[20]; fmt_ieee(s, ieee);
     doc["ieee"] = s;
     if (occupancy_timeout_s) doc["occupancy_timeout"] = *occupancy_timeout_s;
     if (debounce_ms)         doc["debounce_ms"]       = *debounce_ms;
+    if (throttle_ms)         doc["throttle_ms"]       = *throttle_ms;
     size_t n = serializeJson(doc, (char*)buf, cap);
     if (n == 0 || n >= cap) return false;
     *out_len = (uint16_t)n;
@@ -1032,7 +1034,8 @@ bool hap_json_encode_device_options_set(uint8_t* buf, size_t cap, uint16_t* out_
 bool hap_json_decode_device_options_set(const uint8_t* payload, uint16_t len,
                                          uint64_t* ieee_out,
                                          int32_t* occupancy_timeout_s_out,
-                                         int32_t* debounce_ms_out) {
+                                         int32_t* debounce_ms_out,
+                                         int32_t* throttle_ms_out) {
     JsonDocument doc;
     if (deserializeJson(doc, (const char*)payload, len) != DeserializationError::Ok) return false;
     *ieee_out = parse_ieee(doc["ieee"] | "");
@@ -1045,6 +1048,10 @@ bool hap_json_decode_device_options_set(const uint8_t* payload, uint16_t len,
     if (debounce_ms_out) {
         *debounce_ms_out = doc["debounce_ms"].is<int>()
             ? doc["debounce_ms"].as<int32_t>() : -1;
+    }
+    if (throttle_ms_out) {
+        *throttle_ms_out = doc["throttle_ms"].is<int>()
+            ? doc["throttle_ms"].as<int32_t>() : -1;
     }
     return true;
 }

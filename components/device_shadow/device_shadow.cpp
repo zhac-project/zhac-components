@@ -481,6 +481,17 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
     return true;
 }
 
+bool device_shadow_set_throttle_ms(uint64_t ieee, uint32_t throttle_ms) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_or_create_entry(ieee);
+    if (!e) { xSemaphoreGive(s_mutex); return false; }
+    e->config.throttle_ms = throttle_ms;
+    e->throttle_last_ms = 0;   // reset window so the new rate applies immediately
+    nvs_save_config(ieee, &e->config);
+    xSemaphoreGive(s_mutex);
+    return true;
+}
+
 bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);

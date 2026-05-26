@@ -117,3 +117,10 @@ bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s);
 // within the window. Used as "flood protection" for chatty devices
 // (e.g. some Tuya thermostats that spam ~10 msg/s). Persisted to NVS.
 bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms);
+
+// Set per-device report rate-limit (shadow_pipeline_throttle_pass): at most one
+// state update per `throttle_ms` window, regardless of value change (unlike
+// debounce, which only coalesces identical values). 0 = disabled. For
+// flood-prone Tuya-DP sensors (air-quality monitors) that report every few
+// seconds with no device-side reporting-interval control. Persisted to NVS.
+bool device_shadow_set_throttle_ms(uint64_t ieee, uint32_t throttle_ms);

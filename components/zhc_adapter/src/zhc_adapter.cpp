@@ -470,13 +470,36 @@ void log_payload(std::uint64_t ieee,
                 case zhc::FrameFamily::TuyaDp: family_name = "TuyaDp"; break;
             }
         }
-        ESP_LOGI(TAG, "%s  (no match) cluster=0x%04x(%s) family=%s type=%u cmd=0x%02x zcl[%zu]=%s%s",
-                 prefix, cluster_id,
-                 msg && msg->cluster ? msg->cluster : "?",
-                 family_name,
-                 msg ? static_cast<unsigned>(msg->type) : 0,
-                 msg ? msg->command_id : 0,
-                 zcl_len, hex, zcl_len > 16 ? "…" : "");
+        // Benign protocol housekeeping carries no device state — demote to
+        // debug so it doesn't read like a device-coverage gap:
+        //   * any ZCL Default Response (global cmd 0x0B, any cluster)
+        //   * Tuya 0xEF00 MCU management — 0x10/0x11 version, 0x24 sync-time,
+        //     0x25 gateway-connection-status
+        bool protocol_noise = false;
+        if (msg) {
+            const auto cmd = msg->command_id;
+            const bool cluster_specific =
+                zcl_len >= 1 && (zcl[0] & 0x03) == 0x01;
+            if (!cluster_specific && cmd == 0x0B) {
+                protocol_noise = true;
+            } else if (cluster_id == 0xEF00 && cluster_specific &&
+                       (cmd == 0x10 || cmd == 0x11 ||
+                        cmd == 0x24 || cmd == 0x25)) {
+                protocol_noise = true;
+            }
+        }
+        if (protocol_noise) {
+            ESP_LOGD(TAG, "%s  (protocol frame, no state) cluster=0x%04x cmd=0x%02x",
+                     prefix, cluster_id, msg ? msg->command_id : 0);
+        } else {
+            ESP_LOGI(TAG, "%s  (no match) cluster=0x%04x(%s) family=%s type=%u cmd=0x%02x zcl[%zu]=%s%s",
+                     prefix, cluster_id,
+                     msg && msg->cluster ? msg->cluster : "?",
+                     family_name,
+                     msg ? static_cast<unsigned>(msg->type) : 0,
+                     msg ? msg->command_id : 0,
+                     zcl_len, hex, zcl_len > 16 ? "…" : "");
+        }
         return;
     }
     ESP_LOGI(TAG, "%s  matched, %u keys:",

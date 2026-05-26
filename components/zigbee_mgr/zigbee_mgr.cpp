@@ -610,6 +610,29 @@ static bool zcl_maybe_respond_ias_enroll(const AfRawFrame& frame,
     return true;
 }
 
+// ZCL Foundation global (profile-wide) commands that must NOT be answered
+// with a Default Response. A DR acknowledges a *command*; you never ACK a
+// frame that is itself a response, nor one that explicitly opted out:
+//   0x01 Read Attributes Response          0x0D Discover Attributes Response
+//   0x04 Write Attributes Response         0x10 Write Attributes Structured Rsp
+//   0x05 Write Attributes No Response      0x12 Discover Commands Received Rsp
+//   0x07 Configure Reporting Response      0x14 Discover Commands Generated Rsp
+//   0x09 Read Reporting Configuration Rsp  0x16 Discover Attributes Extended Rsp
+//   0x0B Default Response (also caught upstream as a loop guard)
+// Everything else — reads, writes, configure-reporting, discover, and the
+// unsolicited Report Attributes (0x0A) — stays DR-eligible so sleepy
+// reporters still get their ZCL-level ACK. Cluster-specific frames are
+// always genuine commands and are never gated by this list.
+static bool zcl_global_cmd_wants_default_response(uint8_t cmd_id) {
+    switch (cmd_id) {
+        case 0x01: case 0x04: case 0x05: case 0x07: case 0x09:
+        case 0x0B: case 0x0D: case 0x10: case 0x12: case 0x14: case 0x16:
+            return false;
+        default:
+            return true;
+    }
+}
+
 // Tuya sleepy end-devices retransmit up to 5× when the outgoing frame
 // control has bit 4 ("disable default response") clear and we don't
 // ACK. Respond to every unicast frame except Default Responses
@@ -635,6 +658,10 @@ static void zcl_send_default_response_if_needed(const AfRawFrame& frame,
     const bool is_default_response = !is_cs && (cmd_id == 0x0B);
     const bool disable_default     = (in_fc & 0x10) != 0;
     if (is_default_response || disable_default) return;
+    // ZCL spec: a Default Response ACKs a command, never another response.
+    // Cluster-specific frames are always commands; among global frames,
+    // skip the ones that are themselves responses (or opted out of ACK).
+    if (!is_cs && !zcl_global_cmd_wants_default_response(cmd_id)) return;
     zigbee_send_default_response(frame.src_nwk, frame.src_ep,
                                   frame.cluster_id, in_fc,
                                   mfg_code, tsn, cmd_id, 0x00);

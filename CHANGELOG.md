@@ -7,6 +7,24 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Added
+
+- **device_shadow / hap_json**: per-device `throttle_ms` report rate-limit knob,
+  carried over `DEVICE_OPTIONS_SET` and applied by the existing
+  `shadow_pipeline_throttle_pass` (new `device_shadow_set_throttle_ms`, NVS-
+  persisted). Caps the message flood from chatty Tuya-DP sensors (air-quality
+  monitors) that report every few seconds with no device-side reporting-interval
+  control. `hap_json_{encode,decode}_device_options_set` gained an optional
+  `throttle_ms` field. (#84)
+
+### Changed
+
+- **zhc_adapter**: benign protocol housekeeping frames now log at debug as
+  "(protocol frame, no state)" instead of the INFO "(no match)" line that
+  read like a device-coverage gap — any ZCL Default Response (global cmd
+  0x0B) and Tuya 0xEF00 MCU management (0x10/0x11 version, 0x24 sync-time,
+  0x25 gateway-connection-status). Decode/shadow behaviour unchanged.
+
 ### Fixed — Critical
 
 - **zigbee_mgr**: hold pool mutex across the `on_tc_dev_ind` find-then-mutate
@@ -26,6 +44,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed — Important
 
+- **zigbee_mgr**: the ZCL Default-Response TX gate is now spec-correct — it
+  no longer answers global frames that are themselves *responses* (Read /
+  Write Attributes Response, Configure-Reporting / Read-Reporting-Config
+  Response, the Discover-* responses, Write-Structured Response) or
+  Write-Attributes-No-Response (0x05). Previously every unsolicited unicast
+  frame was ACK'd, so the coordinator sent a Default Response back at its own
+  interview Read-Attributes Responses. Cluster-specific commands and the
+  unsolicited Report Attributes (0x0A) stay DR-eligible, so the sleepy-Tuya
+  retransmit suppression is unchanged. New helper
+  `zcl_global_cmd_wants_default_response`.
 - **zigbee_mgr**: switch `s_expected_rsp_cmd1` / `s_expected_src_nwk` from
   `volatile` to `std::atomic` with release/acquire ordering, and arm the
   filter BEFORE flushing the response semaphore in `wait_rsp`. Closes the
