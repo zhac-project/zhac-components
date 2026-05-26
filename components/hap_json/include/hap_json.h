@@ -403,21 +403,23 @@ bool hap_json_decode_interview_req(const uint8_t* payload, uint16_t len,
                                     uint64_t* ieee_out);
 
 // ── DEVICE_OPTIONS_SET (0x2C, S3→P4) / DEVICE_OPTIONS_SET_ACK (0x2D) ─────
-// Request:  {"ieee":"0x...", "occupancy_timeout":N?, "debounce_ms":N?}
+// Request:  {"ieee":"0x...", "occupancy_timeout":N?, "debounce_ms":N?, "throttle_ms":N?}
 // Response: {"ok":true/false}
 //
-// `occupancy_timeout_s` / `debounce_ms` are optional. Pass `nullptr` to
-// the encoder to omit a field, and the decoder writes -1 into the out
-// pointer when the field is absent — callers must skip forwarding to
-// the shadow in that case.
+// `occupancy_timeout_s` / `debounce_ms` / `throttle_ms` are optional. Pass
+// `nullptr` to the encoder to omit a field, and the decoder writes -1 into the
+// out pointer when the field is absent — callers must skip forwarding to the
+// shadow in that case.
 bool hap_json_encode_device_options_set(uint8_t* buf, size_t cap, uint16_t* out_len,
                                          uint64_t ieee,
                                          const int32_t* occupancy_timeout_s,
-                                         const int32_t* debounce_ms);
+                                         const int32_t* debounce_ms,
+                                         const int32_t* throttle_ms);
 bool hap_json_decode_device_options_set(const uint8_t* payload, uint16_t len,
                                          uint64_t* ieee_out,
                                          int32_t* occupancy_timeout_s_out,
-                                         int32_t* debounce_ms_out);
+                                         int32_t* debounce_ms_out,
+                                         int32_t* throttle_ms_out);
 bool hap_json_encode_device_options_ack(uint8_t* buf, size_t cap, uint16_t* out_len,
                                          bool ok);
 bool hap_json_decode_device_options_ack(const uint8_t* payload, uint16_t len,
