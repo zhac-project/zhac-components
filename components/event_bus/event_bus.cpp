@@ -4,6 +4,7 @@
 #include "event_bus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 
 static const char* TAG = "event_bus";
@@ -22,7 +23,20 @@ static SubEntry s_subs[EVENT_TYPE_COUNT][MAX_SUBS_PER_TYPE];
 // s_sub_hwm[t] = highest used slot index + 1 for type t
 static uint8_t  s_sub_hwm[EVENT_TYPE_COUNT];
 
+// F28/F36 (FINDINGS.md): guard the subscriber table. subscribe/unsubscribe
+// mutate it while publish (called from many tasks) iterates it — previously
+// unsynchronised (torn SubEntry reads; a queue could be vQueueDelete'd by
+// unsubscribe mid-send → use-after-free; the F36 evict+resend pair raced other
+// publishers). publish is send-only (the direct-handler path runs in
+// event_bus_drain, not here), so holding the lock across its loop is safe.
+// Recursive so a handler that re-enters the bus can't self-deadlock.
+// Null-guarded for pre-init single-threaded use.
+static SemaphoreHandle_t s_bus_mtx = nullptr;
+static inline void bus_lock()   { if (s_bus_mtx) xSemaphoreTakeRecursive(s_bus_mtx, portMAX_DELAY); }
+static inline void bus_unlock() { if (s_bus_mtx) xSemaphoreGiveRecursive(s_bus_mtx); }
+
 void event_bus_init() {
+    if (!s_bus_mtx) s_bus_mtx = xSemaphoreCreateRecursiveMutex();
     for (uint8_t t = 0; t < EVENT_TYPE_COUNT; t++) {
         s_sub_hwm[t] = 0;
         for (uint8_t i = 0; i < MAX_SUBS_PER_TYPE; i++) {
@@ -42,6 +56,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
     }
 
     // Find first free slot (supports re-use after unsubscribe)
+    bus_lock();
     int8_t pos = -1;
     for (uint8_t i = 0; i < MAX_SUBS_PER_TYPE; i++) {
         if (s_subs[idx][i].queue == nullptr && !s_subs[idx][i].handler) {
@@ -50,6 +65,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
         }
     }
     if (pos < 0) {
+        bus_unlock();
         ESP_LOGE(TAG, "subscriber table full for type %d", idx);
         return EVENT_SUB_INVALID;
     }
@@ -59,6 +75,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
     s_subs[idx][pos] = {handler, q, filter};
     if ((uint8_t)(pos + 1) > s_sub_hwm[idx])
         s_sub_hwm[idx] = (uint8_t)(pos + 1);
+    bus_unlock();
 
     ESP_LOGI(TAG, "subscribed type=%d pos=%d", idx, pos);
     return (EventSubHandle)((idx << 8) | (uint8_t)pos);
@@ -70,6 +87,7 @@ void event_bus_unsubscribe(EventSubHandle handle) {
     uint8_t pos = handle & 0xFF;
     if (idx == 0 || idx >= EVENT_TYPE_COUNT || pos >= MAX_SUBS_PER_TYPE) return;
 
+    bus_lock();
     if (s_subs[idx][pos].queue) {
         vQueueDelete(s_subs[idx][pos].queue);
         s_subs[idx][pos].queue = nullptr;
@@ -81,6 +99,7 @@ void event_bus_unsubscribe(EventSubHandle handle) {
            s_subs[idx][s_sub_hwm[idx] - 1].queue == nullptr &&
            !s_subs[idx][s_sub_hwm[idx] - 1].handler)
         s_sub_hwm[idx]--;
+    bus_unlock();
 
     ESP_LOGI(TAG, "unsubscribed type=%d pos=%d", idx, pos);
 }
@@ -89,6 +108,7 @@ void event_bus_publish(const Event& e) {
     uint8_t idx = static_cast<uint8_t>(e.type);
     if (idx == 0 || idx >= EVENT_TYPE_COUNT) return;
 
+    bus_lock();   // F28/F36: send-only loop; safe to hold across (no blocking handler here)
     for (uint8_t i = 0; i < s_sub_hwm[idx]; i++) {
         SubEntry& sub = s_subs[idx][i];
         if (!sub.queue && !sub.handler) continue;   // unsubscribed slot
@@ -111,6 +131,7 @@ void event_bus_publish(const Event& e) {
             sub.handler(e);
         }
     }
+    bus_unlock();
 }
 
 uint8_t event_bus_drain(EventType type, uint32_t timeout_ms) {

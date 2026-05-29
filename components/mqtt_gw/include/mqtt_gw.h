@@ -45,6 +45,10 @@ void mqtt_gw_on_sta_up();
 /* S3 only — no-ops on P4 */
 bool mqtt_gw_is_connected();
 bool mqtt_gw_is_active();  // true if client exists (not auto-disabled)
+/* True only when the configured broker URL is a verified-TLS scheme
+ * (mqtts:// / wss://). Used to gate cleartext-sensitive publishes (e.g. the
+ * metrics snapshot, F45). Always false on P4 (no local client). */
+bool mqtt_gw_is_secure();
 void mqtt_gw_set_rx_callback(mqtt_rx_cb_t cb);
 void mqtt_gw_subscribe(const char* topic_filter, int qos);
 

@@ -31,7 +31,10 @@ bool znp_get_wire_trace() { return s_wire_trace; }
 // crash loop is caught within seconds, long enough that a one-off reset
 // during normal operation doesn't escalate.
 static constexpr size_t RESET_BURST_N        = 3;
-static constexpr int64_t RESET_BURST_US      = 30LL * 1000 * 1000;  // 10 s
+// F13 (FINDINGS.md): was 30 s, which contradicted the documented 10 s
+// window above and the log line below — an NCP rebooting every ~11 s never
+// tripped the burst detector. Now matches the intended 10 s.
+static constexpr int64_t RESET_BURST_US      = 10LL * 1000 * 1000;  // 10 s
 static int64_t s_reset_ts[RESET_BURST_N] = { 0 };
 static size_t  s_reset_ts_next = 0;
 
@@ -122,7 +125,12 @@ void znp_state_note_reset() {
 void znp_state_note_ok() {
     bool changed = false;
     portENTER_CRITICAL(&s_mux);
-    if (s_state == ZnpTransportState::Recovering) {
+    // F13 (FINDINGS.md): self-heal from Error too. A successful SRSP proves
+    // the link is alive, so a wedged-then-recovered NCP no longer depends
+    // solely on the external zigbee_mgr supervisor to clear the otherwise
+    // sticky Error state.
+    if (s_state == ZnpTransportState::Recovering ||
+        s_state == ZnpTransportState::Error) {
         s_state = ZnpTransportState::Up;
         changed = true;
         // Clear the reset-burst ring — a successful recovery means the

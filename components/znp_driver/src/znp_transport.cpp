@@ -29,6 +29,7 @@
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include <atomic>
 
 static const char* TAG = "znp_transport";
 
@@ -48,7 +49,9 @@ static constexpr gpio_num_t PIN_BSL    = GPIO_NUM_29;
 
 static constexpr int UART_BUF_SZ = 4096;
 
-static bool s_started = false;
+// F43 (FINDINGS.md): atomic so a concurrent double-call (e.g. radio re-init
+// racing boot) can't both pass the guard and install the driver/tasks twice.
+static std::atomic<bool> s_started{false};
 
 static void init_uart() {
     uart_config_t cfg = {
@@ -90,8 +93,8 @@ static void init_gpios() {
 }
 
 void znp_transport_start() {
-    if (s_started) return;
-    s_started = true;
+    bool expected = false;
+    if (!s_started.compare_exchange_strong(expected, true)) return;
 
     znp_state_set(ZnpTransportState::Booting);
     init_uart();

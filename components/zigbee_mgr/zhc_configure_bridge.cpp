@@ -24,8 +24,15 @@ static const char* TAG = "zhc_cfg";
 
 extern "C" bool zhc_cfg_bind_af(uint64_t ieee, uint8_t ep,
                                  uint16_t cluster) {
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35 (FINDINGS.md): snapshot nwk_addr under the advisory lock, then
+    // make the blocking ZDO call with the local copy — never hold a raw
+    // pool pointer across a swap-with-last-capable window.
+    uint16_t nwk = 0;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { nwk = dev->nwk_addr; found = true; }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGW(TAG, "bind: unknown ieee=0x%016llx",
                  static_cast<unsigned long long>(ieee));
         return false;
@@ -35,7 +42,7 @@ extern "C" bool zhc_cfg_bind_af(uint64_t ieee, uint8_t ep,
         ESP_LOGW(TAG, "bind: coordinator ieee not yet known");
         return false;
     }
-    return zigbee_zdo_bind(dev->nwk_addr, ieee, ep, cluster, coord, 1);
+    return zigbee_zdo_bind(nwk, ieee, ep, cluster, coord, 1);
 }
 
 extern "C" bool zhc_cfg_report_af(uint64_t ieee, uint8_t ep,
@@ -51,13 +58,18 @@ extern "C" bool zhc_cfg_report_af(uint64_t ieee, uint8_t ep,
     // silently inert. zhc_cfg_bind_af above resolves nwk from the pool
     // the same way — reusing the lookup keeps the IEEE→nwk decoupling
     // out of the device cpps.
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35 (FINDINGS.md): snapshot nwk_addr under the advisory lock.
+    uint16_t nwk = 0;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { nwk = dev->nwk_addr; found = true; }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGW(TAG, "report: unknown ieee=0x%016llx",
                  static_cast<unsigned long long>(ieee));
         return false;
     }
-    return zigbee_zcl_configure_report(dev->nwk_addr, ep, cluster,
+    return zigbee_zcl_configure_report(nwk, ep, cluster,
                                         attr_id, attr_type,
                                         min_interval, max_interval,
                                         reportable_change, manu_code);

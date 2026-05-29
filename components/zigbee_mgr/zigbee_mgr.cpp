@@ -139,7 +139,7 @@ static constexpr uint16_t NV_ZNP_HAS_CONFIGURED  = 0x0F00;
 // ── NV item helpers (osalNvReadExt / osalNvWriteExt / osalNvItemInit) ────
 // osalNvReadExt (SYS 0x1C): payload = id(2 LE) + offset(2 LE)
 // Response = status(1) + len(1) + data[len]
-static bool nv_read(uint16_t id, uint16_t offset, uint8_t* out, uint8_t* out_len,
+[[maybe_unused]] static bool nv_read(uint16_t id, uint16_t offset, uint8_t* out, uint8_t* out_len,
                      uint8_t out_cap) {
     uint8_t pl[4] = {(uint8_t)(id & 0xFF), (uint8_t)(id >> 8),
                      (uint8_t)(offset & 0xFF), (uint8_t)(offset >> 8)};
@@ -335,12 +335,26 @@ static bool do_commissioning() {
     if (chan < 11 || chan > 26) chan = 11;
     if (!net_key_present) {
         esp_fill_random(net_key, sizeof(net_key));
+        // F8 (FINDINGS.md): this key is about to go on-air; it MUST survive
+        // a reboot or every paired device is orphaned next boot. Abort
+        // commissioning if it cannot be persisted, rather than forming a
+        // network whose key is lost. (All NVS return values checked.)
         nvs_handle_t h;
-        if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_blob(h, "net_key", net_key, sizeof(net_key));
-            nvs_set_u8  (h, "channel", chan);
-            nvs_commit(h);
-            nvs_close(h);
+        esp_err_t eo = nvs_open("zigbee_cfg", NVS_READWRITE, &h);
+        if (eo != ESP_OK) {
+            ESP_LOGE(TAG, "commission: nvs_open(zigbee_cfg) rw failed: %s — aborting",
+                     esp_err_to_name(eo));
+            return false;
+        }
+        esp_err_t e1 = nvs_set_blob(h, "net_key", net_key, sizeof(net_key));
+        esp_err_t e2 = nvs_set_u8  (h, "channel", chan);
+        esp_err_t e3 = nvs_commit(h);
+        nvs_close(h);
+        if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK) {
+            ESP_LOGE(TAG, "commission: net_key persist failed "
+                          "(set_blob=%s set_u8=%s commit=%s) — aborting",
+                     esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(e3));
+            return false;
         }
         ESP_LOGI(TAG, "Generated new random Zigbee network key "
                       "(persisted to NVS zigbee_cfg::net_key)");
@@ -351,6 +365,18 @@ static bool do_commissioning() {
              (unsigned)chan, (unsigned long)chan_mask,
              net_key_present ? "loaded from NVS" : "freshly generated");
 
+    // ── SECURITY (FINDINGS.md F7) — trust-center key model ───────────────
+    // Devices currently join under the well-known global Trust-Center link
+    // key (ZigBeeAlliance09): PRECFGKEYS_ENABLE=1 + the network key
+    // (PRECFGKEY) below. A sniffer present at a device's join can therefore
+    // recover the network key. Hardening to per-device install-code-derived
+    // APS link keys is the planned follow-up — it needs Z-Stack ZDSecMgr NV
+    // writes (TCLK table), an AES-MMO-128 derivation of the link key from
+    // the printed install code, a REST/WS/SPA path to enter codes, and
+    // on-hardware validation with a real install-code device. Design in
+    // docs/INSTALL_CODES_PLAN.md. Until then, join devices on a trusted RF
+    // environment (away from potential sniffers).
+    //
     // Config writes — ORDER MATTERS (matches working PHP coordinator flow):
     // LOGICAL_TYPE = 0x00 (COORDINATOR)
     { uint8_t v = 0x00; if (!nv_write(NV_LOGICAL_TYPE, &v, 1)) return false; }

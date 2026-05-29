@@ -22,6 +22,12 @@ static const char* NVS_NS    = "zhac";
 static const char* NVS_TOKEN = "tg_token";
 static const char* NVS_CHAT  = "tg_chat";
 
+// F45 (FINDINGS.md): documented max Telegram bot-token length. Real tokens are
+// `<bot_id>:<35-char-secret>` ≈ 46 chars; 80 gives generous headroom. Reject
+// over-long tokens on SET so they can't silently truncate in the send buffers
+// (a truncated token breaks delivery, not security — HTTPS is verified).
+static constexpr uint16_t TG_TOKEN_MAX = 80;
+
 static SemaphoreHandle_t s_cfg_mutex = nullptr;
 
 // TG_SEND is offloaded onto a dedicated worker. The HAP frame thread
@@ -72,6 +78,11 @@ extern "C" void tg_gw_handle_settoken(const uint8_t* buf, uint16_t len) {
     HapTgSettoken m{};
     if (!hap_unpack_tg_settoken(buf, len, &m)) {
         ESP_LOGW(TAG, "TG_SETTOKEN unpack failed len=%u", len);
+        return;
+    }
+    if (m.token_len > TG_TOKEN_MAX) {   // F45: reject over-long rather than truncate
+        ESP_LOGW(TAG, "TG_SETTOKEN rejected — token len %u > max %u",
+                 m.token_len, (unsigned)TG_TOKEN_MAX);
         return;
     }
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
@@ -151,7 +162,7 @@ static void tg_worker_task(void*) {
 }
 
 static void tg_perform_send(const HapTgSend& m) {
-    char token[100];
+    char token[TG_TOKEN_MAX + 1];   // F45: sized to the documented token max
     char default_chat[40];
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
     bool have_token = nvs_read_str(NVS_TOKEN, token, sizeof(token));

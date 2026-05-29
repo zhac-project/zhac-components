@@ -42,29 +42,73 @@ static constexpr uint32_t BACKOFF_SECS[MAX_ATTEMPTS] = { 1, 5, 30, 120, 600 };
 
 static QueueHandle_t s_q = nullptr;
 
-struct RetrySlot { uint64_t ieee; };
+// F49 (FINDINGS.md): reusable retry-timer pool. Previously every retry did a
+// heap `new RetrySlot` + `xTimerCreate`/`xTimerDelete` (per-retry alloc + timer
+// churn on flaky devices). Now a small pool of timers is created lazily and
+// reused; the slot index (which fits in the timer ID) replaces the heap slot,
+// so there is no per-retry allocation. The busy map is guarded by a short
+// critical section (no blocking inside); all xTimer* calls run outside it.
+static constexpr uint8_t RETRY_POOL = 16;
+static TimerHandle_t s_retry_tmr[RETRY_POOL]  = {};
+static uint64_t      s_retry_ieee[RETRY_POOL] = {};
+static bool          s_retry_busy[RETRY_POOL] = {};
+static portMUX_TYPE  s_retry_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void retry_timer_cb(TimerHandle_t t) {
-    auto* slot = static_cast<RetrySlot*>(pvTimerGetTimerID(t));
-    if (slot && s_q) {
-        (void)xQueueSend(s_q, &slot->ieee, 0);
-        delete slot;
+    const int slot = static_cast<int>(reinterpret_cast<intptr_t>(pvTimerGetTimerID(t)));
+    uint64_t ieee = 0;
+    bool ok = false;
+    portENTER_CRITICAL(&s_retry_mux);
+    if (slot >= 0 && slot < RETRY_POOL && s_retry_busy[slot]) {
+        ieee = s_retry_ieee[slot];          // copy before releasing the slot
+        s_retry_busy[slot] = false;         // one-shot already stopped — back to pool
+        ok = true;
     }
-    xTimerDelete(t, 0);
+    portEXIT_CRITICAL(&s_retry_mux);
+    if (ok && s_q) (void)xQueueSend(s_q, &ieee, 0);
+    // Timer is retained for reuse — no xTimerDelete.
 }
 
 static void schedule_retry(uint64_t ieee, uint8_t attempts) {
     uint8_t idx = (attempts == 0) ? 0 :
                   (attempts - 1 < MAX_ATTEMPTS ? attempts - 1 : MAX_ATTEMPTS - 1);
     uint32_t secs = BACKOFF_SECS[idx];
-    auto* slot = new RetrySlot{ ieee };
-    TimerHandle_t t = xTimerCreate("cfg_retry",
-        pdMS_TO_TICKS(secs * 1000UL), pdFALSE,
-        static_cast<void*>(slot), retry_timer_cb);
-    if (!t || xTimerStart(t, 0) != pdPASS) {
-        ESP_LOGW(TAG, "retry timer create failed ieee=0x%016llx",
+
+    int slot = -1;
+    portENTER_CRITICAL(&s_retry_mux);
+    for (int i = 0; i < RETRY_POOL; i++) {
+        if (!s_retry_busy[i]) { s_retry_busy[i] = true; s_retry_ieee[i] = ieee; slot = i; break; }
+    }
+    portEXIT_CRITICAL(&s_retry_mux);
+
+    if (slot < 0) {
+        // Pool exhausted (>RETRY_POOL devices retrying at once) — re-queue now
+        // rather than dropping; the worker re-attempts immediately.
+        ESP_LOGW(TAG, "retry pool full — re-queue ieee=0x%016llx now",
                  (unsigned long long)ieee);
-        delete slot;
+        if (s_q) (void)xQueueSend(s_q, &ieee, 0);
+        return;
+    }
+
+    const TickType_t period = pdMS_TO_TICKS(secs * 1000UL);
+    bool started;
+    if (!s_retry_tmr[slot]) {
+        s_retry_tmr[slot] = xTimerCreate(
+            "cfg_retry", period, pdFALSE,
+            reinterpret_cast<void*>(static_cast<intptr_t>(slot)), retry_timer_cb);
+        started = (s_retry_tmr[slot] != nullptr) &&
+                  (xTimerStart(s_retry_tmr[slot], 0) == pdPASS);
+    } else {
+        // Reuse: changing the period also (re)activates the timer.
+        started = (xTimerChangePeriod(s_retry_tmr[slot], period, 0) == pdPASS);
+    }
+    if (!started) {
+        ESP_LOGW(TAG, "retry timer start failed ieee=0x%016llx — re-queue now",
+                 (unsigned long long)ieee);
+        portENTER_CRITICAL(&s_retry_mux);
+        s_retry_busy[slot] = false;
+        portEXIT_CRITICAL(&s_retry_mux);
+        if (s_q) (void)xQueueSend(s_q, &ieee, 0);
         return;
     }
     // First retry logs at INFO so the operator sees the failure entered a

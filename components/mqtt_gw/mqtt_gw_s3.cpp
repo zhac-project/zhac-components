@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "mqtt_gw.h"
 #include "mqtt_client.h"
+#include "esp_crt_bundle.h"   // F10: verify broker cert for mqtts://
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +26,7 @@ static char   s_broker_url[128]              = {};
 static char   s_client_id[32]                = {};   // empty → auto from MAC
 static char   s_root_topic[32]               = "zhac";
 static uint8_t s_fail_count                  = 0;
+static esp_timer_handle_t s_rearm_tmr        = nullptr;   // F40: auto-disable cooldown re-arm
 // Tolerate transient broker flaps / WiFi blips before giving up. The
 // old cap of 3 was aggressive enough that a single reconnect storm
 // right after boot (WiFi up → STA_GOT_IP delay → mqtt tries early)
@@ -65,6 +67,14 @@ static void restart_client() {
     esp_mqtt_client_config_t cfg{};
     cfg.broker.address.uri           = s_broker_url;
     cfg.credentials.client_id        = s_client_id;
+    // F10 (FINDINGS.md): for a TLS broker (mqtts:// / wss://) verify the
+    // server certificate chain against the bundled CA store. Without this an
+    // mqtts:// connection is unauthenticated and a MITM can impersonate the
+    // broker. Plain mqtt:// (no TLS) is unaffected.
+    if (strncmp(s_broker_url, "mqtts://", 8) == 0 ||
+        strncmp(s_broker_url, "wss://",   6) == 0) {
+        cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+    }
     // Bump esp-mqtt's internal task stack from the 6 KB default. Two
     // problem paths trip it:
     //   - reconnect/TLS-error chain when the broker drops us repeatedly
@@ -80,6 +90,19 @@ static void restart_client() {
     // partial frames.
     cfg.buffer.size                  = 4608;
     cfg.buffer.out_size              = 4608;
+    // F45 (FINDINGS.md): Last-Will so the broker announces an ungraceful drop.
+    // We publish retained "online" on connect (below); if the TCP/keepalive
+    // dies the broker publishes this retained "offline" to the same topic, so
+    // subscribers get a real availability signal. will_topic stays in scope
+    // through esp_mqtt_client_init, which copies the config strings.
+    char will_topic[160];
+    if (mqtt_gw_format_topic(will_topic, sizeof(will_topic), "availability") > 0) {
+        cfg.session.last_will.topic   = will_topic;
+        cfg.session.last_will.msg     = "offline";
+        cfg.session.last_will.msg_len = 7;
+        cfg.session.last_will.qos     = 1;
+        cfg.session.last_will.retain  = 1;
+    }
     s_client = esp_mqtt_client_init(&cfg);
     if (!s_client) { ESP_LOGE(TAG, "mqtt init failed"); return; }
     extern void mqtt_event_handler(void*, esp_event_base_t, int32_t, void*);
@@ -116,6 +139,13 @@ void mqtt_event_handler(void* arg, esp_event_base_t base,
             if (s_sub_filter[0]) {
                 esp_mqtt_client_subscribe(s_client, s_sub_filter, s_sub_qos);
                 ESP_LOGI(TAG, "MQTT subscribed to %s qos=%d", s_sub_filter, s_sub_qos);
+            }
+            // F45: announce availability "online" (retained), pairing with the
+            // LWT "offline" the broker holds for our ungraceful disconnect.
+            {
+                char av[160];
+                if (mqtt_gw_format_topic(av, sizeof(av), "availability") > 0)
+                    esp_mqtt_client_publish(s_client, av, "online", 6, 1, 1);
             }
             break;
         case MQTT_EVENT_DISCONNECTED:
@@ -168,6 +198,17 @@ void mqtt_event_handler(void* arg, esp_event_base_t base,
 // The worker is the only task that can stall on MQTT, and the stall is
 // isolated to it.
 
+// F40 (FINDINGS.md): after the auto-disable trip, re-arm the client once a
+// cooldown elapses so a transient broker outage (>MQTT_MAX_FAILS) recovers
+// without a manual restart or WiFi reconnect. Runs on the esp_timer task.
+static void mqtt_rearm_cb(void*) {
+    s_fail_count = 0;
+    if (s_enabled && s_broker_url[0] && !s_client) {
+        ESP_LOGI(TAG, "MQTT re-arm after cooldown");
+        restart_client();
+    }
+}
+
 static void mqtt_pub_worker(void*) {
     for (;;) {
         PubItem* item = nullptr;
@@ -185,6 +226,19 @@ static void mqtt_pub_worker(void*) {
                 esp_mqtt_client_destroy(doomed);
             }
             free(item);
+            // F40: schedule a cooldown re-arm (5 min) instead of staying off
+            // until a manual restart / WiFi reconnect.
+            if (!s_rearm_tmr) {
+                const esp_timer_create_args_t a = {
+                    .callback = &mqtt_rearm_cb, .arg = nullptr,
+                    .dispatch_method = ESP_TIMER_TASK, .name = "mqtt_rearm",
+                    .skip_unhandled_events = true };
+                esp_timer_create(&a, &s_rearm_tmr);
+            }
+            if (s_rearm_tmr) {
+                esp_timer_stop(s_rearm_tmr);
+                esp_timer_start_once(s_rearm_tmr, (uint64_t)300 * 1000000ULL);
+            }
             continue;
         }
 
@@ -340,6 +394,12 @@ bool mqtt_gw_is_active() {
     return s_client != nullptr;
 }
 
+bool mqtt_gw_is_secure() {
+    // F45 (FINDINGS.md): only a verified-TLS scheme counts as secure.
+    return strncmp(s_broker_url, "mqtts://", 8) == 0 ||
+           strncmp(s_broker_url, "wss://",   6) == 0;
+}
+
 void mqtt_gw_set_rx_callback(mqtt_rx_cb_t cb) {
     s_rx_cb = cb;
 }
@@ -390,7 +450,9 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     item->topic        = strdup(eff);
     item->payload_len  = payload_len;
     item->payload      = (char*)malloc(payload_len + 1);
-    item->qos          = (uint8_t)qos;
+    // F23 (FINDINGS.md): clamp QoS to the valid 0..2 range before esp-mqtt
+    // (a rule/Lua publish could pass anything).
+    item->qos          = (uint8_t)(qos < 0 ? 0 : (qos > 2 ? 2 : qos));
     item->retain       = retain;
     item->disable_client = false;
     if (!item->topic || !item->payload) {

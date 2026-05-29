@@ -26,8 +26,14 @@ uint16_t   pool_count() { return s_pool_count; }
 // invoke the public functions without self-deadlocking.
 static SemaphoreHandle_t s_pool_mutex = nullptr;
 
-static inline void lock()   { xSemaphoreTakeRecursive(s_pool_mutex, portMAX_DELAY); }
-static inline void unlock() { xSemaphoreGiveRecursive(s_pool_mutex); }
+// Null-safe: s_pool_mutex is created in zigbee_pool_init(), which runs after
+// the stores/rules bring-up (main.cpp). Early callers — e.g.
+// simple_rules_resolve_names() at boot, before any device exists — must not
+// crash on the not-yet-created mutex. Pre-init there is no concurrency and
+// pool_count()==0, so skipping the lock is safe. (Regression fix: F35 added
+// zigbee_pool_lock() to resolve_names, which runs during simple_rules_init.)
+static inline void lock()   { if (s_pool_mutex) xSemaphoreTakeRecursive(s_pool_mutex, portMAX_DELAY); }
+static inline void unlock() { if (s_pool_mutex) xSemaphoreGiveRecursive(s_pool_mutex); }
 
 void zigbee_pool_lock()   { lock(); }
 void zigbee_pool_unlock() { unlock(); }

@@ -25,17 +25,10 @@ inline const char* ncp_protocol_name(NcpProtocol p) {
     }
 }
 
-// Snapshot partition header (64 bytes)
-// Layout: magic(4) + sequence(4) + device_count(2) + attr_count(2) + crc32(4) + _pad(48) = 64
-struct __attribute__((packed)) SnapHeader {
-    uint32_t magic;         // 0x5A415053 'ZAPS'
-    uint32_t sequence;      // monotonic, compared A vs B on boot
-    uint16_t device_count;
-    uint16_t attr_count;
-    uint32_t crc32;         // CRC32 of entire partition
-    uint8_t  _pad[48];
-};
-static_assert(sizeof(SnapHeader) == 64);
+// (F16, FINDINGS.md) The A/B-snapshot + journal persistence scheme was never
+// implemented. The device DB lives in NVS (per-record CRC32 + single
+// nvs_commit = crash-safe). The dead SnapHeader/JournalEntry structs and the
+// zap_snap_A/B + zap_journal partitions were removed 2026-05-29.
 
 // ── Lifecycle state enums (backend-agnostic) ─────────────────────────────
 // Each state is explicitly persisted in ZapDevice so a device's position
@@ -126,15 +119,7 @@ static inline void zap_dev_clear_removed(ZapDevice* d) {
     if (d) d->flags &= static_cast<uint8_t>(~ZAP_DEV_REMOVED);
 }
 
-// Journal entry header (12 bytes, payload follows in flash)
-struct __attribute__((packed)) JournalEntry {
-    uint8_t  type;          // ADD_DEVICE=1 UPDATE_ATTR=2 REMOVE=3 RENAME=4
-    uint8_t  _pad;
-    uint16_t payload_len;
-    uint32_t seq;
-    uint32_t crc32;
-};
-static_assert(sizeof(JournalEntry) == 12);
+// (F16) JournalEntry struct removed 2026-05-29 — see snapshot note above; NVS store only.
 
 // rule_type values
 enum class RuleType : uint8_t {

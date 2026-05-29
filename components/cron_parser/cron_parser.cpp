@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
+#include <cerrno>
+#include <climits>
 
 // ── Field parser ──────────────────────────────────────────────────────────
 // Parses one cron field into a uint64_t bitmask.
@@ -16,8 +18,12 @@
 static bool parse_int(const char* s, int* out) {
     if (!s || *s == '\0') return false;
     char* end;
+    errno = 0;
     long v = strtol(s, &end, 10);
     if (end == s || *end != '\0') return false;
+    // F24 (FINDINGS.md): reject out-of-range values so a huge field can't
+    // truncate into a different valid slot (e.g. "4294967296" → 0).
+    if (errno == ERANGE || v < INT_MIN || v > INT_MAX) return false;
     *out = (int)v;
     return true;
 }

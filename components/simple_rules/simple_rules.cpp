@@ -32,6 +32,19 @@ static ParsedRule*         s_rules      = nullptr; // allocated in PSRAM on init
 static uint16_t            s_rule_count = 0;
 static SemaphoreHandle_t   s_mutex = nullptr; // recursive
 
+// F27 (FINDINGS.md): per-slot CronExpr cache so task_cron doesn't re-parse
+// every TIME_CRON rule's string every second. Slot-indexed; invalidated
+// wholesale on any rule-list mutation (add/update/delete/reload) — delete
+// compaction shifts the slot→rule mapping, so a blanket reset is the safe
+// choice. enable() doesn't change the key/slot, so it needs no invalidation.
+// All access is under s_mutex (task_cron holds it during the collect loop).
+enum : uint8_t { CRON_UNCACHED = 0, CRON_BAD = 1, CRON_GOOD = 2 };
+static CronExpr s_cron_cache[MAX_CACHED_RULES];
+static uint8_t  s_cron_state[MAX_CACHED_RULES] = {};
+static inline void cron_cache_invalidate() {
+    memset(s_cron_state, 0, sizeof(s_cron_state));
+}
+
 // Optional error callback — registered from zhac-main-core/main.cpp after HAP is up
 static rules_error_cb_t s_error_cb = nullptr;
 
@@ -65,11 +78,25 @@ static uint16_t next_rule_id() {
     uint16_t max_id = 0;
     for (uint16_t i = 0; i < s_rule_count; i++)
         if (s_rules[i].rule_id > max_id) max_id = s_rules[i].rule_id;
-    return max_id + 1;
+    // F25 (FINDINGS.md): max_id+1 wraps to 0 at 0xFFFF and could collide with
+    // an existing rule. Fast path while ids are small; otherwise scan for the
+    // lowest free id (always exists — s_rule_count is capped far below 65535).
+    if (max_id < 0xFFFF) return static_cast<uint16_t>(max_id + 1);
+    for (uint16_t cand = 1; cand != 0; cand++) {
+        bool used = false;
+        for (uint16_t i = 0; i < s_rule_count; i++)
+            if (s_rules[i].rule_id == cand) { used = true; break; }
+        if (!used) return cand;
+    }
+    return 0;
 }
 
 static void reload_locked() {
-    auto* slots = static_cast<RuleSlot*>(malloc(sizeof(RuleSlot) * MAX_CACHED_RULES));
+    // F47 (FINDINGS.md): ~34 KB scratch — allocate from PSRAM (internal DRAM is
+    // the tight pool on this device), falling back to internal heap on failure.
+    auto* slots = static_cast<RuleSlot*>(
+        heap_caps_malloc(sizeof(RuleSlot) * MAX_CACHED_RULES, MALLOC_CAP_SPIRAM));
+    if (!slots) slots = static_cast<RuleSlot*>(malloc(sizeof(RuleSlot) * MAX_CACHED_RULES));
     if (!slots) { ESP_LOGE(TAG, "reload: malloc failed"); return; }
     uint16_t cnt = rule_store_load_all(slots, MAX_CACHED_RULES);
     s_rule_count = 0;
@@ -90,6 +117,7 @@ static void reload_locked() {
         s_rules[s_rule_count++] = r;
     }
     simple_rules_resolve_names(s_rules, s_rule_count);
+    cron_cache_invalidate();   // F27: rules reloaded — drop stale cron cache
     free(slots);
 }
 
@@ -205,30 +233,37 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
             char val_buf[32];
             expand_value(a.arg2, event_val, val_buf, sizeof(val_buf));
 
-            ZapDevice* dev = nullptr;
+            // F35 (FINDINGS.md): resolve under the pool lock and snapshot
+            // the device — never hold a raw pool pointer across the blocking
+            // zhac_adapter_send_uint (a concurrent swap-with-last pool_remove
+            // would otherwise relocate the slot and we'd actuate the wrong
+            // device).
+            ZapDevice snap; bool dev_found = false;
+            zigbee_pool_lock();
             if (a.arg0[0] == '0' && (a.arg0[1] == 'x' || a.arg0[1] == 'X')) {
                 uint64_t ieee = (uint64_t)strtoull(a.arg0, nullptr, 16);
-                dev = pool_find_by_ieee(ieee);
+                if (ZapDevice* d = pool_find_by_ieee(ieee)) { snap = *d; dev_found = true; }
             } else {
                 ZapDevice* pool = pool_all();
                 uint16_t cnt = pool_count();
                 for (uint16_t j = 0; j < cnt; j++) {
                     if (strcmp(pool[j].friendly_name, a.arg0) == 0) {
-                        dev = &pool[j];
+                        snap = pool[j]; dev_found = true;
                         break;
                     }
                 }
             }
-            if (!dev) {
+            zigbee_pool_unlock();
+            if (!dev_found) {
                 ESP_LOGW(TAG, "zigbee.set: device '%s' not found", a.arg0);
                 break;
             }
             int32_t int_val = (int32_t)strtol(val_buf, nullptr, 10);
-            uint8_t ep = dev->endpoints[0] ? dev->endpoints[0] : 1;
-            if (!zhac_adapter_send_uint(dev->ieee_addr,
-                                         dev->model_id,
-                                         dev->manufacturer_name,
-                                         dev->nwk_addr, ep,
+            uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
+            if (!zhac_adapter_send_uint(snap.ieee_addr,
+                                         snap.model_id,
+                                         snap.manufacturer_name,
+                                         snap.nwk_addr, ep,
                                          a.arg1,
                                          static_cast<uint64_t>(int_val))) {
                 ESP_LOGW(TAG, "zigbee.set: no tz converter for '%s' key='%s'",
@@ -238,26 +273,29 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
         }
 
         case ActionType::ZIGBEE_TOGGLE: {
-            ZapDevice* dev = nullptr;
+            // F35 (FINDINGS.md): resolve + snapshot under the pool lock.
+            ZapDevice snap; bool dev_found = false;
+            zigbee_pool_lock();
             if (a.arg0[0] == '0' && (a.arg0[1] == 'x' || a.arg0[1] == 'X')) {
                 uint64_t ieee = (uint64_t)strtoull(a.arg0, nullptr, 16);
-                dev = pool_find_by_ieee(ieee);
+                if (ZapDevice* d = pool_find_by_ieee(ieee)) { snap = *d; dev_found = true; }
             } else {
                 ZapDevice* pool = pool_all();
                 uint16_t cnt = pool_count();
                 for (uint16_t j = 0; j < cnt; j++) {
                     if (strcmp(pool[j].friendly_name, a.arg0) == 0) {
-                        dev = &pool[j];
+                        snap = pool[j]; dev_found = true;
                         break;
                     }
                 }
             }
-            if (!dev) {
+            zigbee_pool_unlock();
+            if (!dev_found) {
                 ESP_LOGW(TAG, "zigbee.toggle: device '%s' not found", a.arg0);
                 break;
             }
             ShadowAttr sa[32];
-            uint8_t n = device_shadow_get_attrs(dev->ieee_addr, sa, 32);
+            uint8_t n = device_shadow_get_attrs(snap.ieee_addr, sa, 32);
             int32_t cur_int = -1;
             bool found = false;
             bool is_bool = false;
@@ -282,11 +320,11 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                 break;
             }
             int32_t next_int = cur_int ? 0 : 1;
-            uint8_t ep = dev->endpoints[0] ? dev->endpoints[0] : 1;
-            if (!zhac_adapter_send_uint(dev->ieee_addr,
-                                         dev->model_id,
-                                         dev->manufacturer_name,
-                                         dev->nwk_addr, ep,
+            uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
+            if (!zhac_adapter_send_uint(snap.ieee_addr,
+                                         snap.model_id,
+                                         snap.manufacturer_name,
+                                         snap.nwk_addr, ep,
                                          a.arg1,
                                          static_cast<uint64_t>(next_int))) {
                 ESP_LOGW(TAG, "zigbee.toggle: no tz converter for '%s' key='%s'",
@@ -456,9 +494,13 @@ static void task_cron(void*) {
         for (uint16_t i = 0; i < s_rule_count && fire_count < MAX_CRON_FIRES; i++) {
             if (!s_rules[i].enabled) continue;
             if (s_rules[i].trigger.type != TriggerType::TIME_CRON) continue;
-            CronExpr expr{};
-            if (!cron_parse(s_rules[i].trigger.key, expr)) continue;
-            if (cron_matches(expr, now)) {
+            // F27: parse once and cache (invalidated on rule-list changes).
+            if (s_cron_state[i] == CRON_UNCACHED) {
+                s_cron_state[i] = cron_parse(s_rules[i].trigger.key, s_cron_cache[i])
+                                      ? CRON_GOOD : CRON_BAD;
+            }
+            if (s_cron_state[i] != CRON_GOOD) continue;
+            if (cron_matches(s_cron_cache[i], now)) {
                 fire_idx[fire_count] = i;
                 fire_id [fire_count] = s_rules[i].rule_id;
                 fire_count++;
@@ -539,6 +581,7 @@ bool simple_rules_add(const char* name, const char* dsl,
         r.enabled = true;
         s_rules[s_rule_count++] = r;
         simple_rules_resolve_names(&s_rules[s_rule_count - 1], 1);
+        cron_cache_invalidate();   // F27
     }
     if (out_rule_id) *out_rule_id = id;
     xSemaphoreGiveRecursive(s_mutex);
@@ -573,6 +616,7 @@ bool simple_rules_update(uint16_t rule_id,
             s_rules[i] = r;
             s_rules[i].enabled = was_enabled;
             simple_rules_resolve_names(&s_rules[i], 1);
+            cron_cache_invalidate();   // F27
             break;
         }
     }
@@ -586,6 +630,7 @@ bool simple_rules_delete(uint16_t rule_id) {
     for (uint16_t i = 0; i < s_rule_count; i++) {
         if (s_rules[i].rule_id == rule_id) {
             s_rules[i] = s_rules[--s_rule_count];
+            cron_cache_invalidate();   // F27: slot→rule mapping changed
             found = true;
             break;
         }
@@ -632,6 +677,10 @@ uint16_t simple_rules_list(RuleSlot* out, uint16_t max_count) {
 }
 
 void simple_rules_resolve_names(ParsedRule* rules, uint16_t count) {
+    // F35 (FINDINGS.md): read the pool under the advisory lock — this scans
+    // friendly_name/ieee_addr while another task may swap-with-last remove.
+    // Pure reads, short scan, no blocking calls, so holding the lock is safe.
+    zigbee_pool_lock();
     ZapDevice* pool = pool_all();
     uint16_t   cnt  = pool_count();
     for (uint16_t i = 0; i < count; i++) {
@@ -646,4 +695,5 @@ void simple_rules_resolve_names(ParsedRule* rules, uint16_t count) {
             }
         }
     }
+    zigbee_pool_unlock();
 }
