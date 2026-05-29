@@ -13,6 +13,7 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_rom_crc.h"   // F26: esp_rom_crc32_le for blob integrity
 #include <cstring>
 #include <cstdio>
 #include <ctime>
@@ -28,6 +29,23 @@ static constexpr const char* KEY_LAST_SEEN = "_last_seen";
 
 // Cached NVS handle — opened once in init, kept open for firmware lifetime.
 static nvs_handle_t s_nvs = 0;
+
+// F26 (FINDINGS.md): the attr blob is stored as [ShadowBlobHdr][ShadowAttr×count]
+// with a version byte + count + CRC32 over the payload, so a torn / wrong-length /
+// corrupt blob is rejected on load instead of being silently accepted as a
+// truncated final attr. SHADOW_ATTR_MAX bounds both the on-disk count and the
+// shared scratch buffer below.
+static constexpr uint8_t SHADOW_ATTR_BLOB_VER = 1;
+static constexpr uint8_t SHADOW_ATTR_MAX      = 32;   // == DeviceShadowEntry::attrs[32]
+struct __attribute__((packed)) ShadowBlobHdr {
+    uint8_t  ver;     // SHADOW_ATTR_BLOB_VER
+    uint8_t  count;   // number of ShadowAttr records following
+    uint16_t _pad;
+    uint32_t crc;     // esp_rom_crc32_le(0, payload, count*sizeof(ShadowAttr))
+};
+// Single shared scratch: save() runs under s_mutex (serialised across tasks),
+// load() runs only at boot (single-threaded restore) — never concurrent.
+static uint8_t s_attr_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX * sizeof(ShadowAttr)];
 
 // ── Pipeline helpers (defined in shadow_pipeline.cpp) ────────────────────
 extern "C" uint8_t shadow_pipeline_filter(const DeviceConfig*, const ZclAttribute*, uint8_t,
@@ -51,9 +69,21 @@ static QueueHandle_t s_debounce_queue;
 
 static bool nvs_save_attrs(uint64_t ieee, const ShadowAttr* attrs, uint8_t count) {
     if (!s_nvs) return false;
+    if (count > SHADOW_ATTR_MAX) count = SHADOW_ATTR_MAX;
     char key[16];
     snprintf(key, sizeof(key), "a%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
-    esp_err_t err = nvs_set_blob(s_nvs, key, attrs, sizeof(ShadowAttr) * count);
+
+    // F26: prepend version + count + CRC header (see ShadowBlobHdr).
+    const size_t plen = (size_t)count * sizeof(ShadowAttr);
+    auto* h   = reinterpret_cast<ShadowBlobHdr*>(s_attr_blob);
+    auto* pay = s_attr_blob + sizeof(ShadowBlobHdr);
+    memcpy(pay, attrs, plen);
+    h->ver   = SHADOW_ATTR_BLOB_VER;
+    h->count = count;
+    h->_pad  = 0;
+    h->crc   = esp_rom_crc32_le(0, pay, plen);
+
+    esp_err_t err = nvs_set_blob(s_nvs, key, s_attr_blob, sizeof(ShadowBlobHdr) + plen);
     if (err != ESP_OK) { ESP_LOGE(TAG, "nvs_set_blob attrs: %s", esp_err_to_name(err)); return false; }
     err = nvs_commit(s_nvs);
     if (err != ESP_OK) ESP_LOGE(TAG, "nvs_commit attrs: %s", esp_err_to_name(err));
@@ -71,13 +101,55 @@ static bool nvs_save_config(uint64_t ieee, const DeviceConfig* cfg) {
     return err == ESP_OK;
 }
 
+// F26 (FINDINGS.md): config setters previously hit NVS on every API call.
+// Dedupe by CRC of the config bytes — a no-op re-push (e.g. SPA re-sending an
+// unchanged config) skips the flash write entirely; a real change still
+// persists immediately, so no edit is ever lost. Caller holds s_mutex.
+static void persist_config_dedup(DeviceShadowEntry* e) {
+    uint32_t crc = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(&e->config),
+                                    sizeof(DeviceConfig));
+    if (e->cfg_crc_valid && crc == e->cfg_crc) return;   // unchanged → no flash wear
+    if (nvs_save_config(e->ieee, &e->config)) {
+        e->cfg_crc       = crc;
+        e->cfg_crc_valid = true;
+    }
+}
+
 static bool nvs_load_attrs(uint64_t ieee, ShadowAttr* out, uint8_t* count) {
     if (!s_nvs) return false;
     char key[16];
     snprintf(key, sizeof(key), "a%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
-    size_t len = sizeof(ShadowAttr) * 32;
-    if (nvs_get_blob(s_nvs, key, out, &len) != ESP_OK) return false;
-    *count = (uint8_t)(len / sizeof(ShadowAttr));
+
+    // F26: read into scratch, then validate header (version), exact length,
+    // and CRC before trusting the payload. Any mismatch → discard (entry
+    // starts empty and re-populates from live traffic) rather than loading a
+    // truncated / corrupt final attr.
+    size_t len = sizeof(s_attr_blob);
+    esp_err_t e = nvs_get_blob(s_nvs, key, s_attr_blob, &len);
+    if (e != ESP_OK) return false;
+    if (len < sizeof(ShadowBlobHdr)) {
+        ESP_LOGW(TAG, "attr blob too short (%zu B) — discarding", len);
+        return false;
+    }
+    const auto* h = reinterpret_cast<const ShadowBlobHdr*>(s_attr_blob);
+    if (h->ver != SHADOW_ATTR_BLOB_VER || h->count > SHADOW_ATTR_MAX) {
+        ESP_LOGW(TAG, "attr blob ver/count invalid (ver=%u count=%u) — discarding",
+                 h->ver, h->count);
+        return false;
+    }
+    const size_t plen = (size_t)h->count * sizeof(ShadowAttr);
+    if (len != sizeof(ShadowBlobHdr) + plen) {
+        ESP_LOGW(TAG, "attr blob size mismatch (%zu != %zu) — discarding",
+                 len, sizeof(ShadowBlobHdr) + plen);
+        return false;
+    }
+    const uint8_t* pay = s_attr_blob + sizeof(ShadowBlobHdr);
+    if (esp_rom_crc32_le(0, pay, plen) != h->crc) {
+        ESP_LOGW(TAG, "attr blob CRC mismatch — discarding");
+        return false;
+    }
+    memcpy(out, pay, plen);
+    *count = h->count;
     return true;
 }
 
@@ -358,9 +430,10 @@ static void task_shadow(void* arg) {
 void device_shadow_init() {
     // NVS format version guard. v6 = ATTR_KEY_MAX widened 20→28 +
     // ATTR_STR_MAX widened 32→48 so ShadowAttr grew 60 → 84 bytes
-    // (SHA-F1 + SHA-F8 in docs/FINDINGS.md). Any older blob layout is
-    // incompatible and wiped on first boot.
-    static constexpr uint8_t NVS_SHADOW_VERSION = 6;
+    // (SHA-F1 + SHA-F8 in docs/FINDINGS.md). v7 = F26: attr blob gained a
+    // version+count+CRC header (ShadowBlobHdr), so the raw v6 layout no longer
+    // validates — wipe it on first boot rather than rejecting per-device on load.
+    static constexpr uint8_t NVS_SHADOW_VERSION = 7;
     if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
         if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
@@ -397,7 +470,13 @@ uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) 
         const ZapDevice* d = &pool[i];
         DeviceShadowEntry* e = find_or_create_entry(d->ieee_addr);
         if (!e) continue;
-        nvs_load_config(d->ieee_addr, &e->config);
+        if (nvs_load_config(d->ieee_addr, &e->config)) {
+            // F26: seed the dedupe CRC so an unchanged config re-push after
+            // boot doesn't trigger a redundant NVS write.
+            e->cfg_crc = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(&e->config),
+                                          sizeof(DeviceConfig));
+            e->cfg_crc_valid = true;
+        }
         uint8_t ac = 0;
         if (nvs_load_attrs(d->ieee_addr, e->attrs, &ac)) e->attr_count = ac;
         // Restore last_seen from synthetic attr → ZapDevice. Deferred via
@@ -476,7 +555,7 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
     if (e->nvs_dirty) persist_attrs_force(e);
 
     e->config = *cfg;
-    nvs_save_config(ieee, cfg);
+    persist_config_dedup(e);
     xSemaphoreGive(s_mutex);
     return true;
 }
@@ -487,7 +566,7 @@ bool device_shadow_set_throttle_ms(uint64_t ieee, uint32_t throttle_ms) {
     if (!e) { xSemaphoreGive(s_mutex); return false; }
     e->config.throttle_ms = throttle_ms;
     e->throttle_last_ms = 0;   // reset window so the new rate applies immediately
-    nvs_save_config(ieee, &e->config);
+    persist_config_dedup(e);
     xSemaphoreGive(s_mutex);
     return true;
 }
@@ -545,7 +624,7 @@ bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
         e->debounce_timer = nullptr;
     }
 
-    nvs_save_config(ieee, &e->config);
+    persist_config_dedup(e);
     xSemaphoreGive(s_mutex);
     return true;
 }
@@ -562,7 +641,7 @@ bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s) {
         e->occupancy_timer = nullptr;
     }
 
-    nvs_save_config(ieee, &e->config);
+    persist_config_dedup(e);
     xSemaphoreGive(s_mutex);
     return true;
 }

@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,19 @@
 static const char* TAG     = "zap_store";
 static const char* NVS_NS  = "zap_v0";
 static bool        s_ready = false;
+
+// F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
+// previously unsynchronised, a latent race on the slot table — and back save
+// with an in-RAM IEEE→slot index so a bulk interview is O(n), not O(n²) NVS
+// blob scans. The index mirrors the on-disk slot order; delete invalidates it
+// (rebuilt lazily on the next save).
+static SemaphoreHandle_t s_store_mutex = nullptr;
+static uint64_t          s_idx_ieee[ZAP_MAX_DEVICES];
+static uint16_t          s_idx_count   = 0;
+static bool              s_idx_built   = false;
+
+static inline void store_lock()   { if (s_store_mutex) xSemaphoreTake(s_store_mutex, portMAX_DELAY); }
+static inline void store_unlock() { if (s_store_mutex) xSemaphoreGive(s_store_mutex); }
 
 static void dev_key(char* out, uint16_t idx) {
     snprintf(out, 8, "d%04x", idx);
@@ -27,6 +42,28 @@ static nvs_handle_t open_ns(nvs_open_mode_t mode) {
         return 0;
     }
     return h;
+}
+
+// F16: (re)build the IEEE index from NVS — one O(n) scan. Caller holds the
+// store lock and passes an open handle.
+static void index_build_locked(nvs_handle_t h) {
+    uint16_t count = 0;
+    nvs_get_u16(h, "cnt", &count);
+    if (count > ZAP_MAX_DEVICES) count = ZAP_MAX_DEVICES;
+    s_idx_count = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        char key[8]; dev_key(key, i);
+        ZapDevice tmp{}; size_t sz = sizeof(ZapDevice);
+        s_idx_ieee[i] = (nvs_get_blob(h, key, &tmp, &sz) == ESP_OK) ? tmp.ieee_addr : 0;
+        s_idx_count = static_cast<uint16_t>(i + 1);
+    }
+    s_idx_built = true;
+}
+
+static int16_t index_find_locked(uint64_t ieee) {
+    for (uint16_t i = 0; i < s_idx_count; i++)
+        if (s_idx_ieee[i] == ieee) return static_cast<int16_t>(i);
+    return -1;
 }
 
 // ── CRC32 integrity ──────────────────────────────────────────────────────
@@ -48,6 +85,7 @@ static uint32_t zap_device_crc(const ZapDevice* d) {
 static constexpr uint16_t ZAP_STORE_SCHEMA_VERSION = 6;
 
 void zap_store_init() {
+    if (!s_store_mutex) s_store_mutex = xSemaphoreCreateMutex();   // F16
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
         err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -85,32 +123,29 @@ void zap_store_init() {
 bool zap_store_is_ready() { return s_ready; }
 
 // ── Save device with CRC32 ───────────────────────────────────────────────
-// Scans existing entries to find matching IEEE, writes with CRC checksum.
-// NOTE: O(n) NVS reads for the scan. For bulk interviews this creates O(n²)
-// total I/O. A future optimisation would cache an IEEE→index hash.
+// Resolves the slot via the in-RAM IEEE index (built once from NVS), writes
+// with a CRC32 checksum. F16 (FINDINGS.md): the store mutex serialises this
+// with zap_store_delete_device (cross-task — flush vs dispatch), and the index
+// removes the old per-save O(n) NVS scan (a bulk interview was O(n²)). The
+// never-implemented A/B-snapshot + journal scheme was removed 2026-05-29; NVS
+// is the store.
 
 bool zap_store_save_device(const ZapDevice* dev) {
     if (!dev) return false;
 
+    store_lock();   // F16: serialise with delete + protect the IEEE index
     nvs_handle_t h = open_ns(NVS_READWRITE);
-    if (!h) return false;
+    if (!h) { store_unlock(); return false; }
 
     uint16_t count = 0;
     nvs_get_u16(h, "cnt", &count);
 
+    // F16 (FINDINGS.md): resolve the slot via the in-RAM IEEE index instead of
+    // an O(n) NVS blob scan per save (which made a bulk interview O(n²)). Built
+    // once from NVS, kept in sync below; delete invalidates it.
     char key[8];
-    int16_t found_idx = -1;
-    for (uint16_t i = 0; i < count; i++) {
-        dev_key(key, i);
-        ZapDevice tmp{};
-        size_t sz = sizeof(ZapDevice);
-        if (nvs_get_blob(h, key, &tmp, &sz) == ESP_OK) {
-            if (tmp.ieee_addr == dev->ieee_addr) {
-                found_idx = static_cast<int16_t>(i);
-                break;
-            }
-        }
-    }
+    if (!s_idx_built) index_build_locked(h);
+    int16_t found_idx = index_find_locked(dev->ieee_addr);
 
     uint16_t idx = (found_idx >= 0) ? static_cast<uint16_t>(found_idx) : count;
 
@@ -134,6 +169,7 @@ bool zap_store_save_device(const ZapDevice* dev) {
         if (cnt_err != ESP_OK) {
             ESP_LOGE(TAG, "nvs_set_u16 cnt: %s", esp_err_to_name(cnt_err));
             nvs_close(h);
+            store_unlock();
             return false;
         }
     }
@@ -141,11 +177,20 @@ bool zap_store_save_device(const ZapDevice* dev) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_set_blob: %s", esp_err_to_name(err));
         nvs_close(h);
+        store_unlock();
         return false;
     }
 
     err = nvs_commit(h);
     nvs_close(h);
+
+    // F16: keep the index in sync on success. NVS commits atomically, so on
+    // failure NVS is unchanged and the index must stay as-is.
+    if (err == ESP_OK && idx < ZAP_MAX_DEVICES) {
+        s_idx_ieee[idx] = dev->ieee_addr;
+        if (idx >= s_idx_count) s_idx_count = static_cast<uint16_t>(idx + 1);
+    }
+    store_unlock();
 
     ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
     return err == ESP_OK;
@@ -173,6 +218,7 @@ bool zap_store_delete_device(uint64_t ieee) {
 
     bool ok = false;
     uint16_t count = 0;
+    store_lock();   // F16: serialise with save + protect the IEEE index
     do {
         // 1. Read all devices into the scratch buffer.
         nvs_handle_t h = open_ns(NVS_READONLY);
@@ -229,6 +275,8 @@ bool zap_store_delete_device(uint64_t ieee) {
         ok = true;
     } while (0);
 
+    s_idx_built = false;   // F16: slot order changed — index rebuilt on next save
+    store_unlock();
     free(devs);
     if (ok) {
         ESP_LOGI(TAG, "Device deleted ieee=0x%016llx remaining=%u",

@@ -256,6 +256,15 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     }
     zigbee_pool_unlock();
     zigbee_pool_mark_dirty();  // nwk may have changed on rejoin — rebuild hash index
+    // F6/F35 (FINDINGS.md) — KNOWN RESIDUAL: `dev` is dereferenced below
+    // across multi-second blocking ZNP I/O after this unlock. A concurrent
+    // swap-with-last pool_remove (rare — user delete / ZDO_LEAVE_IND during
+    // another device's interview) can relocate this slot, so a late write
+    // could land on the wrong record. The correct fix accumulates results
+    // into a local and commits under a re-acquired lock, but is entangled
+    // with interview_read_basic(dev) and zap_store_mark_dirty(dev), which
+    // both require the real pool slot — deferred to a coordinated refactor
+    // + on-hardware test (the bridges and rule engine are already fixed).
 
     if (is_rejoin)
         ESP_LOGI(TAG, "Device rejoin ieee=0x%016llx nwk=0x%04x", (unsigned long long)ieee, nwk);

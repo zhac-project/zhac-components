@@ -69,6 +69,8 @@ struct DeviceShadowEntry {
     uint32_t      nvs_last_write_s; // runtime-only, seconds since boot
     volatile bool debounce_pending_flush; // set by timer cb if queue full (fallback)
     bool          nvs_dirty;        // runtime-only — skipped NVS write pending flush
+    uint32_t      cfg_crc;          // F26: crc32 of last-persisted config (dedupe writes)
+    bool          cfg_crc_valid;    // F26: true once cfg_crc reflects a persisted config
 };
 
 // ── Public API ────────────────────────────────────────────────────────────

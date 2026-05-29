@@ -50,7 +50,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
                        ? payload_len : sizeof(s_msg.payload) - 1;
     memcpy(s_msg.payload, payload, n);
     s_msg.payload[n] = '\0';
-    s_msg.qos    = static_cast<uint8_t>(qos);
+    s_msg.qos    = static_cast<uint8_t>(qos < 0 ? 0 : (qos > 2 ? 2 : qos));   // F23: clamp 0..2
     s_msg.retain = retain;
 
     uint16_t len = 0;
@@ -73,6 +73,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
 
 bool mqtt_gw_is_connected()                    { return false; }  // N/A on P4
 bool mqtt_gw_is_active()                       { return false; }  // N/A on P4
+bool mqtt_gw_is_secure()                       { return false; }  // F45: no local client on P4
 void mqtt_gw_set_rx_callback(mqtt_rx_cb_t)     {}  // N/A on P4
 void mqtt_gw_subscribe(const char*, int)        {}  // N/A on P4
 void mqtt_gw_set_broker_url(const char*)        {}  // N/A on P4

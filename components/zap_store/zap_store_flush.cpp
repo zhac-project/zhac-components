@@ -103,6 +103,18 @@ static bool flush_slot(size_t idx) {
             s_dirty[slot].in_use = true;
         }
         xSemaphoreGive(s_mtx);
+        if (slot < 0) {
+            // F37 (FINDINGS.md): dirty table full — can't defer the retry, so
+            // persist synchronously rather than dropping the device record. The
+            // `dev` snapshot is already detached from the live pool (taken via
+            // s_snapshot), so re-saving it here is safe against pool_remove.
+            ESP_LOGW(TAG, "dirty table full on re-queue — synchronous save ieee=0x%016llx",
+                     (unsigned long long)snap.ieee);
+            if (!zap_store_save_device(&dev))
+                ESP_LOGE(TAG, "synchronous save ALSO failed ieee=0x%016llx — record lost",
+                         (unsigned long long)snap.ieee);
+            return true;   // slot consumed; nothing left re-queued
+        }
         return false;
     }
     return true;

@@ -332,6 +332,14 @@ ZnpStatus znp_call_retry(uint8_t cmd0, uint8_t cmd1,
         ESP_LOGW(TAG, "znp_call attempt %d/%d failed "
                       "cmd0=0x%02x cmd1=0x%02x status=%u",
                  i, max_attempts, cmd0, cmd1, (unsigned)last);
+        // F43 (FINDINGS.md): back off between retries so a momentarily wedged
+        // NCP isn't hammered with back-to-back commands. 25/50/100/200 ms,
+        // capped at 400 ms; no delay after the final attempt.
+        if (i < max_attempts) {
+            uint32_t backoff_ms = (i <= 5) ? (25u << (i - 1)) : 400u;
+            if (backoff_ms > 400u) backoff_ms = 400u;
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        }
     }
     return last;
 }

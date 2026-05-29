@@ -37,8 +37,16 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
                                       const char* str_val) {
     if (!key) return;
 
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35 (FINDINGS.md): pool_find_by_ieee returns a raw pointer whose
+    // array slot a concurrent swap-with-last pool_remove can relocate.
+    // Snapshot the device under the advisory lock and operate on the copy
+    // (device_shadow_process only reads ieee_addr and does not retain it).
+    ZapDevice snap;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGD(TAG, "no device for ieee=0x%016llx",
                  static_cast<unsigned long long>(ieee));
         return;
@@ -80,7 +88,7 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
             return;   // None / BytesRef / ObjectRef — not shadowable
     }
 
-    device_shadow_process(dev, &attr, 1);
+    device_shadow_process(&snap, &attr, 1);
 }
 
 }  // namespace

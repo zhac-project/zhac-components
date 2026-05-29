@@ -81,12 +81,25 @@ static bool flush_slot(size_t idx) {
         ok = true;
     }
     if (!ok) {
+        // Only WRITE reaches here — TOMBSTONE always sets ok=true above.
         ESP_LOGE(TAG, "flush failed rule_id=0x%04x state=%u — re-queueing",
                  snap.rule_id, snap.state);
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         int slot = find_free_locked();
         if (slot >= 0) s_dirty[slot] = snap;
         xSemaphoreGive(s_mtx);
+        if (slot < 0) {
+            // F37 (FINDINGS.md): dirty table full — we can't defer the retry,
+            // so persist synchronously here instead of silently dropping the
+            // edit. May fail again (same NVS error), but then it's logged loud,
+            // not lost in silence.
+            ESP_LOGW(TAG, "dirty table full on re-queue — synchronous save rule_id=0x%04x",
+                     snap.rule_id);
+            if (!rule_store_save(&snap.slot))
+                ESP_LOGE(TAG, "synchronous save ALSO failed rule_id=0x%04x — edit lost",
+                         snap.rule_id);
+            return true;   // slot consumed; nothing left re-queued
+        }
         return false;
     }
     return true;
