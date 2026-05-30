@@ -82,23 +82,35 @@ static int find_free_slot() {
 }
 
 void hap_session_init(const HapSessionCfg& cfg) {
-    s_mutex    = xSemaphoreCreateMutex();
-    configASSERT(s_mutex);
+    // Q19 (QWEN_FINDINGS triage): guard against re-init. The original
+    // unconditionally re-created s_mutex AND memset s_win (nulling the old
+    // payload_copy pointers) AND re-allocated the 16 retransmit buffers — a
+    // second call (e.g. a radio reset / self-heal path) leaked the mutex plus
+    // 64 KB of PSRAM. Allocate the mutex + buffers once; on re-init just refresh
+    // cfg and reset the per-slot bookkeeping, keeping the existing buffers.
+    const bool first = (s_mutex == nullptr);
+    if (first) {
+        s_mutex = xSemaphoreCreateMutex();
+        configASSERT(s_mutex);
+    }
     s_cfg      = cfg;
     s_next_seq = 1;
-    memset(s_win, 0, sizeof(s_win));
-    // Park each retransmit slot's payload buffer in PSRAM. 16 × 4 KB =
-    // 64 KB off internal RAM. PSRAM fallback to internal alloc if the
-    // SPIRAM pool is unavailable so unit tests / non-PSRAM targets
-    // still work.
     for (int i = 0; i < WIN_SIZE; i++) {
-        s_win[i].payload_copy = static_cast<uint8_t*>(
-            heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!s_win[i].payload_copy) {
+        if (first) {
+            // 16 × 4 KB parked in PSRAM (fallback to internal for non-PSRAM
+            // targets / unit tests) so the retransmit ring is off internal SRAM.
             s_win[i].payload_copy = static_cast<uint8_t*>(
-                heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_8BIT));
+                heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (!s_win[i].payload_copy) {
+                s_win[i].payload_copy = static_cast<uint8_t*>(
+                    heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_8BIT));
+            }
+            configASSERT(s_win[i].payload_copy);
         }
-        configASSERT(s_win[i].payload_copy);
+        s_win[i].active  = false;
+        s_win[i].seq     = 0;
+        s_win[i].retries = 0;
+        s_win[i].sent_ms = 0;
     }
     ESP_LOGI(TAG, "win slots: %u × %zu B in PSRAM (%u KB)",
              WIN_SIZE, SLOT_BUF_SIZE,

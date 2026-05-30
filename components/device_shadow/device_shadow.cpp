@@ -47,6 +47,25 @@ struct __attribute__((packed)) ShadowBlobHdr {
 // load() runs only at boot (single-threaded restore) — never concurrent.
 static uint8_t s_attr_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX * sizeof(ShadowAttr)];
 
+// Q76 (QWEN_FINDINGS triage): NVS keys cap at 15 chars, so the original
+// "a%014llX" packed only 56 of the 64 IEEE bits — two devices differing only in
+// the top MAC byte (e.g. different vendors) collided on a single shadow record.
+// base36 packs the full 64-bit IEEE into ≤13 chars (+1 prefix ≤ 15). The v6→v7
+// NVS bump (below) wipes the old 56-bit-keyed entries, so there's no migration.
+static void shadow_key(char out[16], char prefix, uint64_t ieee) {
+    out[0] = prefix;
+    char tmp[16];
+    int n = 0;
+    do {
+        unsigned d = (unsigned)(ieee % 36u);
+        ieee /= 36u;
+        tmp[n++] = (d < 10) ? (char)('0' + d) : (char)('a' + d - 10);
+    } while (ieee);
+    int w = 1;
+    while (n > 0) out[w++] = tmp[--n];
+    out[w] = '\0';
+}
+
 // ── Pipeline helpers (defined in shadow_pipeline.cpp) ────────────────────
 extern "C" uint8_t shadow_pipeline_filter(const DeviceConfig*, const ZclAttribute*, uint8_t,
                                             ZclAttribute*, uint8_t);
@@ -71,7 +90,7 @@ static bool nvs_save_attrs(uint64_t ieee, const ShadowAttr* attrs, uint8_t count
     if (!s_nvs) return false;
     if (count > SHADOW_ATTR_MAX) count = SHADOW_ATTR_MAX;
     char key[16];
-    snprintf(key, sizeof(key), "a%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
+    shadow_key(key, 'a', ieee);   // Q76: full 64-bit IEEE, base36
 
     // F26: prepend version + count + CRC header (see ShadowBlobHdr).
     const size_t plen = (size_t)count * sizeof(ShadowAttr);
@@ -93,7 +112,7 @@ static bool nvs_save_attrs(uint64_t ieee, const ShadowAttr* attrs, uint8_t count
 static bool nvs_save_config(uint64_t ieee, const DeviceConfig* cfg) {
     if (!s_nvs) return false;
     char key[16];
-    snprintf(key, sizeof(key), "c%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
+    shadow_key(key, 'c', ieee);   // Q76: full 64-bit IEEE, base36
     esp_err_t err = nvs_set_blob(s_nvs, key, cfg, sizeof(DeviceConfig));
     if (err != ESP_OK) { ESP_LOGE(TAG, "nvs_set_blob config: %s", esp_err_to_name(err)); return false; }
     err = nvs_commit(s_nvs);
@@ -118,7 +137,7 @@ static void persist_config_dedup(DeviceShadowEntry* e) {
 static bool nvs_load_attrs(uint64_t ieee, ShadowAttr* out, uint8_t* count) {
     if (!s_nvs) return false;
     char key[16];
-    snprintf(key, sizeof(key), "a%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
+    shadow_key(key, 'a', ieee);   // Q76: full 64-bit IEEE, base36
 
     // F26: read into scratch, then validate header (version), exact length,
     // and CRC before trusting the payload. Any mismatch → discard (entry
@@ -156,7 +175,7 @@ static bool nvs_load_attrs(uint64_t ieee, ShadowAttr* out, uint8_t* count) {
 static bool nvs_load_config(uint64_t ieee, DeviceConfig* out) {
     if (!s_nvs) return false;
     char key[16];
-    snprintf(key, sizeof(key), "c%014llX", (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
+    shadow_key(key, 'c', ieee);   // Q76: full 64-bit IEEE, base36
     size_t len = sizeof(DeviceConfig);
     return (nvs_get_blob(s_nvs, key, out, &len) == ESP_OK);
 }
@@ -237,8 +256,13 @@ static void occupancy_timeout_cb(TimerHandle_t timer) {
 
     emit_zcl_attr(e, &synthetic, 1);
 
+    // Q17 (QWEN_FINDINGS triage): this callback runs on the esp_timer service
+    // task. A synchronous NVS write here would block *every* software timer
+    // during the flash write (not a deadlock — all xTimerDelete/Reset use a
+    // 0 tick wait — but a real latency hit). Just mark dirty; task_shadow's
+    // periodic loop persists it off the timer task.
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    persist_attrs_throttled(e);
+    e->nvs_dirty = true;
     xSemaphoreGive(s_mutex);
 
     ESP_LOGD(TAG, "occ_ttl: 0x%014llX — synthetic occupancy=0",
@@ -597,8 +621,7 @@ void device_shadow_clear_attrs(uint64_t ieee) {
 
         if (s_nvs) {
             char key[16];
-            snprintf(key, sizeof(key), "a%014llX",
-                     (unsigned long long)(ieee & 0x00FFFFFFFFFFFFFFULL));
+            shadow_key(key, 'a', ieee);   // Q76: full 64-bit IEEE, base36
             nvs_erase_key(s_nvs, key);
             nvs_commit(s_nvs);
         }

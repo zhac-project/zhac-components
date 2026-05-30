@@ -24,6 +24,12 @@ uint8_t hap_crc8(const uint8_t* data, size_t len) {
 }
 
 size_t hap_encode(const HapFrame& f, uint8_t* buf, size_t buf_size) {
+    // Q16 (QWEN_FINDINGS triage): reject a frame that declares payload_len > 0
+    // but supplies no payload pointer — otherwise the header length says N while
+    // the wire bytes + CRC cover uninitialised buf memory (a corrupt frame that
+    // still passes its own CRC). payload_len == 0 is fine: hap_crc16 over 0 bytes
+    // is the deterministic 0xFFFF seed, with no uninitialised read.
+    if (f.payload_len > 0 && !f.payload) return 0;
     size_t total = HAP_FRAME_OVERHEAD + f.payload_len;
     if (total > buf_size) return 0;
 
@@ -143,6 +149,7 @@ HapDecodeResult hap_decode_stage1(const uint8_t in[HAP_STAGE1_LEN], HapFrame& ou
 }
 
 size_t hap_encode_stage2(const HapFrame& f, uint8_t* out, size_t cap) {
+    if (f.payload_len > 0 && !f.payload) return 0;   // Q16: see hap_encode
     size_t need = static_cast<size_t>(f.payload_len) + 2;
     if (need > cap) return 0;
     if (f.payload_len > 0 && f.payload)

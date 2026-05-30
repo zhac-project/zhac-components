@@ -35,7 +35,12 @@ extern "C" void zhc_configure_bridge_register(void);
 // Raw AF frames are copied here from the AREQ callback so the UART RX task
 // is never blocked by converter/shadow work.
 static constexpr uint8_t  ZCL_QUEUE_DEPTH   = 16;
-static constexpr uint8_t  ZCL_PAYLOAD_MAX   = 128;
+// DS15 (DS_FINDINGS): an MT AF_INCOMING_MSG carries up to ~238 ZCL bytes
+// (255-byte MT data − 17-byte AF header), so the old 128-byte cap silently
+// truncated large attribute reports, long string attrs, and Tuya DP bursts.
+// 250 covers the worst case (data_len is uint8_t; the AREQ copy still clamps to
+// this). Cost: AfRawFrame grows ~122 B → the queue is 16×~262 ≈ 4.2 KB.
+static constexpr uint8_t  ZCL_PAYLOAD_MAX   = 250;
 
 struct AfRawFrame {
     uint16_t group_id;     // AF_INCOMING_MSG bytes 0..1 (0 = unicast)

@@ -34,6 +34,7 @@
 static const char* TAG = "znp_transport";
 
 uart_port_t znp_uart_port = UART_NUM_1;
+QueueHandle_t znp_uart_evt_q = nullptr;   // Q32: UART event queue (overrun detection)
 
 #ifdef CONFIG_ZHAC_ZNP_UART_TX_GPIO
 static constexpr gpio_num_t PIN_TX     = (gpio_num_t)CONFIG_ZHAC_ZNP_UART_TX_GPIO;
@@ -67,8 +68,12 @@ static void init_uart() {
     ESP_ERROR_CHECK(uart_param_config(znp_uart_port, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(znp_uart_port, PIN_TX, PIN_RX,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(znp_uart_port, UART_BUF_SZ, 0, 0,
-                                         nullptr, 0));
+    // Q32 (QWEN_FINDINGS triage): install with an event queue so znp_rx_task can
+    // observe UART_FIFO_OVF / UART_BUFFER_FULL (otherwise an RX overrun on the
+    // CC2652 link at 115200 with no flow control silently drops bytes) and
+    // resync the MT parser instead of feeding it a corrupt partial frame.
+    ESP_ERROR_CHECK(uart_driver_install(znp_uart_port, UART_BUF_SZ, 0, 20,
+                                         &znp_uart_evt_q, 0));
 }
 
 static void init_gpios() {
