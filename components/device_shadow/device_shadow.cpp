@@ -4,6 +4,7 @@
 #include "event_bus.h"
 #include "zap_store.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"   // EXT_RAM_BSS_ATTR — park the big CRC scratch in PSRAM
 #include "esp_log.h"
 #include "metrics/metrics_macros.h"
 #include "freertos/FreeRTOS.h"
@@ -45,7 +46,11 @@ struct __attribute__((packed)) ShadowBlobHdr {
 };
 // Single shared scratch: save() runs under s_mutex (serialised across tasks),
 // load() runs only at boot (single-threaded restore) — never concurrent.
-static uint8_t s_attr_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX * sizeof(ShadowAttr)];
+// Parked in PSRAM (EXT_RAM_BSS_ATTR): ~2.7 KB is too much for the tight internal
+// DRAM of the single-chip (mono) build, which it overflowed by ~1.3 KB. Accessed
+// only under s_mutex (save) or at boot (load) — never from an ISR — so external
+// RAM is fine. No-op (stays internal) on targets without PSRAM-BSS enabled.
+EXT_RAM_BSS_ATTR static uint8_t s_attr_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX * sizeof(ShadowAttr)];
 
 // Q76 (QWEN_FINDINGS triage): NVS keys cap at 15 chars, so the original
 // "a%014llX" packed only 56 of the 64 IEEE bits — two devices differing only in
