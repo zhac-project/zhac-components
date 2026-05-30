@@ -18,6 +18,7 @@
 #include "znp_driver.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "freertos/task.h"
 #include "task_stacks.h"
 
@@ -154,9 +155,34 @@ static void znp_rx_task(void*) {
     MtStreamParser parser;
     parser.reset();
     uint8_t buf[256];
+    // Q58 (QWEN_FINDINGS triage): subscribe to the task watchdog so a wedged RX
+    // loop reboots the host (best effort — no-op if the TWDT isn't enabled).
+    // The 50 ms read timeout below feeds the WDT each loop even when idle.
+    // (The worker task intentionally blocks on portMAX_DELAY — idle there is
+    // normal, so it is NOT WDT-subscribed.)
+    esp_task_wdt_add(NULL);
     while (true) {
+        // Q32 (QWEN_FINDINGS triage): drain UART events; on an RX overrun the
+        // dropped bytes corrupt the in-flight MT frame, so flush the driver
+        // buffers + queued events and resync the parser. uart_read_bytes still
+        // owns the data path (the event queue is a separate notification
+        // channel) — keeping the proven read loop intact.
+        if (znp_uart_evt_q) {
+            uart_event_t ev;
+            while (xQueueReceive(znp_uart_evt_q, &ev, 0) == pdTRUE) {
+                if (ev.type == UART_FIFO_OVF || ev.type == UART_BUFFER_FULL) {
+                    ESP_LOGW(TAG, "UART RX overrun (event %d) — flush + parser resync",
+                             (int)ev.type);
+                    uart_flush_input(znp_uart_port);
+                    xQueueReset(znp_uart_evt_q);
+                    parser.reset();
+                    break;
+                }
+            }
+        }
         const int n = uart_read_bytes(znp_uart_port, buf, sizeof(buf),
                                        pdMS_TO_TICKS(50));
+        esp_task_wdt_reset();   // Q58: fed each loop (data or 50 ms timeout)
         if (n <= 0) continue;
         for (int i = 0; i < n; i++) parser.feed(buf[i], on_frame, nullptr);
     }

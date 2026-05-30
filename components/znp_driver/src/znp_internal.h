@@ -12,6 +12,7 @@
 
 // ── UART configuration (owned by znp_transport.cpp) ───────────────────────
 extern uart_port_t znp_uart_port;
+extern QueueHandle_t znp_uart_evt_q;   // Q32: UART event queue (overrun detection)
 
 // ── Parser / encoder (znp_parser.cpp) ─────────────────────────────────────
 // Encode a high-level ZnpFrame into MT wire bytes (SOF+LEN+CMD0+CMD1+data+FCS).
