@@ -16,6 +16,8 @@
 
 #include "metrics/metrics_macros.h"
 
+#include "zhc/runtime/expose_range.hpp"
+
 #include "definitions/lumi/_shared.hpp"
 #include "zhc/devices/lumi_registry.hpp"
 #include "zhc/devices/efekta_registry.hpp"
@@ -862,6 +864,11 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
         int w = snprintf(tmp, sizeof(tmp), "%u", n);
         if (w > 0) write(tmp);
     };
+    auto write_int = [&](std::int32_t n) {   // signed — numeric bounds may be negative
+        char tmp[12];
+        int w = snprintf(tmp, sizeof(tmp), "%d", static_cast<int>(n));
+        if (w > 0) write(tmp);
+    };
 
     auto category_str = [](zhc::ExposeCategory c) -> const char* {
         switch (c) {
@@ -896,6 +903,18 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
                 write_quoted(e.enum_values[j] ? e.enum_values[j] : "");
             }
             write("]");
+        }
+        // Numeric bounds (UI slider scaling). Prefer the def's explicit bounds; else fill the
+        // standard attrs (brightness/color_temp/position/…) from the central range table so a
+        // slider scales correctly without per-def edits. Emitted as z2m's value_min/value_max.
+        if (e.type == zhc::ExposeType::Numeric) {
+            std::int32_t lo = e.value_min, hi = e.value_max, st = e.value_step;
+            if (hi <= lo) zhc::default_numeric_range(e.name, lo, hi, st);
+            if (hi > lo) {
+                write(",\"value_min\":"); write_int(lo);
+                write(",\"value_max\":"); write_int(hi);
+                if (st > 0) { write(",\"value_step\":"); write_int(st); }
+            }
         }
         write("}");
     };
