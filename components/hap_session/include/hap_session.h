@@ -34,3 +34,13 @@ void hap_session_tick();
 
 // Returns and auto-increments the next outgoing sequence number.
 uint16_t hap_session_next_seq();
+
+// Free all in-flight retransmit-window slots, abandoning any frames the peer
+// never ACKed. Preserves cfg, mutex, retransmit buffers, the outbound seq
+// counter (seq continuity is kept — the peer does not expect a reset) and the
+// dedup SEEN_RING. Use when the link is presumed dead / on re-SYNC so recovery
+// starts with an empty window and cannot wedge on stale pre-outage frames
+// (which would otherwise keep retransmitting and risk window-full). Cheap and
+// non-blocking beyond a short mutex hold — safe to call from on_link_dead /
+// on_sync context.
+void hap_session_reset_link();
