@@ -117,6 +117,29 @@ void hap_session_init(const HapSessionCfg& cfg) {
              (unsigned)(WIN_SIZE * SLOT_BUF_SIZE / 1024));
 }
 
+void hap_session_reset_link() {
+    if (!s_mutex) return;  // never inited — nothing in flight
+    // Free every in-flight slot. The single frame that hit MAX_RETRIES is
+    // already freed by hap_session_tick before on_link_dead fires, but
+    // siblings enqueued just before the outage stay `active` and keep
+    // retransmitting stale pre-outage seqs (the peer stopped tracking them),
+    // which can wedge the window full after recovery. Mirror the init reset
+    // of the per-slot bookkeeping; keep cfg, mutex, retransmit buffers and the
+    // SEEN_RING (dedup is harmless across a resync) and DO NOT touch s_next_seq
+    // — seq continuity is intentional, the peer does not expect a reset.
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int freed = 0;
+    for (int i = 0; i < WIN_SIZE; i++) {
+        if (s_win[i].active) freed++;
+        s_win[i].active  = false;
+        s_win[i].seq     = 0;
+        s_win[i].retries = 0;
+        s_win[i].sent_ms = 0;
+    }
+    xSemaphoreGive(s_mutex);
+    if (freed) ESP_LOGW(TAG, "reset_link — abandoned %d in-flight frame(s)", freed);
+}
+
 uint16_t hap_session_next_seq() {
     if (!s_mutex) {
         // Called before hap_session_init() — likely a Lua script or
