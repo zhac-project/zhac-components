@@ -483,22 +483,35 @@ bool zigbee_zcl_read(uint16_t nwk_addr, uint8_t endpoint,
 bool zigbee_zcl_write_attr(uint16_t nwk_addr, uint8_t endpoint,
                             uint16_t cluster_id, uint16_t attr_id,
                             uint8_t type, const uint8_t* value,
-                            uint8_t value_len) {
+                            uint8_t value_len,
+                            uint16_t manu_code) {
     if (!value || value_len == 0) return false;
-    // ZCL header (3) + record (attr_id 2 + type 1 + value N).
-    const std::size_t body_len =
-        3u + 3u + static_cast<std::size_t>(value_len);
+    // ZCL header: profile-wide = 3 B (FC|TSN|CMD); manu-specific = 5 B
+    // (FC|manu_lo|manu_hi|TSN|CMD) — mirrors zigbee_zcl_read above.
+    // Record = attr_id 2 + type 1 + value N.
+    const std::size_t hdr_len = manu_code ? 5u : 3u;
+    const std::size_t rec_len = 3u + static_cast<std::size_t>(value_len);
+    const std::size_t body_len = hdr_len + rec_len;
     if (body_len > kAfPayloadMax) return false;
 
     const uint8_t seq = zcl_seq_next();
     uint8_t zcl_frame[kAfPayloadMax];
-    zcl_frame[0] = 0x00;   // FC: profile-wide, C→S
-    zcl_frame[1] = seq;
-    zcl_frame[2] = 0x02;   // CMD_WRITE_ATTR
-    zcl_frame[3] = static_cast<uint8_t>(attr_id & 0xFF);
-    zcl_frame[4] = static_cast<uint8_t>((attr_id >> 8) & 0xFF);
-    zcl_frame[5] = type;
-    std::memcpy(zcl_frame + 6, value, value_len);
+    std::size_t pos = 0;
+    if (manu_code) {
+        zcl_frame[pos++] = 0x04;   // FC: profile-wide, manu-specific, C→S
+        zcl_frame[pos++] = static_cast<uint8_t>(manu_code & 0xFF);
+        zcl_frame[pos++] = static_cast<uint8_t>((manu_code >> 8) & 0xFF);
+        zcl_frame[pos++] = seq;
+        zcl_frame[pos++] = 0x02;   // CMD_WRITE_ATTR
+    } else {
+        zcl_frame[pos++] = 0x00;   // FC: profile-wide, C→S
+        zcl_frame[pos++] = seq;
+        zcl_frame[pos++] = 0x02;   // CMD_WRITE_ATTR
+    }
+    zcl_frame[pos++] = static_cast<uint8_t>(attr_id & 0xFF);
+    zcl_frame[pos++] = static_cast<uint8_t>((attr_id >> 8) & 0xFF);
+    zcl_frame[pos++] = type;
+    std::memcpy(zcl_frame + pos, value, value_len);
 
     uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
     af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);

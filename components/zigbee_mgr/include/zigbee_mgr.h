@@ -117,14 +117,20 @@ bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
                                   uint32_t reportable_change,
                                   uint16_t manu_code = 0);
 
-// Generic ZCL Write Attributes — profile-wide (FC=0x00) write of a
-// single attribute. `value` points at the on-wire byte buffer for
-// `type` (e.g. 8 LE bytes for `0xF0`/IEEE Address). Returns true when
-// the SRSP status byte is 0.
+// Generic ZCL Write Attributes (cmd 0x02) for a single attribute.
+// `value` points at the on-wire byte buffer for `type` (e.g. 8 LE bytes
+// for `0xF0`/IEEE Address). `manu_code` non-zero wraps the frame
+// manufacturer-specific (FC=0x04, 5-byte header) exactly like
+// `zigbee_zcl_read` — required by Aqara/lumi 0xFCC0 writes which z2m
+// emits with `{manufacturerCode: 0x115f}` and which the hardware rejects
+// if sent profile-wide. `manu_code == 0` (the default) keeps the legacy
+// profile-wide 3-byte header (FC=0x00) for Tuya 0x8004, IAS CIE, etc.
+// Returns true when the SRSP status byte is 0.
 bool zigbee_zcl_write_attr(uint16_t nwk_addr, uint8_t endpoint,
                             uint16_t cluster_id, uint16_t attr_id,
                             uint8_t type, const uint8_t* value,
-                            uint8_t value_len);
+                            uint8_t value_len,
+                            uint16_t manu_code = 0);
 
 // Generic ZCL cluster-specific command. `flags` accepts
 // `kStepFlag*` bits from `ConfigStep::flags` (only bit 0 =
