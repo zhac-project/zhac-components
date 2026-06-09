@@ -18,12 +18,19 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   signature is untouched), a `configure_write_bridge` forwarding through the
   addr-mutex `g_cfg_ieee`/`g_cfg_nwk` globals exactly like `configure_read_bridge`
   (wired at both ctx-setup sites — configure path + inbound-decode path), and the
-  `zhc_cfg_write_af` bridge backing it with the production-tested
-  `zigbee_zcl_write_attr`. Limitation: that transport is profile-wide (FC=0x00)
-  and ignores the manufacturer code — correct for the writes the lib emits today
-  (e.g. lumi 0xFCC0, where cluster id carries the manufacturer-specificity);
-  manu-specific write FC needs a future `zigbee_zcl_write_attr` param. **NEEDS
-  HARDWARE TEST** — host build cannot exercise the ZNP radio path.
+  `zhc_cfg_write_af` bridge backing it with `zigbee_zcl_write_attr`.
+  `zigbee_zcl_write_attr` gained an optional trailing `manufacturer_code`
+  parameter (default 0): non-zero builds a manufacturer-specific ZCL frame
+  (FC=0x04, 5-byte header), mirroring `zigbee_zcl_read`'s manu branch exactly;
+  the bridge forwards `manu` end-to-end. This makes lumi 0xFCC0 writes actually
+  work — z2m emits them as `endpoint.write("manuSpecificLumi", {...},
+  {manufacturerCode: 0x115f})` and Aqara hardware rejects a profile-wide write
+  (the earlier "0xFCC0 is fine profile-wide / cluster id carries the
+  specificity" rationale was wrong — the lib's own def/test thread
+  `manu_code=0x115F` through to the transport). The default-0 param leaves
+  every existing profile-wide caller (Tuya 0x8004, IAS CIE-address write)
+  byte-for-byte unchanged. **NEEDS HARDWARE TEST** — host build cannot
+  exercise the ZNP radio path.
 - **device_shadow / hap_json**: per-device `throttle_ms` report rate-limit knob,
   carried over `DEVICE_OPTIONS_SET` and applied by the existing
   `shadow_pipeline_throttle_pass` (new `device_shadow_set_throttle_ms`, NVS-

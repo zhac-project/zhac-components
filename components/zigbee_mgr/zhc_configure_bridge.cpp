@@ -110,17 +110,19 @@ extern "C" bool zhc_cfg_write_af(uint64_t /*ieee*/, uint16_t nwk,
                                   uint8_t endpoint, uint16_t cluster,
                                   uint16_t attr, uint8_t type,
                                   const uint8_t* val, uint8_t len,
-                                  uint16_t /*manu*/) {
-    // NOTE manu_code limitation: zigbee_zcl_write_attr is profile-wide
-    // (FC=0x00) and has no manufacturer-code parameter, so `manu` is
-    // intentionally dropped here. This is correct for the writes the lib
-    // emits today — e.g. lumi 0xFCC0 attributes, where the manufacturer-
-    // specificity is carried by the cluster id, not the ZCL frame control
-    // (z2m writes 0xFCC0 attrs profile-wide too). FOLLOW-UP: if a device
-    // ever needs a manu-specific frame control on a write,
-    // zigbee_zcl_write_attr must gain a manu_code param (mirroring
-    // zigbee_zcl_read) and this bridge must forward it.
-    return zigbee_zcl_write_attr(nwk, endpoint, cluster, attr, type, val, len);
+                                  uint16_t manu) {
+    // Forward the manufacturer code end-to-end. When `manu` != 0,
+    // zigbee_zcl_write_attr builds a manu-specific ZCL frame (FC=0x04,
+    // 5-byte header) — required for lumi 0xFCC0 attribute writes, which
+    // z2m emits as `endpoint.write("manuSpecificLumi", {...},
+    // {manufacturerCode: 0x115f})` and which Aqara hardware silently
+    // rejects if sent profile-wide. (The earlier claim that 0xFCC0 is
+    // fine profile-wide because "the cluster id carries the specificity"
+    // was wrong — contradicted by the lib's own def/test which thread
+    // manu_code=0x115F through to here.) `manu == 0` keeps the legacy
+    // profile-wide write (Tuya 0x8004, IAS CIE) unchanged.
+    return zigbee_zcl_write_attr(nwk, endpoint, cluster, attr, type, val, len,
+                                  manu);
 }
 
 extern "C" void zhc_cfg_sleep(uint16_t wait_ms) {
