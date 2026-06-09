@@ -9,6 +9,21 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **zhc_adapter / zigbee_mgr**: wire the join-time `configure_write` hook so
+  `ConfigStepOp::Write` steps actually transmit. embedded-zhc's runtime already
+  invokes `ctx.configure_write` during configure, but nothing registered a
+  transport, so it stayed null and Write steps were inert no-ops. Added
+  `zhac_configure_write_fn_t` + a dedicated `zhac_adapter_register_configure_write`
+  setter (separate from `..._register_configure_ex` so the existing caller's
+  signature is untouched), a `configure_write_bridge` forwarding through the
+  addr-mutex `g_cfg_ieee`/`g_cfg_nwk` globals exactly like `configure_read_bridge`
+  (wired at both ctx-setup sites — configure path + inbound-decode path), and the
+  `zhc_cfg_write_af` bridge backing it with the production-tested
+  `zigbee_zcl_write_attr`. Limitation: that transport is profile-wide (FC=0x00)
+  and ignores the manufacturer code — correct for the writes the lib emits today
+  (e.g. lumi 0xFCC0, where cluster id carries the manufacturer-specificity);
+  manu-specific write FC needs a future `zigbee_zcl_write_attr` param. **NEEDS
+  HARDWARE TEST** — host build cannot exercise the ZNP radio path.
 - **device_shadow / hap_json**: per-device `throttle_ms` report rate-limit knob,
   carried over `DEVICE_OPTIONS_SET` and applied by the existing
   `shadow_pipeline_throttle_pass` (new `device_shadow_set_throttle_ms`, NVS-

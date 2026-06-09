@@ -545,6 +545,7 @@ zhac_configure_bind_fn_t   g_cfg_bind   = nullptr;
 zhac_configure_report_fn_t g_cfg_report = nullptr;
 zhac_configure_cmd_fn_t    g_cfg_cmd    = nullptr;
 zhac_configure_read_fn_t   g_cfg_read   = nullptr;
+zhac_configure_write_fn_t  g_cfg_write  = nullptr;
 zhac_configure_sleep_fn_t  g_cfg_sleep  = nullptr;
 // Per-bridge-call addressing. The zhc library's bridge function-pointer
 // types only carry (idx, ep, cluster, ...) — they have no slot for
@@ -603,6 +604,23 @@ bool configure_read_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
         : false;
 }
 
+bool configure_write_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
+                             std::uint16_t cluster, std::uint16_t attr,
+                             std::uint8_t type, const std::uint8_t* value,
+                             std::size_t len, std::uint16_t manu_code) {
+    // The zhc library's ConfigureWriteFn carries the value length as
+    // std::size_t, but a single ZCL attribute value is at most a few
+    // bytes (the widest standard type is an 8-byte IEEE address / u64).
+    // The bridge fn-ptr + radio transport take a uint8_t length, so clamp
+    // here — guard against a malformed >255 spec rather than truncating
+    // silently into a corrupt frame.
+    if (len > 0xFF) return false;
+    return g_cfg_write
+        ? g_cfg_write(g_cfg_ieee, g_cfg_nwk, ep, cluster, attr, type, value,
+                       static_cast<std::uint8_t>(len), manu_code)
+        : false;
+}
+
 void configure_sleep_bridge(std::uint16_t wait_ms) {
     if (g_cfg_sleep) g_cfg_sleep(wait_ms);
 }
@@ -622,6 +640,11 @@ extern "C" void zhac_adapter_register_configure_ex(
     g_cfg_cmd   = cmd_fn;
     g_cfg_read  = read_fn;
     g_cfg_sleep = sleep_fn;
+}
+
+extern "C" void zhac_adapter_register_configure_write(
+        zhac_configure_write_fn_t write_fn) {
+    g_cfg_write = write_fn;
 }
 
 extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
@@ -644,6 +667,7 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
     ctx.configure_report = g_cfg_report ? &configure_report_bridge : nullptr;
     ctx.configure_cmd    = g_cfg_cmd    ? &configure_cmd_bridge    : nullptr;
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
+    ctx.configure_write  = g_cfg_write  ? &configure_write_bridge  : nullptr;
     ctx.configure_sleep  = g_cfg_sleep  ? &configure_sleep_bridge  : nullptr;
 
     // Hold the addr mutex across the whole bridge-consuming section so a
@@ -1053,6 +1077,7 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     ctx.configure_report = g_cfg_report ? &configure_report_bridge : nullptr;
     ctx.configure_cmd    = g_cfg_cmd    ? &configure_cmd_bridge    : nullptr;
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
+    ctx.configure_write  = g_cfg_write  ? &configure_write_bridge  : nullptr;
 
     // Hold the addr mutex from the snapshot of g_cfg_nwk through the
     // full dispatch — the bridges below consume g_cfg_ieee/g_cfg_nwk
