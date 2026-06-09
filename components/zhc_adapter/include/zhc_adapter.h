@@ -225,6 +225,25 @@ void zhac_adapter_register_configure_ex(zhac_configure_cmd_fn_t   cmd,
                                           zhac_configure_read_fn_t  read,
                                           zhac_configure_sleep_fn_t sleep);
 
+// Platform hook for ZCL Write Attributes issued during configure
+// (`ConfigStepOp::Write`). Single attribute per call. `val` points at
+// the on-wire attribute payload encoded LE per `type` (the ZCL data-
+// type byte); `len` is its byte count. `manu` 0 = profile-wide; non-zero
+// = manufacturer-specific frame. Returns false on transport failure.
+// Registered through its OWN setter (separate from
+// `zhac_adapter_register_configure_ex`) so adding write support doesn't
+// change that function's signature and break its existing caller.
+typedef bool (*zhac_configure_write_fn_t)(uint64_t ieee, uint16_t nwk,
+                                           uint8_t  endpoint,
+                                           uint16_t cluster_id,
+                                           uint16_t attr_id,
+                                           uint8_t  attr_type,
+                                           const uint8_t* val,
+                                           uint8_t  len,
+                                           uint16_t manu_code);
+
+void zhac_adapter_register_configure_write(zhac_configure_write_fn_t write);
+
 // Fire `run_configure` for a device that has just joined. `ieee`
 // resolves to a PreparedDefinition via the same lookup path as
 // `zhac_adapter_try_decode`. Returns true if every bind + report
