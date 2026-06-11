@@ -817,19 +817,22 @@ namespace zhc_adapter_internal {
 // describes the NEW device (cross-device state corruption).
 //
 // g_slots itself has no mutex yet (Task-13 adds one alongside the
-// resolve_device_index append path). Two benign races remain until
-// then, both bounded by the fallback's A/B buffer keeping the victim's
-// published half byte-stable for one more generation: (a) a decode on
-// another core re-reads a pointer we are about to clear and dispatches
-// one last frame against the still-intact OLD bytes (cached_def is a
-// single aligned pointer — word-atomic load/store on both 32-bit
-// targets, matching the codebase's existing relaxed-reader pattern);
-// (b) a decode that resolved the victim's def just before the eviction
-// took the pool mutex re-caches it just after this walk — that stale
-// entry survives until the slot's next invalidation, but only ever
-// dereferences frozen old-generation bytes, never the new device's
-// def. What can no longer happen is the persistent use-after-repurpose
-// this hook exists to cut.
+// resolve_device_index append path). Two races exist around this walk:
+// (a) BENIGN — a decode on another core re-reads a pointer we are
+// about to clear and dispatches one last frame against the still-
+// intact OLD bytes, bounded by the fallback's A/B buffer keeping the
+// victim's published half byte-stable for one more generation
+// (cached_def is a single aligned pointer — word-atomic load/store on
+// both 32-bit targets, matching the codebase's existing relaxed-reader
+// pattern); (b) NOT benign if left open — a decode that resolved the
+// victim's def just before the eviction took the pool mutex could
+// re-cache it just after this walk. Such a stale entry would survive
+// the repurposed slot's FIRST rebuild (which writes the other half),
+// but the slot's SECOND rebuild rewrites the very bytes it points at —
+// the old device's frames would then decode through the NEW device's
+// def. The decode-miss path therefore re-validates every cache fill
+// against the pool under its mutex (zhc_fallback::owns) and drops the
+// fill if the slot no longer belongs to that ieee, closing (b).
 void invalidate_cached_defs_in(const void* begin, const void* end) {
     const auto lo = reinterpret_cast<std::uintptr_t>(begin);
     const auto hi = reinterpret_cast<std::uintptr_t>(end);
@@ -1056,6 +1059,25 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         if (slot && def) {
             slot->cached_def        = def;
             slot->cached_supplement = supp;
+            // Race (b) closure (see invalidate_cached_defs_in): the
+            // resolve above ran without the fallback pool mutex, so a
+            // pool-backed def may belong to a slot that was evicted /
+            // cleared / repurposed between resolve and the stores —
+            // and the invalidation walk may have run BEFORE the stores
+            // landed, missing them. Store first, then re-validate
+            // ownership under the pool mutex: either the walk saw the
+            // entries and cleared them, or owns() sees the slot moved
+            // on and we drop the fill here. Either way no stale pool
+            // pointer persists. MISS path only — the cached-hit fast
+            // path above never takes the pool lock. The local def/supp
+            // still dispatch this one frame below, against bytes the
+            // A/B buffer keeps frozen for one generation (same shape
+            // as benign race (a)).
+            if (!zhc_fallback::owns(ieee, def) ||
+                !zhc_fallback::owns(ieee, supp)) {
+                slot->cached_def        = nullptr;
+                slot->cached_supplement = nullptr;
+            }
         }
     }
 

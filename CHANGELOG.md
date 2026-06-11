@@ -84,6 +84,12 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   16-slot A/B halves. (zhc_adapter_fallback.cpp:455,92,406) **NEEDS
   HARDWARE TEST** — component is IDF-only; verified by host syntax check +
   reader/writer trace, full build gated on the IDF toolchain.
+  Review follow-up: cache invalidation centralized in `reset_slot()` (now
+  also covers the empty-slot realloc path), the decode-miss re-cache race
+  closed via an ownership re-check under the pool mutex
+  (`zhc_fallback::owns`), and `g_pool` moved to PSRAM (`EXT_RAM_BSS_ATTR`,
+  freeing the full ~48 KB — including the pre-existing ~23 KB — of internal
+  .bss).
 - **zigbee_mgr**: hold pool mutex across the `on_tc_dev_ind` find-then-mutate
   sequence so a concurrent `pool_remove` (swap-with-last from user delete or
   ZDO_LEAVE_IND) can no longer relocate the entry between lookup and write,

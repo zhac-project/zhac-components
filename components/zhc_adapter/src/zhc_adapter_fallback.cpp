@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "esp_attr.h"   // EXT_RAM_BSS_ATTR — park the synth pool in PSRAM
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -96,7 +97,13 @@ struct FallbackSlot {
     BuiltDef      bufs[2];
 };
 
-FallbackSlot g_pool[kPoolSize] = {};
+// Parked in PSRAM (EXT_RAM_BSS_ATTR): 16 slots × A/B-buffered BuiltDef
+// is ~48 KB — far too much for internal DRAM .bss (the pool sat there
+// even before the double buffer, at ~23 KB). Accessed only from task
+// context under g_pool_mtx, never from an ISR, so external RAM is
+// fine. No-op (stays internal) on targets without PSRAM-BSS enabled —
+// same pattern as device_shadow's s_attr_blob.
+EXT_RAM_BSS_ATTR FallbackSlot g_pool[kPoolSize];
 
 // Pool mutex — serializes every accessor of g_pool (alloc / evict /
 // rebuild / lookup). Created from a global constructor so it exists
@@ -120,19 +127,6 @@ std::uint32_t fallback_now_ms() {
     return static_cast<std::uint32_t>(esp_timer_get_time() / 1000ULL);
 }
 
-// Drop a slot's identity + interview data but PRESERVE bufs[] and
-// `active`: a stale reader may still hold a pointer into the
-// previously-published half, and the next rebuild (for whatever ieee
-// owns the slot next) writes the OTHER half first — so published bytes
-// survive one more generation even across a slot repurpose.
-void reset_slot(FallbackSlot& s) {
-    s.ieee         = 0;
-    s.last_used_ms = 0;
-    std::memset(s.eps, 0, sizeof(s.eps));
-    s.built     = false;
-    s.last_base = nullptr;
-}
-
 // Tell zhc_adapter to forget any IeeeSlot.cached_def /
 // .cached_supplement pointing into this slot's built-def storage
 // (both A/B halves) — must run BEFORE the slot is repurposed so the
@@ -142,6 +136,25 @@ void invalidate_adapter_cache_for(FallbackSlot& s) {
         &s.bufs[0], &s.bufs[0] + 2);
 }
 
+// Drop a slot's identity + interview data but PRESERVE bufs[] and
+// `active`: a stale reader may still hold a pointer into the
+// previously-published half, and the next rebuild (for whatever ieee
+// owns the slot next) writes the OTHER half first — so published bytes
+// survive one more generation even across a slot repurpose.
+//
+// Single invalidation choke point: EVERY path that frees or repurposes
+// a slot (clear, LRU evict, empty-slot realloc) funnels through here,
+// so the adapter-cache invalidation cannot be forgotten at a call
+// site. Re-invalidating an already-clean slot is a cheap no-op walk.
+void reset_slot(FallbackSlot& s) {
+    invalidate_adapter_cache_for(s);
+    s.ieee         = 0;
+    s.last_used_ms = 0;
+    std::memset(s.eps, 0, sizeof(s.eps));
+    s.built     = false;
+    s.last_base = nullptr;
+}
+
 // Linear scans are fine at pool size 16.
 FallbackSlot* find_slot(std::uint64_t ieee) {
     if (ieee == 0) return nullptr;
@@ -149,10 +162,15 @@ FallbackSlot* find_slot(std::uint64_t ieee) {
     return nullptr;
 }
 
-FallbackSlot* alloc_slot(std::uint64_t ieee) {
+// `evicted_ieee` reports an LRU eviction (0 = none) so the caller can
+// log it AFTER releasing the pool mutex — no ESP_LOG under the lock.
+FallbackSlot* alloc_slot(std::uint64_t ieee, std::uint64_t& evicted_ieee) {
     if (auto* s = find_slot(ieee)) return s;
     const std::uint32_t now = fallback_now_ms();
-    // Prefer an empty slot.
+    // Prefer an empty slot. reset_slot() runs even here: an empty slot
+    // may have been freed by clear()/eviction, and a racing decode can
+    // have re-cached a pointer into its bufs since — invalidate again
+    // before repurposing (the choke point makes this automatic).
     for (auto& s : g_pool) {
         if (s.ieee == 0) {
             reset_slot(s);
@@ -163,12 +181,11 @@ FallbackSlot* alloc_slot(std::uint64_t ieee) {
     }
     // LRU eviction — `last_used_ms` is stamped on every
     // register_endpoint / synth_definition touch, so the victim really
-    // is the least-recently-used device, not just slot 0.
+    // is the least-recently-used device, not just slot 0. reset_slot()
+    // invalidates the adapter's cached pointers into the victim.
     FallbackSlot* victim = &g_pool[0];
     for (auto& s : g_pool) if (s.last_used_ms < victim->last_used_ms) victim = &s;
-    ESP_LOGW(TAG, "pool full — evicting ieee=0x%016llx",
-              static_cast<unsigned long long>(victim->ieee));
-    invalidate_adapter_cache_for(*victim);
+    evicted_ieee = victim->ieee;
     reset_slot(*victim);
     victim->ieee = ieee;
     victim->last_used_ms = now;
@@ -462,21 +479,9 @@ void rebuild(const FallbackSlot& s, BuiltDef& b,
     b.def.config_steps         = b.steps;
     b.def.config_steps_count   = static_cast<std::uint8_t>(b.n_steps);
 
-    const bool any = b.n_exposes || b.n_fz || b.n_tz ||
-                     b.n_bindings || b.n_reports || b.n_steps;
-    if (any) {
-        ESP_LOGI(TAG,
-                  "[fallback] synth def ieee=0x%016llx exposes=%zu fz=%zu tz=%zu "
-                  "bindings=%zu reports=%zu steps=%zu",
-                  static_cast<unsigned long long>(s.ieee),
-                  b.n_exposes, b.n_fz, b.n_tz,
-                  b.n_bindings, b.n_reports, b.n_steps);
-    } else {
-        ESP_LOGD(TAG,
-                  "[fallback] synth def ieee=0x%016llx exposes=0 fz=0 tz=0 "
-                  "bindings=0 reports=0 steps=0 (empty)",
-                  static_cast<unsigned long long>(s.ieee));
-    }
+    // Summary logging happens in synth_definition() AFTER the pool
+    // mutex is released — rebuild() always runs under the lock and
+    // ESP_LOG must not stretch the hold time.
 }
 
 }  // namespace
@@ -495,47 +500,58 @@ void register_endpoint(std::uint64_t ieee,
     // clusters we map.
     if (endpoint == 0xF2) return;
 
-    PoolLock lock;
-    FallbackSlot* s = alloc_slot(ieee);
-    if (!s) return;
-    s->last_used_ms = fallback_now_ms();
+    std::uint64_t evicted_ieee = 0;
+    {
+        PoolLock lock;
+        FallbackSlot* s = alloc_slot(ieee, evicted_ieee);
+        if (s) {
+            s->last_used_ms = fallback_now_ms();
 
-    // Find existing endpoint slot or a free one.
-    EndpointInfo* target = nullptr;
-    for (auto& ep : s->eps) {
-        if (ep.endpoint == endpoint) { target = &ep; break; }
-    }
-    if (!target) {
-        for (auto& ep : s->eps) {
-            if (ep.endpoint == 0) { target = &ep; break; }
+            // Find existing endpoint slot or a free one.
+            EndpointInfo* target = nullptr;
+            for (auto& ep : s->eps) {
+                if (ep.endpoint == endpoint) { target = &ep; break; }
+            }
+            if (!target) {
+                for (auto& ep : s->eps) {
+                    if (ep.endpoint == 0) { target = &ep; break; }
+                }
+            }
+            if (target) {   // else: too many endpoints — drop extras
+                target->endpoint   = endpoint;
+                target->profile_id = profile_id;
+                target->device_id  = device_id;
+                target->n_in       = 0;
+                target->n_out      = 0;
+                const std::size_t cap_in  = std::min(n_in,  kMaxClusters);
+                const std::size_t cap_out = std::min(n_out, kMaxClusters);
+                for (std::size_t i = 0; i < cap_in;  ++i) target->in[target->n_in++]   = in_clusters[i];
+                for (std::size_t i = 0; i < cap_out; ++i) target->out[target->n_out++] = out_clusters[i];
+
+                // Force rebuild on next synth_definition() call. The
+                // published half stays byte-intact — readers that
+                // already resolved it keep decoding against the
+                // pre-update view until the rebuild swaps.
+                s->built = false;
+            }
         }
     }
-    if (!target) return;   // too many endpoints — drop extras
-
-    target->endpoint   = endpoint;
-    target->profile_id = profile_id;
-    target->device_id  = device_id;
-    target->n_in       = 0;
-    target->n_out      = 0;
-    const std::size_t cap_in  = std::min(n_in,  kMaxClusters);
-    const std::size_t cap_out = std::min(n_out, kMaxClusters);
-    for (std::size_t i = 0; i < cap_in;  ++i) target->in[target->n_in++]   = in_clusters[i];
-    for (std::size_t i = 0; i < cap_out; ++i) target->out[target->n_out++] = out_clusters[i];
-
-    // Force rebuild on next synth_definition() call. The published
-    // half stays byte-intact — readers that already resolved it keep
-    // decoding against the pre-update view until the rebuild swaps.
-    s->built = false;
+    // Deferred from alloc_slot: log outside the pool mutex (ESP_LOG can
+    // block on the console and must not stretch the lock hold time).
+    if (evicted_ieee != 0) {
+        ESP_LOGW(TAG, "pool full — evicting ieee=0x%016llx",
+                  static_cast<unsigned long long>(evicted_ieee));
+    }
 }
 
 void clear(std::uint64_t ieee) {
     PoolLock lock;
     if (FallbackSlot* s = find_slot(ieee)) {
-        // Same stale-pointer discipline as eviction: drop any adapter
-        // cache entries into this slot, then reset identity/interview
-        // data while leaving the published bytes intact for one more
-        // generation (an in-flight dispatch may still be reading them).
-        invalidate_adapter_cache_for(*s);
+        // Same stale-pointer discipline as eviction: reset_slot()
+        // first drops any adapter cache entries into this slot (single
+        // choke point), then resets identity/interview data while
+        // leaving the published bytes intact for one more generation
+        // (an in-flight dispatch may still be reading them).
         reset_slot(*s);
     }
 }
@@ -548,48 +564,96 @@ bool has_data(std::uint64_t ieee) {
     return false;
 }
 
+bool owns(std::uint64_t ieee, const void* def_ptr) {
+    if (!def_ptr) return true;   // nothing cached — nothing to disown
+    PoolLock lock;
+    const auto p = reinterpret_cast<std::uintptr_t>(def_ptr);
+    for (const auto& s : g_pool) {
+        const auto lo = reinterpret_cast<std::uintptr_t>(&s.bufs[0]);
+        const auto hi = reinterpret_cast<std::uintptr_t>(&s.bufs[0] + 2);
+        if (p >= lo && p < hi) return s.ieee == ieee;
+    }
+    return true;   // not pool storage (registry def) — ownership n/a
+}
+
 const zhc::PreparedDefinition* synth_definition(std::uint64_t ieee,
                                                  const char* model,
                                                  const char* manufacturer,
                                                  const zhc::PreparedDefinition* base) {
-    PoolLock lock;
-    FallbackSlot* s = find_slot(ieee);
-    if (!s) return nullptr;
-    s->last_used_ms = fallback_now_ms();
+    // Rebuild-summary log data is captured under the lock and emitted
+    // after release — ESP_LOG can block on the console and must not
+    // stretch the pool-mutex hold time.
+    bool        rebuilt = false;
+    std::size_t n_exposes = 0, n_fz = 0, n_tz = 0,
+                n_bindings = 0, n_reports = 0, n_steps = 0;
+    const zhc::PreparedDefinition* result = nullptr;
+    {
+        PoolLock lock;
+        FallbackSlot* s = find_slot(ieee);
+        if (!s) return nullptr;
+        s->last_used_ms = fallback_now_ms();
 
-    // Fast path: already built for this base AND the identity labels
-    // baked into the def still match — return the published half
-    // untouched. Rebuilds happen only on new interview data
-    // (register_endpoint → built=false), a base flip (unmatched →
-    // registry-matched supplement), or a late identity fill changing
-    // the model/manufacturer strings.
-    const char* eff_model = model        ? model        : "generic";
-    const char* eff_manu  = manufacturer ? manufacturer : "generic";
-    const BuiltDef* cur = &s->bufs[s->active];
-    const bool fresh =
-        s->built && s->last_base == base &&
-        std::strncmp(cur->model,        eff_model, sizeof(cur->model) - 1)        == 0 &&
-        std::strncmp(cur->manufacturer, eff_manu,  sizeof(cur->manufacturer) - 1) == 0;
-    if (!fresh) {
-        // Build into the INACTIVE half, publish by flipping `active`.
-        // Never rebuild a published def in place: readers holding the
-        // old pointer (cached_def fast path, in-flight dispatch) keep
-        // seeing a fully-consistent definition.
-        BuiltDef& spare = s->bufs[s->active ^ 1];
-        rebuild(*s, spare, model, manufacturer, base);
-        s->active   = static_cast<std::uint8_t>(s->active ^ 1);
-        s->last_base = base;
-        s->built     = true;
-        cur = &s->bufs[s->active];
+        // Fast path: already built for this base AND the identity labels
+        // baked into the def still match — return the published half
+        // untouched. Rebuilds happen only on new interview data
+        // (register_endpoint → built=false), a base flip (unmatched →
+        // registry-matched supplement), or a late identity fill changing
+        // the model/manufacturer strings.
+        const char* eff_model = model        ? model        : "generic";
+        const char* eff_manu  = manufacturer ? manufacturer : "generic";
+        const BuiltDef* cur = &s->bufs[s->active];
+        const bool fresh =
+            s->built && s->last_base == base &&
+            std::strncmp(cur->model,        eff_model, sizeof(cur->model) - 1)        == 0 &&
+            std::strncmp(cur->manufacturer, eff_manu,  sizeof(cur->manufacturer) - 1) == 0;
+        if (!fresh) {
+            // Build into the INACTIVE half, publish by flipping `active`.
+            // Never rebuild a published def in place: readers holding the
+            // old pointer (cached_def fast path, in-flight dispatch) keep
+            // seeing a fully-consistent definition.
+            BuiltDef& spare = s->bufs[s->active ^ 1];
+            rebuild(*s, spare, model, manufacturer, base);
+            s->active   = static_cast<std::uint8_t>(s->active ^ 1);
+            s->last_base = base;
+            s->built     = true;
+            cur = &s->bufs[s->active];
+
+            rebuilt    = true;
+            n_exposes  = cur->n_exposes;
+            n_fz       = cur->n_fz;
+            n_tz       = cur->n_tz;
+            n_bindings = cur->n_bindings;
+            n_reports  = cur->n_reports;
+            n_steps    = cur->n_steps;
+        }
+
+        if (cur->n_exposes != 0) {
+            result = &cur->def;
+        }
+        // else: no mapped clusters left after subtracting `base`'s
+        // coverage — either a pure router, unsupported device type, or
+        // the registry def already handles everything.
     }
 
-    if (cur->n_exposes == 0) {
-        // No mapped clusters left after subtracting `base`'s coverage
-        // — either a pure router, unsupported device type, or the
-        // registry def already handles everything.
-        return nullptr;
+    if (rebuilt) {
+        // Deferred from rebuild(): summary log, outside the pool mutex.
+        const bool any = n_exposes || n_fz || n_tz ||
+                         n_bindings || n_reports || n_steps;
+        if (any) {
+            ESP_LOGI(TAG,
+                      "[fallback] synth def ieee=0x%016llx exposes=%zu fz=%zu tz=%zu "
+                      "bindings=%zu reports=%zu steps=%zu",
+                      static_cast<unsigned long long>(ieee),
+                      n_exposes, n_fz, n_tz,
+                      n_bindings, n_reports, n_steps);
+        } else {
+            ESP_LOGD(TAG,
+                      "[fallback] synth def ieee=0x%016llx exposes=0 fz=0 tz=0 "
+                      "bindings=0 reports=0 steps=0 (empty)",
+                      static_cast<unsigned long long>(ieee));
+        }
     }
-    return &cur->def;
+    return result;
 }
 
 }  // namespace zhc_fallback

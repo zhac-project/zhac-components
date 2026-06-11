@@ -38,6 +38,15 @@ void clear(std::uint64_t ieee);
 // device.
 bool has_data(std::uint64_t ieee);
 
+// Return false iff `def_ptr` points into the synth pool's built-def
+// storage AND the slot holding it no longer belongs to `ieee`
+// (evicted / cleared / repurposed since the pointer was resolved).
+// nullptr and pointers outside the pool (registry defs) return true —
+// ownership doesn't apply to them. Checked under the pool mutex; used
+// by the adapter's decode-miss re-cache to close the resolve→store
+// race against a concurrent eviction's invalidation walk.
+bool owns(std::uint64_t ieee, const void* def_ptr);
+
 // Return a synthesized PreparedDefinition, or nullptr if no cluster
 // data is registered or no mapped clusters were found. `model` /
 // `manufacturer` seed `def.model` / `.vendor` so logs / UI render
@@ -52,12 +61,16 @@ bool has_data(std::uint64_t ieee);
 //     inactive half and publishes it by flipping the active index, so
 //     a previously returned pointer keeps referencing fully-consistent
 //     (if stale) bytes.
-//   * Residual one-generation rule: a returned pointer's bytes stay
-//     intact until the SECOND rebuild of the same device's slot (the
-//     next rebuild writes the other half). Callers must not hold the
-//     pointer across rebuild triggers longer than one resolve cycle —
-//     re-resolve via synth_definition() (or the adapter's cached_def,
-//     which eviction/clear invalidates) rather than stashing it.
+//   * Residual one-generation rule — THE lifetime rule: a returned
+//     pointer's bytes stay intact until the SECOND rebuild of the same
+//     device's slot (the next rebuild writes the other half; the one
+//     after that rewrites the pointed-at bytes). Do not stash the
+//     pointer — re-resolve via synth_definition() (or the adapter's
+//     cached_def, which eviction/clear invalidates).
+//   * Epoch invariant: every rebuild trigger pairs with a cached_def
+//     invalidation (register_endpoint / identity fill / device
+//     remove), so a correctly re-resolved pointer is never older than
+//     one rebuild and the second-rebuild rule above cannot be hit.
 //   * `clear()` / LRU eviction drop the slot's identity and notify
 //     zhc_adapter to forget cached pointers into the slot, but leave
 //     the published bytes intact for one more generation so an
