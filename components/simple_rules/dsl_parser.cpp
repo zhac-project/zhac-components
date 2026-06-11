@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <cstdint>   // INT32_MAX / INT32_MIN bounds for strtod clamp
+#include <cmath>     // std::isfinite — reject NaN/inf literals before cast
 
 static const char* TAG = "dsl_parser";
 
@@ -218,7 +219,14 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
             // a value up to 0.5 past d, so check (|d| + 0.5) against the
             // int32 limits. This both keeps the subsequent (int32_t) cast in
             // defined range and rejects out-of-range literals like 1e20.
-            if (endp == v || errno == ERANGE ||
+            //
+            // NaN must be rejected EXPLICITLY: `nan >= X` and `nan <= Y` are
+            // both false, so a `nan` literal (strtod parses it) would slip the
+            // magnitude guard and reach `(int32_t)nan` = UB. !std::isfinite(d)
+            // catches NaN AND inf in one check; the magnitude bounds below are
+            // then redundant for inf but KEPT (defensive + clear). isfinite is
+            // ordered first so non-finite values short-circuit before compare.
+            if (endp == v || errno == ERANGE || !std::isfinite(d) ||
                 d >= (double)INT32_MAX + 0.5 || d <= (double)INT32_MIN - 0.5) {
                 ESP_LOGW(TAG, "invalid/out-of-range numeric literal in DSL: %s", v);
                 dsl_set_err("invalid numeric literal '%s'", v);

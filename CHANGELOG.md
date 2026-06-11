@@ -23,7 +23,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   REST/cloud-supplied `#temp>1e20`). Now checks `errno==ERANGE` and the
   rounded magnitude against the int32 bounds before the cast; `1e20`,
   `-1e20`, `99999999999`, and garbage all return `ERR_BAD_TRIGGER`, while
-  `2147483647` (INT32_MAX) still round-trips.
+  `2147483647` (INT32_MAX) still round-trips. Follow-up: the magnitude-only
+  guard let `nan` slip through (`nan>=X` / `nan<=Y` are both false) into
+  `(int32_t)nan` = UB; a `!std::isfinite(d)` check now rejects `nan`/`-nan`/
+  `inf`/`-inf` too (confirmed via UBSan `float-cast-overflow`).
 - **simple_rules** (MED, FINDINGS §7, `:580`): a full active-rule cache used
   to persist to NVS yet return `true`, so the rule was accepted but never
   evaluated (silent no-op). `add` now returns `false` and sets

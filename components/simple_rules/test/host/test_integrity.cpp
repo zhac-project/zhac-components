@@ -112,6 +112,23 @@ int main() {
         CHECK(dsl_parse(num_rule("2147483647").c_str(), 1, &r) == ParseResult::OK &&
               r.trigger.int_val == 2147483647,
               "INT32_MAX literal parses to exactly INT32_MAX");
+        // Boundary: INT32_MIN must round-trip.
+        CHECK(dsl_parse(num_rule("-2147483648").c_str(), 1, &r) == ParseResult::OK &&
+              r.trigger.int_val == (-2147483647 - 1),
+              "INT32_MIN literal parses to exactly INT32_MIN");
+
+        // Non-finite literals: strtod accepts "nan"/"inf" (and signed forms),
+        // but `nan >= X` / `nan <= Y` are both false so NaN slipped the old
+        // magnitude-only guard and reached (int32_t)nan = UB. The isfinite
+        // guard must REJECT NaN and inf, both signs.
+        CHECK(dsl_parse(num_rule("nan").c_str(), 1, &r) == ParseResult::ERR_BAD_TRIGGER,
+              "nan numeric literal rejected (non-finite, no int32 cast UB)");
+        CHECK(dsl_parse(num_rule("-nan").c_str(), 1, &r) == ParseResult::ERR_BAD_TRIGGER,
+              "-nan numeric literal rejected (non-finite)");
+        CHECK(dsl_parse(num_rule("inf").c_str(), 1, &r) == ParseResult::ERR_BAD_TRIGGER,
+              "inf numeric literal rejected (non-finite)");
+        CHECK(dsl_parse(num_rule("-inf").c_str(), 1, &r) == ParseResult::ERR_BAD_TRIGGER,
+              "-inf numeric literal rejected (non-finite)");
     }
 
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
