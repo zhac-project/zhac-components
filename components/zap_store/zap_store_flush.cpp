@@ -37,7 +37,9 @@ static constexpr uint32_t HIGH_MAX_AGE_MS = 5 * 1000;
 static constexpr uint32_t LOW_MAX_AGE_MS  = 300 * 1000;
 static constexpr size_t   DIRTY_CAP       = 64;  // concurrent dirty entries
 static constexpr uint32_t FLUSH_WAIT_POLL_MS = 10;    // barrier poll period
-static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;  // barrier upper bound
+// Barrier upper bound — ≫ worst-case NVS commit incl. page GC (tens of
+// ms); generous so the barrier only expires on genuinely wedged flash.
+static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;
 
 // Slot lifecycle (every transition happens under s_mtx):
 //
@@ -268,7 +270,7 @@ void zap_store_flush_now() {
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < DIRTY_CAP; i++) flush_slot(i);
         if (!wait_no_flushing())
-            ESP_LOGW(TAG, "flush_now: in-flight write did not settle within %lu ms",
+            ESP_LOGE(TAG, "flush_now: in-flight write did not settle within %lu ms",
                      (unsigned long)FLUSH_WAIT_MAX_MS);
         bool pending = false;
         xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -278,7 +280,7 @@ void zap_store_flush_now() {
         xSemaphoreGive(s_mtx);
         if (!pending) return;
     }
-    ESP_LOGW(TAG, "flush_now: dirty entries remain (write failures or concurrent marks)");
+    ESP_LOGE(TAG, "flush_now: dirty entries remain (write failures or concurrent marks)");
 }
 
 static void flush_task(void*) {

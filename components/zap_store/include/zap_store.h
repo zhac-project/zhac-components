@@ -95,7 +95,9 @@ void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri);
 // handlers (esp_register_shutdown_handler), OTA handoff, etc.
 // Durability barrier: also waits (bounded) for writes already in flight
 // on the background flush task, so on return pending state is on flash
-// — not merely dequeued. Blocks; task context only (uses vTaskDelay).
+// — not merely dequeued; entries whose write fails twice remain pending
+// and are logged at error level.
+// Blocks; task context only (uses vTaskDelay).
 void zap_store_flush_now();
 
 // Force-flush one device by IEEE (blocking, task context only). Returns

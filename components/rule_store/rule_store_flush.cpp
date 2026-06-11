@@ -30,7 +30,9 @@ static constexpr uint32_t FLUSH_TICK_MS   = 1000;
 static constexpr uint32_t MAX_AGE_MS      = 5 * 1000;
 static constexpr size_t   DIRTY_CAP       = 64;  // concurrent dirty rules
 static constexpr uint32_t FLUSH_WAIT_POLL_MS = 10;    // barrier poll period
-static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;  // barrier upper bound
+// Barrier upper bound — ≫ worst-case NVS commit incl. page GC (tens of
+// ms); generous so the barrier only expires on genuinely wedged flash.
+static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;
 
 enum DirtyState : uint8_t { CLEAN = 0, WRITE = 1, TOMBSTONE = 2 };
 
@@ -218,7 +220,7 @@ void rule_store_flush_now() {
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < DIRTY_CAP; i++) flush_slot(i);
         if (!wait_no_flushing())
-            ESP_LOGW(TAG, "flush_now: in-flight NVS op did not settle within %lu ms",
+            ESP_LOGE(TAG, "flush_now: in-flight NVS op did not settle within %lu ms",
                      (unsigned long)FLUSH_WAIT_MAX_MS);
         bool pending = false;
         xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -228,7 +230,7 @@ void rule_store_flush_now() {
         xSemaphoreGive(s_mtx);
         if (!pending) return;
     }
-    ESP_LOGW(TAG, "flush_now: pending entries remain (write failures or concurrent marks)");
+    ESP_LOGE(TAG, "flush_now: pending entries remain (write failures or concurrent marks)");
 }
 
 // Overlay APIs — consult dirty table before falling through to NVS so
