@@ -66,7 +66,8 @@ static HapSessionCfg      s_cfg;
 static SemaphoreHandle_t  s_mutex;
 
 // Defect 3 (FINDINGS §1.3): dedup against re-dispatch of NEEDS_ACK frames on
-// peer retransmit. Two complementary mechanisms:
+// peer retransmit. See README §"Receive-side dedup & sequence space" for the
+// authoritative description. Two complementary mechanisms:
 //
 //  (a) Exact-match ring of recent (seq,type) pairs — catches the common case
 //      (a frame we just handled is re-sent because our ACK was lost). The ring
