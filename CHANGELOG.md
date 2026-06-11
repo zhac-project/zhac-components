@@ -330,3 +330,52 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   `components/event_bus/test/host/` reusing the simple_rules shims (which
   gained a one-shot `stub_queue_fail_next_create()` knob); also removed a
   stray `</content>` paste artifact that ended this file.
+
+### Fixed — High (P1 findings review, device_shadow)
+
+- **device_shadow**: no flash I/O or bus publish under `s_mutex` any more —
+  the shadow lock is now a leaf. Pre-fix, `device_shadow_process` (radio RX
+  path) committed attr blobs to NVS while holding the lock (:412), the
+  task_shadow sweep held it across the FULL 200-entry table doing sequential
+  `nvs_set_blob`+`commit` (:446), and `emit_zcl_attr` published to the event
+  bus under it (:334) — nesting the shadow lock over the bus lock (deadlock
+  surface for any bus filter touching shadow API) and stalling the radio
+  path, readers and the FreeRTOS timer task for tens-hundreds of ms per
+  flash commit. ALL attr persistence is now a dirty-mark consumed by the
+  task_shadow sweep, which cycles the locks per entry (lock → serialize into
+  a task-owned PSRAM scratch + clear flags → unlock → publish + flash write
+  outside). Failed writes re-mark dirty after the interval stamp, giving an
+  `NVS_MIN_INTERVAL_S` backoff instead of hammering a failing flash every
+  100 ms. Worst-case added persistence latency is one sweep period (~100 ms,
+  was: immediate when interval-eligible). Config setters split the F26
+  dedupe into decide-under-lock / write-outside-lock halves (`CfgPersist`),
+  and `clear_attrs` erases its NVS key after unlock.
+- **device_shadow**: ZCL_ATTR events are staged under the lock and published
+  after `xSemaphoreGive` via a new `s_emit_mutex` (always taken BEFORE
+  `s_mutex`, owns the shared PSRAM staging buffer, held across the publish)
+  — preserves the old publish-order totality while the bus (hardened in
+  `22217df`) runs filters in the publisher's task with no shadow lock held.
+  Read-only API (`get_attrs`/`get_config`) takes `s_mutex` alone and is no
+  longer stalled by publishes or flash writes.
+- **device_shadow**: `device_shadow_restore_from_pool` mutated
+  `s_shadow`/`s_count` and loaded through the shared `s_attr_blob` scratch
+  with NO lock (:500), racing the already-spawned task_shadow iterating the
+  table every 100 ms. NVS reads now land in a boot-only PSRAM scratch
+  outside the lock, the table install runs under `s_mutex`, and
+  `DEVICE_JOIN`/`zap_store_mark_dirty` fire after release. (Spawning
+  task_shadow after restore instead was rejected — restore is called by
+  firmware after `init()` returns, so reordering needs a split init/start
+  API across both cores.)
+- **device_shadow**: the occupancy-timeout callback blocked the SHARED
+  FreeRTOS timer service task on `s_mutex` with `portMAX_DELAY` (:248) —
+  while an NVS sweep held the lock, every software timer in the firmware
+  froze. The callback is now lock-free: zero-timeout enqueue of
+  `{ieee, kind}` onto the (renamed, unified) task_shadow queue, with a
+  per-entry fallback flag + log-once when full; the synthetic occupancy=0
+  runs on task_shadow under proper locking, and an `xTimerIsTimerActive`
+  guard drops timeouts made obsolete by a fresh occupancy=1 re-arm (a race
+  the old run-in-callback code also had, narrower).
+- **device_shadow**: debounce `xTimerCreate` failure fell through to
+  `xTimerReset(NULL)` and tripped `configASSERT` (:396); now guarded like
+  the occupancy timer, with `debounce_pending_flush` set as fallback so the
+  merged attrs flush via the sweep instead of sitting in `pending` forever.
