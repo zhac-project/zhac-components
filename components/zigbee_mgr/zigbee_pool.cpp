@@ -66,7 +66,7 @@ static constexpr uint16_t HASH_MASK  = HASH_SIZE - 1;
 static uint16_t s_ieee_idx[HASH_SIZE];
 static uint16_t s_nwk_idx[HASH_SIZE];
 
-bool s_hash_dirty = true;   // force first build
+static bool s_hash_dirty = true;   // force first build
 
 static void hash_rebuild() {
     memset(s_ieee_idx, 0xFF, sizeof(s_ieee_idx));   // fill with HASH_EMPTY
@@ -119,6 +119,35 @@ ZapDevice* pool_find_by_nwk(uint16_t nwk) {
     }
     unlock();
     return result;
+}
+
+// ── Locked visitor API ───────────────────────────────────────────────────────
+// Lock decision (see header): the advisory zigbee_pool_lock() and the
+// internal per-call lock are the SAME recursive s_pool_mutex, and
+// pool_remove()'s swap-with-last runs entirely under it — so holding it
+// here is sufficient to keep fn's pointer valid and the slot untouched
+// for fn's whole duration. The nested pool_find_* below re-takes the
+// recursive mutex; that is safe by construction.
+bool zigbee_pool_with_device(uint64_t ieee,
+                             void (*fn)(ZapDevice* dev, void* ctx),
+                             void* ctx) {
+    if (!fn) return false;
+    lock();
+    ZapDevice* dev = pool_find_by_ieee(ieee);
+    if (dev) fn(dev, ctx);
+    unlock();
+    return dev != nullptr;
+}
+
+bool zigbee_pool_with_device_by_nwk(uint16_t nwk,
+                                    void (*fn)(ZapDevice* dev, void* ctx),
+                                    void* ctx) {
+    if (!fn) return false;
+    lock();
+    ZapDevice* dev = pool_find_by_nwk(nwk);
+    if (dev) fn(dev, ctx);
+    unlock();
+    return dev != nullptr;
 }
 
 // ── Add / Remove ─────────────────────────────────────────────────────────────

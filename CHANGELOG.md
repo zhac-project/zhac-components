@@ -242,4 +242,40 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   supply-chain hazard. (F-09)
 - **metrics**: register `METRIC_MQTT_DROPPED_MSGS` in the shared
   metric registry; needed by F-07.
+
+### Fixed — High (P1 findings review, zigbee_pool)
+
+- **zigbee_mgr / zigbee_pool**: new locked-visitor API
+  `zigbee_pool_with_device(ieee, fn, ctx)` /
+  `zigbee_pool_with_device_by_nwk(nwk, fn, ctx)` — runs `fn` under the
+  pool's internal recursive mutex (the same one `zigbee_pool_lock()` and
+  `pool_remove()` take), so the `ZapDevice*` handed to `fn` cannot be
+  retargeted by a concurrent swap-with-last remove for `fn`'s duration.
+  `pool_find_by_ieee` / `pool_find_by_nwk` doc-comments now spell out the
+  hazard: the returned pointer is only valid under `zigbee_pool_lock()` —
+  snapshot under lock (house pattern, `zhc_shadow_bridge.cpp`) or use the
+  visitor. (F6/F35)
+- **zigbee_mgr**: `zcl_attr_task` no longer dereferences the
+  `pool_find_by_nwk` pointer across the liveness write and the
+  multi-second `zhac_adapter_try_decode` — find + liveness stamp +
+  522 B snapshot now happen under one lock and the decode runs on the
+  detached copy (`zigbee_mgr.cpp:742` pre-fix). `on_zdo_leave_ind`
+  soft-removes via the locked visitor and marks NVS-dirty from a
+  detached snapshot outside the mutex (`:801` pre-fix). (F6/F35)
+- **zigbee_mgr**: `do_interview` no longer writes through a stale pool
+  pointer across multi-second blocking ZNP I/O (the documented F6/F35
+  residual at `zigbee_interview.cpp:269`). The ZDO/Basic pipeline now
+  runs on a detached `work` copy snapshotted in the existing
+  find-or-create critical section; results are committed field-by-field
+  under a re-acquired lock at the end — preserving concurrent mid-interview
+  mutations (rejoin `nwk_addr` refresh, rename, leave/rejoin flags,
+  liveness) and yielding to the late-identity promotion path
+  (`zigbee_identity.cpp`) when it won the race, exactly as the old code
+  did. If the device was hard-removed mid-interview the commit is
+  skipped — results dropped, no resurrection. Rejoin fast-path
+  (`:499` pre-fix) and the per-attempt nwk re-read (`:537` pre-fix) in
+  `task_interview`, plus `zigbee_interview_trigger`, now hold the lock
+  across find + read/mutate. (F6/F35)
+- **zigbee_pool**: `s_hash_dirty` was missing `static` — internal hash
+  state leaked into the global namespace.
 </content>

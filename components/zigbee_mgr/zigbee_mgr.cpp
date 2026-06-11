@@ -739,8 +739,25 @@ static void zcl_attr_task(void*) {
         const uint8_t* zcl      = frame.data;
         uint8_t        data_len = frame.data_len;
 
-        ZapDevice* dev = pool_find_by_nwk(frame.src_nwk);
-        if (!dev) {
+        // F6/F35 (FINDINGS.md): find + liveness write + snapshot under ONE
+        // lock — pool_find_by_nwk's raw pointer must not outlive the
+        // critical section (swap-with-last pool_remove can retarget the
+        // slot). The multi-second try_decode below then runs on the
+        // detached 522 B stack copy (zcl_attr stack is 8 KiB; one copy
+        // per dequeued frame, never in an inner loop).
+        ZapDevice dev_snap;
+        uint64_t retry_ieee = 0;
+        bool dev_found = false;
+        zigbee_pool_lock();
+        if (ZapDevice* dev = pool_find_by_nwk(frame.src_nwk)) {
+            // Short non-blocking writes; the recursive mutex makes the
+            // nested lock inside zcl_refresh_liveness a no-op re-take.
+            retry_ieee = zcl_refresh_liveness(dev, frame);
+            dev_snap   = *dev;
+            dev_found  = true;
+        }
+        zigbee_pool_unlock();
+        if (!dev_found) {
             ESP_LOGW(TAG, "AF_INCOMING from unknown nwk=0x%04x cluster=0x%04x "
                           "(dropping; try re-interview)",
                      frame.src_nwk, frame.cluster_id);
@@ -749,10 +766,9 @@ static void zcl_attr_task(void*) {
         ESP_LOGD(TAG, "zcl_attr rx nwk=0x%04x cluster=0x%04x ep=%u grp=0x%04x "
                       "len=%u ieee=0x%016llx model='%s'",
                  frame.src_nwk, frame.cluster_id, frame.src_ep, frame.group_id,
-                 (unsigned)data_len, (unsigned long long)dev->ieee_addr,
-                 dev->model_id);
+                 (unsigned)data_len, (unsigned long long)dev_snap.ieee_addr,
+                 dev_snap.model_id);
 
-        const uint64_t retry_ieee = zcl_refresh_liveness(dev, frame);
         if (retry_ieee) {
             ESP_LOGI(TAG, "opportunistic re-interview ieee=0x%016llx "
                           "(FAILED → retrying now)",
@@ -770,14 +786,14 @@ static void zcl_attr_task(void*) {
         // Hand the (ieee, nwk) tuple to the adapter so fz handlers
         // that emit a response (Zosung IR, Tuya MCU sync time) reach
         // the device with a valid destination.
-        zhac_adapter_set_runtime_addr(dev->ieee_addr, dev->nwk_addr);
-        if (zhac_adapter_try_decode(dev->ieee_addr,
-                                     dev->model_id, dev->manufacturer_name,
+        zhac_adapter_set_runtime_addr(dev_snap.ieee_addr, dev_snap.nwk_addr);
+        if (zhac_adapter_try_decode(dev_snap.ieee_addr,
+                                     dev_snap.model_id, dev_snap.manufacturer_name,
                                      frame.group_id, frame.cluster_id,
                                      frame.src_ep, frame.lqi,
                                      zcl, data_len)) continue;
 
-        zcl_publish_raw_fallback(frame, dev, zcl, data_len);
+        zcl_publish_raw_fallback(frame, &dev_snap, zcl, data_len);
     }
 }
 
@@ -798,9 +814,18 @@ static void on_zdo_leave_ind(const MtFrame& f) {
     // friendly name, interview state, and shadow cache survive until
     // the device either rejoins (flag cleared by on_tc_dev_ind) or the
     // user hard-deletes via `zigbee_pool_remove`.
-    if (ZapDevice* d = pool_find_by_ieee(ieee)) {
-        zap_dev_mark_removed(d);
-        zap_store_mark_dirty(d, ZAP_PERSIST_LOW);
+    // F6/F35 (FINDINGS.md): mark + snapshot via the locked visitor so the
+    // pool pointer never escapes the mutex. The NVS dirty-mark then uses
+    // the detached copy OUTSIDE the lock — zap_store_mark_dirty's
+    // dirty-table-full fallback writes flash synchronously, which must
+    // not run under the pool mutex.
+    ZapDevice snap;
+    if (zigbee_pool_with_device(ieee,
+            [](ZapDevice* d, void* ctx) {
+                zap_dev_mark_removed(d);
+                *static_cast<ZapDevice*>(ctx) = *d;
+            }, &snap)) {
+        zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
     }
 
     Event ev{};
