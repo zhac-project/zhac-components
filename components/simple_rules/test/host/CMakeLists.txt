@@ -34,7 +34,7 @@ target_include_directories(simple_rules_event_loop_test PRIVATE
     ${COMPONENTS_DIR}/cron_parser/include
 )
 
-target_compile_options(simple_rules_event_loop_test PRIVATE -Wall -Wextra)
+target_compile_options(simple_rules_event_loop_test PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
 add_test(NAME simple_rules_event_loop COMMAND simple_rules_event_loop_test)

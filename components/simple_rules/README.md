@@ -168,6 +168,10 @@ if (!simple_rules_add("Hallway motion lights",
 }
 ```
 
+## Testing
+
+Host harness in `test/host/` (plain cmake + ctest, FreeRTOS/ESP shims) covers the rule-event TTL loop cut.
+
 ## Recent changes
 
 - **2026-04-25 snapshot-then-exec pattern.** Both `dispatch_event`

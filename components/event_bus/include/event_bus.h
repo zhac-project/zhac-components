@@ -61,13 +61,9 @@ static_assert(sizeof(MqttMsgEvent) == 96);
 // ── RULE_EVENT payload ────────────────────────────────────────────────────
 struct RuleEventPayload {
     char    name[95]; // custom event name
-    // TTL hop counter — 0 = external origin (Lua/REST/timer paths all
-    // zero-init the Event). Each rule EVENT-action republish copies
-    // hop+1 into the new payload; simple_rules refuses to republish once
-    // the chain reaches its hop limit, so a self-feeding rule
-    // (`ON Event#x DO event x ENDON`) can't wedge the drain loop. A
-    // dispatch-depth counter can't catch this: delivery is queue-based,
-    // so every hop is a fresh dispatch at depth 0.
+    // TTL hop counter: 0 = external origin; each rule republish copies
+    // hop+1 into the new payload; simple_rules cuts the chain at
+    // MAX_EVENT_HOPS (full rationale at simple_rules.cpp:25).
     uint8_t hop;
 };
 static_assert(sizeof(RuleEventPayload) == 96);

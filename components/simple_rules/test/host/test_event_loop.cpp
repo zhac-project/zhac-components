@@ -25,6 +25,11 @@
 // delivers N+1 rule firings (the hop-0 external event plus N republishes).
 static constexpr uint8_t kMaxEventHops = 8;
 
+// Queue receive budget handed to the shim before each scenario: comfortably
+// above the kMaxEventHops + 1 expected deliveries, so only genuinely
+// runaway (unfixed) code trips the runaway flag.
+static constexpr uint32_t kRunawayBudget = (kMaxEventHops + 1) * 4;
+
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                         \
     if (cond) { printf("PASS: %s\n", msg); }                          \
@@ -62,25 +67,24 @@ int main() {
     CHECK(simple_rules_add("loop", "ON Event#x DO event x ENDON", &loop_id),
           "install self-feeding rule");
 
-    stub_queue_set_receive_budget(64);   // unfixed code spins past this
+    stub_queue_set_receive_budget(kRunawayBudget);   // unfixed code spins past this
     publish_external_event("x");
     uint32_t fired = drain_until_quiet();
     printf("scenario 1: fired=%lu\n", (unsigned long)fired);
 
     CHECK(!stub_queue_runaway(),
           "drain returns (no self-feeding re-enqueue past the budget)");
-    CHECK(fired >= 2, "rule event chain actually chained (>= 2 firings)");
-    CHECK(fired <= (uint32_t)kMaxEventHops + 1,
-          "chain cut after MAX_EVENT_HOPS hops");
+    CHECK(fired == (uint32_t)kMaxEventHops + 1,
+          "chain cut after exactly MAX_EVENT_HOPS hops (N+1 firings)");
 
     // ── Scenario 2: each external event gets a fresh hop budget ──────────
-    stub_queue_set_receive_budget(64);
+    stub_queue_set_receive_budget(kRunawayBudget);
     publish_external_event("x");
     uint32_t fired2 = drain_until_quiet();
     printf("scenario 2: fired=%lu\n", (unsigned long)fired2);
 
     CHECK(!stub_queue_runaway(), "second external event also terminates");
-    CHECK(fired2 >= 2 && fired2 <= (uint32_t)kMaxEventHops + 1,
+    CHECK(fired2 == (uint32_t)kMaxEventHops + 1,
           "fresh external event re-fires with a fresh budget");
 
     // ── Scenario 3: legitimate short chains keep working ──────────────────
@@ -90,7 +94,7 @@ int main() {
     CHECK(simple_rules_add("chain_b", "ON Event#b DO log done ENDON", &b_id),
           "install chain rule b->log");
 
-    stub_queue_set_receive_budget(64);
+    stub_queue_set_receive_budget(kRunawayBudget);
     publish_external_event("a");
     uint32_t fired3 = drain_until_quiet();
     printf("scenario 3: fired=%lu\n", (unsigned long)fired3);
