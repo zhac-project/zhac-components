@@ -7,6 +7,70 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — High/Medium (P2 findings review, T19 mqtt_gw / tg_gw lifecycle & injection)
+
+- **mqtt_gw (S3)** (HIGH, FINDINGS §7, `mqtt_gw_s3.cpp:53`): the `s_client`
+  stop/destroy/recreate ran UNSYNCHRONIZED from REST handlers, the esp_timer
+  re-arm/deferred-start callbacks, the STA-up handler, and the pub-worker's
+  deferred-disable while the worker could be inside `esp_mqtt_client_publish`
+  → use-after-free of the client handle. A new `s_client_mtx` (created in
+  `mqtt_gw_init` at single-threaded boot) now fences EVERY
+  `esp_mqtt_client_*` lifecycle call (init/start/stop/destroy/subscribe/
+  unsubscribe) AND the worker's publish; the worker snapshots the handle
+  under the lock and publishes under it. Publish-under-lock chosen over a
+  snapshot-revalidate handshake: the worker is the sole publisher (already
+  serialized by the queue), so the only task that can stall behind a blocking
+  QoS>0 publish is a rare concurrent config write — acceptable for a gateway
+  and far simpler/safer than reopening a destroy-vs-use window. The
+  esp-mqtt **event-handler** subscribe/publish (CONNECTED) stay unlocked by
+  design (they run on the mqtt task, which cannot destroy its own client and
+  must not block on a mutex a lifecycle op could hold).
+- **mqtt_gw (S3)** (MED, `:172`): `MQTT_EVENT_DATA` ignored fragmentation —
+  payloads > the 4608 B buffer were forwarded to `rx_cb` truncated to the
+  first chunk with no indication. Now drops any event where
+  `data_len != total_data_len` and logs a one-shot warning; continuation
+  chunks (`topic_len==0`) remain dropped by the existing guard. Reassembly
+  is intentionally not added (the inbound command contract is sub-buffer).
+- **mqtt_gw (S3)** (MED, `:419`): a rule/Lua publish topic was not sanitized
+  for MQTT wildcards (`+`/`#`) or control chars — one wildcard PUBLISH makes a
+  spec-compliant broker drop the connection (reconnect churn). New
+  `mqtt_topic_ok()` rejects `+`, `#`, NUL/control/DEL bytes, and overlong
+  names; the prefix-format overflow path (was silently publishing to the
+  UNPREFIXED topic) now DROPS instead. Host-proven.
+- **mqtt_gw (S3)** (MED, `:112`, `:306`, `:335`): the broker URL (sole carrier
+  of `mqtt://user:pass@host` creds) was logged verbatim at INFO on every
+  (re)start. New `redact_userinfo()` prints `scheme://host:port` only and is
+  applied at all three log sites. Host-proven.
+- **mqtt_gw (S3)** (LOW, `:407`): re-subscribe overwrote the single stored
+  filter without unsubscribing the previous one (old subscription kept
+  delivering until reconnect). Now unsubscribes the prior live filter before
+  replacing it.
+- **mqtt_gw (P4)** (MED, `mqtt_gw_p4.cpp:40`): the publish-path serialization
+  mutex was lazily created (`if(!s_mutex)…`) in the hot path — two first
+  callers each created one (one leaked, serialization broken). Created once in
+  `mqtt_gw_init` at single-threaded boot.
+- **tg_gw (S3)** (HIGH, FINDINGS §7, `tg_gw_s3.cpp:196`): `chat_id` and
+  `parse_mode` (HAP/NVS-sourced, reachable from Lua via `tg_gw_setchat`/`send`)
+  were interpolated UNESCAPED into the Telegram API JSON body — a `"` injected
+  arbitrary request fields. Both are now run through `json_escape`, and
+  `parse_mode` is whitelisted to {`Markdown`,`MarkdownV2`,`HTML`} (any other
+  value is rejected and the send dropped). Host-proven.
+- **tg_gw (S3/P4)** (MED, `tg_gw_s3.cpp:29` / `tg_gw_p4.cpp:29`): token-length
+  cap drift — S3 rejected >80, P4 accepted up to 96, so an 81–96-char token was
+  forwarded by P4 then silently dropped on S3. A single `TG_TOKEN_MAX` (80,
+  comfortably over the ~46-char real token and within the 96-byte HAP field)
+  now lives in `tg_gw.h` and is used by both cores.
+- **tg_gw (S3)** (LOW, `tg_gw_s3.cpp:127`): `json_escape` truncated byte-wise
+  and could split a UTF-8 multibyte sequence → invalid JSON the Telegram API
+  rejects (HTTP 400). On truncation it now backs off to the previous UTF-8
+  code-point boundary. Host-proven.
+- **tg_gw (P4)** (MED, `tg_gw_p4.cpp:95`/`:76`): the static ~3.2 KB pack buffer
+  (and the ~3.2 KB `HapTgSend`) were used WITHOUT a mutex — concurrent
+  `tg_gw_send` from two tasks (rules + Lua) could corrupt the frame
+  mid-pack/send, and a stack-local `HapTgSend{}` per call was a 3.2 KB stack
+  hit. Both are now `static`, serialized by an init-created `s_send_mutex`
+  (same pattern as `mqtt_gw_p4`).
+
 ### Fixed — High/Medium (P2 findings review, T18 simple_rules / cron integrity)
 
 - **simple_rules / rule_store** (HIGH, FINDINGS §7, `simple_rules.cpp:84`):

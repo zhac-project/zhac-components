@@ -12,7 +12,15 @@
 
 static const char* TAG = "mqtt_gw_p4";
 
+// F6-T19: the publish-path serialization mutex. Created ONCE in
+// mqtt_gw_init (single-threaded boot). The previous lazy
+// `if(!s_mutex) s_mutex = xSemaphoreCreateMutex()` inside the publish
+// hot path was itself a race: two first-callers each create a mutex
+// (one leaked, serialization broken). Boot-time creation removes the race.
+static SemaphoreHandle_t s_pub_mutex = nullptr;
+
 void mqtt_gw_init() {
+    if (!s_pub_mutex) s_pub_mutex = xSemaphoreCreateMutex();
     ESP_LOGI(TAG, "mqtt_gw_p4 init — publishes routed via HAP to S3");
 }
 
@@ -33,12 +41,11 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     // internal RAM on P4 (no PSRAM in the hot path) until newlib
     // failed to allocate a recursive mutex inside fread → abort.
     // One-shot alloc, mutex-serialised, no churn.
-    static SemaphoreHandle_t s_mutex = nullptr;
+    // F6-T19: s_pub_mutex is now created in mqtt_gw_init (no lazy race).
     static HapMqttPublish    s_msg{};
     constexpr size_t         kBufSz = 700;
     static uint8_t           s_buf[kBufSz];
-    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    if (!s_pub_mutex || xSemaphoreTake(s_pub_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "mqtt_publish: mutex contention — drop topic=%s", topic);
         return;
     }
@@ -55,7 +62,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
 
     uint16_t len = 0;
     if (!hap_json_encode_mqtt_publish(s_buf, kBufSz, &len, s_msg)) {
-        xSemaphoreGive(s_mutex);
+        xSemaphoreGive(s_pub_mutex);
         ESP_LOGE(TAG, "mqtt_publish encode failed topic=%s", topic);
         return;
     }
@@ -67,7 +74,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     f.payload     = s_buf;
     f.payload_len = len;
     hap_session_send(f);
-    xSemaphoreGive(s_mutex);
+    xSemaphoreGive(s_pub_mutex);
     ESP_LOGD(TAG, "MQTT_PUBLISH forwarded topic=%s qos=%d retain=%d", topic, qos, retain);
 }
 

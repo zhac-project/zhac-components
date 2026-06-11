@@ -23,11 +23,11 @@ static const char* NVS_NS    = "zhac";
 static const char* NVS_TOKEN = "tg_token";
 static const char* NVS_CHAT  = "tg_chat";
 
-// F45 (FINDINGS.md): documented max Telegram bot-token length. Real tokens are
-// `<bot_id>:<35-char-secret>` ≈ 46 chars; 80 gives generous headroom. Reject
-// over-long tokens on SET so they can't silently truncate in the send buffers
-// (a truncated token breaks delivery, not security — HTTPS is verified).
-static constexpr uint16_t TG_TOKEN_MAX = 80;
+// F8-T19: TG_TOKEN_MAX now lives in tg_gw.h, shared with the P4 core so
+// the accept/reject cap can't drift between the two sides. Reject
+// over-long tokens on SET so they can't silently truncate in the send
+// buffers (a truncated token breaks delivery, not security — HTTPS is
+// verified).
 
 static SemaphoreHandle_t s_cfg_mutex = nullptr;
 
@@ -108,9 +108,17 @@ extern "C" void tg_gw_handle_setchat(const uint8_t* buf, uint16_t len) {
 
 // JSON-escape into out, capped. Returns the bytes written (excl. trailing NUL).
 // Escapes ", \\, control bytes, \\n, \\r, \\t. Truncates cleanly on overflow.
+//
+// F9-T19: UTF-8 boundary safety. Multibyte UTF-8 sequences are copied
+// byte-by-byte (each lead/continuation byte ≥ 0x80 goes through the
+// default branch as one byte). A naive truncation can stop mid-sequence,
+// leaving a dangling lead byte or partial continuation → the Telegram
+// API rejects the body as invalid UTF-8 (HTTP 400). On break we back
+// off wi to the last complete UTF-8 code-point boundary.
 static size_t json_escape(const char* in, char* out, size_t cap) {
     if (!in || !out || cap == 0) return 0;
     size_t wi = 0;
+    bool truncated = false;
     for (size_t i = 0; in[i]; i++) {
         unsigned char c = (unsigned char)in[i];
         const char* esc = nullptr; char buf2[3];
@@ -125,8 +133,35 @@ static size_t json_escape(const char* in, char* out, size_t cap) {
                 buf2[0] = (char)c; buf2[1] = '\0'; esc = buf2; break;
         }
         size_t n = strlen(esc);
-        if (wi + n + 1 > cap) break;
+        if (wi + n + 1 > cap) { truncated = true; break; }
         memcpy(out + wi, esc, n); wi += n;
+    }
+    // F9-T19: if we stopped early, drop any trailing incomplete UTF-8
+    // sequence. A UTF-8 code point is: lead byte 0xC0..0xFF followed by
+    // the right number of 0x80..0xBF continuation bytes. Walk back over
+    // continuation bytes (0x80..0xBF) to the lead byte and check the
+    // sequence is complete; if not, discard it.
+    if (truncated && wi > 0) {
+        size_t k = wi;
+        // step back over continuation bytes
+        size_t cont = 0;
+        while (k > 0 && ((unsigned char)out[k - 1] & 0xC0) == 0x80) {
+            k--; cont++;
+        }
+        if (k > 0) {
+            unsigned char lead = (unsigned char)out[k - 1];
+            size_t need;            // expected continuation-byte count
+            if      ((lead & 0x80) == 0x00) need = 0;   // ASCII
+            else if ((lead & 0xE0) == 0xC0) need = 1;
+            else if ((lead & 0xF0) == 0xE0) need = 2;
+            else if ((lead & 0xF8) == 0xF0) need = 3;
+            else                            need = (size_t)-1;  // invalid lead
+            // If the lead expects more continuation bytes than we have,
+            // the sequence is incomplete → drop lead + its conts.
+            if (need == (size_t)-1 || cont < need) {
+                wi = k - 1;
+            }
+        }
     }
     out[wi] = '\0';
     return wi;
@@ -187,21 +222,50 @@ static void tg_perform_send(const HapTgSend& m) {
         return;
     }
 
+    // F7-T19: parse_mode is HAP/Lua-sourced. Whitelist it against the
+    // exact set the Telegram Bot API accepts; reject anything else
+    // outright (an unknown parse_mode is a misconfig and a would-be
+    // injection vector). Empty (parse_mode_len==0) means "omit the field".
+    bool want_parse_mode = (m.parse_mode_len != 0);
+    if (want_parse_mode) {
+        const char* pm = m.parse_mode;
+        if (strcmp(pm, "Markdown")   != 0 &&
+            strcmp(pm, "MarkdownV2") != 0 &&
+            strcmp(pm, "HTML")       != 0) {
+            ESP_LOGW(TAG, "TG_SEND: rejecting unknown parse_mode — drop");
+            return;
+        }
+    }
+
     // Build body: {"chat_id":"...","text":"...","parse_mode":"..."}
     // PSRAM: ~6.7 KB of send staging, touched only when a Telegram message
     // goes out (worker task, never ISR) — cold path.
+    //
+    // F7-T19 (SECURITY): chat and parse_mode are HAP/NVS-sourced and
+    // reachable from Lua (tg_gw_setchat / tg_gw_send). They were
+    // interpolated UNESCAPED into the JSON body — a `"` in chat let a
+    // malicious local script inject arbitrary fields into the Telegram
+    // API request (e.g. close the chat_id string and add its own keys).
+    // Escape BOTH through json_escape (same helper as text). parse_mode
+    // is additionally whitelisted above; chat is free-form (numeric id
+    // or @channelusername) so escaping is its only defence — for a valid
+    // chat id escaping is a no-op.
     EXT_RAM_BSS_ATTR static char body[3500];
     EXT_RAM_BSS_ATTR static char text_esc[3200];
+    char chat_esc[80];
+    char pm_esc[40];
     json_escape(m.text, text_esc, sizeof(text_esc));
+    json_escape(chat, chat_esc, sizeof(chat_esc));
     int bn = 0;
-    if (m.parse_mode_len) {
+    if (want_parse_mode) {
+        json_escape(m.parse_mode, pm_esc, sizeof(pm_esc));
         bn = snprintf(body, sizeof(body),
                       "{\"chat_id\":\"%s\",\"text\":\"%s\",\"parse_mode\":\"%s\"}",
-                      chat, text_esc, m.parse_mode);
+                      chat_esc, text_esc, pm_esc);
     } else {
         bn = snprintf(body, sizeof(body),
                       "{\"chat_id\":\"%s\",\"text\":\"%s\"}",
-                      chat, text_esc);
+                      chat_esc, text_esc);
     }
     if (bn <= 0 || (size_t)bn >= sizeof(body)) {
         ESP_LOGE(TAG, "TG_SEND: body overflow (text too long after escape?)");
