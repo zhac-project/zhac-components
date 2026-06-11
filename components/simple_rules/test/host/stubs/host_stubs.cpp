@@ -136,12 +136,51 @@ BaseType_t xTaskCreate(TaskFunction_t fn, const char* name, uint32_t stack_depth
 }
 void vTaskDelay(TickType_t ticks) { (void)ticks; }
 
-// ── rule_store: empty store, writes are dropped ──────────────────────────
+// ── rule_store: in-memory store model (P2-T18) ───────────────────────────
+//
+// The default behaviour is an empty store (matching the original stub). The
+// id/capacity tests seed a fake persisted store via stub_rule_store_seed_id()
+// so they can prove next_rule_id() derives from the WHOLE store, not just the
+// simple_rules 64-entry cache.
+static uint16_t s_store_ids[512];
+static uint16_t s_store_n = 0;
 
-bool     rule_store_load(uint16_t rule_id, RuleSlot* out) { (void)rule_id; (void)out; return false; }
+void stub_rule_store_reset(void) { s_store_n = 0; }
+void stub_rule_store_seed_id(uint16_t id) {
+    if (s_store_n < (uint16_t)(sizeof(s_store_ids) / sizeof(s_store_ids[0])))
+        s_store_ids[s_store_n++] = id;
+}
+uint16_t stub_rule_store_count(void) { return s_store_n; }
+
+bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
+    for (uint16_t i = 0; i < s_store_n; i++) {
+        if (s_store_ids[i] == rule_id) {
+            if (out) { memset(out, 0, sizeof(*out)); out->rule_id = rule_id; }
+            return true;
+        }
+    }
+    return false;
+}
 uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) { (void)out; (void)max_count; return 0; }
-void     rule_store_mark_dirty(const RuleSlot* slot) { (void)slot; }
-void     rule_store_mark_delete(uint16_t rule_id) { (void)rule_id; }
+void     rule_store_mark_dirty(const RuleSlot* slot) {
+    // Record the create so a subsequent next_rule_id() sees it persisted,
+    // mirroring the real writeback overlay being folded into rule_store_max_id.
+    if (slot && !rule_store_load(slot->rule_id, nullptr)) stub_rule_store_seed_id(slot->rule_id);
+}
+void     rule_store_mark_delete(uint16_t rule_id) {
+    for (uint16_t i = 0; i < s_store_n; i++) {
+        if (s_store_ids[i] == rule_id) {
+            s_store_ids[i] = s_store_ids[--s_store_n];
+            return;
+        }
+    }
+}
+uint16_t rule_store_max_id(void) {
+    uint16_t m = 0;
+    for (uint16_t i = 0; i < s_store_n; i++) if (s_store_ids[i] > m) m = s_store_ids[i];
+    return m;
+}
+uint16_t rule_store_count(void) { return s_store_n; }
 
 // ── zigbee_pool: empty pool ──────────────────────────────────────────────
 
@@ -156,6 +195,11 @@ uint16_t   pool_count() { return 0; }
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {
     (void)ieee; (void)out; (void)max_count;
     return 0;
+}
+
+bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
+    (void)ieee; (void)key; (void)out;
+    return false;
 }
 
 // ── zhc_adapter / mqtt_gw: sinks ─────────────────────────────────────────

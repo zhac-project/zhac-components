@@ -7,6 +7,55 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — High/Medium (P2 findings review, T18 simple_rules / cron integrity)
+
+- **simple_rules / rule_store** (HIGH, FINDINGS §7, `simple_rules.cpp:84`):
+  `next_rule_id()` scanned only the 64-entry in-memory cache for the max id,
+  but `rule_store` persists up to 256 NVS slots — a persisted-but-uncached
+  rule's id was reissued and the deferred `rule_store_mark_dirty` silently
+  overwrote the original (permanent data loss). New `rule_store_max_id()`
+  walks every `r_%04X` NVS key + the writeback overlay (no blob loads);
+  `next_rule_id` derives `max(store, cache) + 1`, and the wraparound free-id
+  scan probes the store too. Host-proven (65 persisted, empty cache → next id
+  = 66, never 1).
+- **dsl_parser** (HIGH, FINDINGS §7, `dsl_parser.cpp:206`): an unclamped
+  `strtod`→`int32_t` cast was UB for out-of-range literals (e.g. a
+  REST/cloud-supplied `#temp>1e20`). Now checks `errno==ERANGE` and the
+  rounded magnitude against the int32 bounds before the cast; `1e20`,
+  `-1e20`, `99999999999`, and garbage all return `ERR_BAD_TRIGGER`, while
+  `2147483647` (INT32_MAX) still round-trips.
+- **simple_rules** (MED, FINDINGS §7, `:580`): a full active-rule cache used
+  to persist to NVS yet return `true`, so the rule was accepted but never
+  evaluated (silent no-op). `add` now returns `false` and sets
+  `dsl_last_error()` = "rule cache full (max 64 active rules)"; the HAP
+  `RULE_CREATE` handler already relays `dsl_last_error()` to the SPA/cloud, so
+  no net-core change was needed.
+- **simple_rules** (MED, FINDINGS §7, `:101`): `reload_locked` loaded only the
+  first 64 NVS slots and silently dropped the rest. The 64-active cap is kept
+  intentionally (raising to 256 = +~130 KB P4 DRAM); a new `rule_store_count()`
+  drives an `ESP_LOGW` with the count of persisted-but-inert rules, and the
+  64-active limit is documented in `simple_rules/README.md`.
+- **simple_rules / dsl_parser** (MED, FINDINGS §7, `:574` + `dsl_parser.cpp:336`):
+  a DSL ≥ 500 B parsed in full for the live rule but persisted truncated to
+  499 (`slot.src`), so the rule mutated/failed-parse after reboot. `add`/`update`
+  now reject `dsl_len >= sizeof(slot.src)` with "rule DSL too long (max 499
+  bytes)"; an action-section overrun returns the new `ERR_ACTION_TOO_LONG`
+  instead of a silent clamp. No truncate-persist path remains.
+- **cron_parser** (MED, FINDINGS §7, `cron_parser.cpp:95`/`:54`): an expression
+  or per-field buffer ≥ 128 chars was silently `strncpy`-truncated and could
+  still parse into a WRONG schedule. Both now reject (`strlen >= sizeof(buf)`).
+- **cron_parser** (MED, FINDINGS §7, `cron_parser.cpp:260`): `cron_next` did
+  `t += 60 - tm_sec`, which is `+0` when `tm_sec == 60` (leap second; reachable
+  on glibc host tests) → infinite loop. `tm_sec` is now clamped to 59 before
+  the jump, matching `cron_matches`. New host suite under
+  `cron_parser/test/host/`.
+- **device_shadow / simple_rules** (MED, FINDINGS §7, `simple_rules.cpp:297`):
+  the `ZIGBEE_TOGGLE` action put a `ShadowAttr[32]` (~2.7 KB) + a 522 B device
+  snapshot on the shared event-drain task stack just to read one attr by key.
+  New `device_shadow_get_attr(ieee, key, out)` (LEAF s_mutex only — no NVS,
+  publish, or nested lock, per T10) returns the single slot; the toggle stack
+  arrays are dropped.
+
 ### Fixed — Medium (P2 findings review, T14 HAP correlation edges)
 
 - **hap_session**: enlarged the receive-side dedup `SEEN_RING` 16→64 entries

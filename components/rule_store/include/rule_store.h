@@ -21,8 +21,23 @@ bool rule_store_delete(uint16_t rule_id);
 // Load all saved RuleSlots into out[0..max_count-1]. Returns count loaded.
 uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count);
 
+// Number of persisted rule slots in NVS (cheap key-count; does not merge
+// the writeback overlay or validate CRCs). Lets a fixed-size-cache reader
+// detect that more rules are stored than it can hold active. Returns 0 on
+// an uninitialised store.
+uint16_t rule_store_count();
+
 // Update only the enabled flag of an existing rule. Returns false if not found.
 bool rule_store_set_enabled(uint16_t rule_id, bool enabled);
+
+// Highest rule_id present across the ENTIRE persisted store — all NVS
+// slots (up to ZAP_MAX_RULES) plus any uncommitted writeback edits — not
+// just the subset another layer happens to have cached. Returns 0 when the
+// store is empty. Callers allocating a fresh id MUST derive it from this
+// (max_id + 1), never from a partial in-memory view, or a persisted-but-
+// uncached rule's id can be reissued and silently overwritten. Cheap: ids
+// are parsed straight from the NVS key (`r_%04X`), no blob loads.
+uint16_t rule_store_max_id();
 
 // ── Writeback cache (PSRAM-backed, deferred NVS commit) ──────────────────
 //

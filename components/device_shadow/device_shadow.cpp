@@ -845,6 +845,29 @@ uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_coun
     return n;
 }
 
+// P2-T18 def 7 (FINDINGS §7): single-attr read by key. LEAF lock only (T10):
+// take s_mutex, find_entry, linear key scan, copy out, release. No NVS, no
+// publish, no nested lock — so it is safe on the event-drain task and lets
+// the ZIGBEE_TOGGLE action avoid a ~2.7 KB ShadowAttr[32] + 522 B device
+// snapshot on that shared stack.
+bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
+    if (!key || !out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_entry(ieee);
+    bool found = false;
+    if (e) {
+        for (uint8_t i = 0; i < e->attr_count; i++) {
+            if (strncmp(e->attrs[i].key, key, ATTR_KEY_MAX) == 0) {
+                *out = e->attrs[i];
+                found = true;
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return found;
+}
+
 bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
     CfgPersist cp;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);

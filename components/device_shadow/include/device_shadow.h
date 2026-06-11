@@ -111,6 +111,16 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
 uint8_t device_shadow_get_attrs(uint64_t ieee,
                                 ShadowAttr* out, uint8_t max_count);
 
+// Read ONE attribute by key. Returns true and copies the matching slot into
+// *out when the device exists and holds an attr whose key equals `key`;
+// false otherwise. Lets callers avoid pulling the whole 32-slot array (~2.7
+// KB) onto the stack just to read a single attr.
+//
+// Lock contract (T10): takes ONLY the leaf s_mutex — no NVS, no
+// event_bus_publish, no other lock acquired inside. Safe to call from the
+// event-drain task. `out` must be non-null.
+bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out);
+
 // Per-device config CRUD.
 bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg);
 bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out);

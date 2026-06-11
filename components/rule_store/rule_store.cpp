@@ -266,6 +266,75 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     return count;
 }
 
+namespace {
+struct MaxIdCtx { uint16_t max_id; };
+// Overlay visitor: a pending WRITE (create/update not yet flushed) can hold
+// an id higher than anything on flash; count it. TOMBSTONEs are ignored —
+// the NVS key still exists until the flush lands, so the iterator below
+// already accounts for the id; double-counting a deletion can't lower the
+// max, and ignoring it can't reissue an id whose NVS row is still live.
+void max_id_cb(uint16_t rule_id, bool tombstoned, const RuleSlot* slot, void* vctx) {
+    (void)slot;
+    if (tombstoned) return;
+    auto* c = static_cast<MaxIdCtx*>(vctx);
+    if (rule_id > c->max_id) c->max_id = rule_id;
+}
+}  // namespace
+
+// F (P2-T18 def 1): highest rule_id across the ENTIRE persisted store
+// (all NVS slots, up to ZAP_MAX_RULES) plus any uncommitted writeback
+// edits — NOT just the subset cached in simple_rules' 64-entry array.
+// simple_rules derives next_rule_id from this so a persisted-but-uncached
+// rule's id can never be reissued (which would silently overwrite it).
+// Cheap: parses the id straight out of the `r_%04X` key, no blob load.
+uint16_t rule_store_max_id() {
+    uint16_t max_id = 0;
+    if (s_nvs) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        nvs_iterator_t it = nullptr;
+        esp_err_t err = nvs_entry_find("nvs", NVS_NS, NVS_TYPE_BLOB, &it);
+        while (err == ESP_OK) {
+            nvs_entry_info_t info;
+            nvs_entry_info(it, &info);
+            if (info.key[0] == 'r' && info.key[1] == '_') {
+                unsigned id = 0;
+                if (sscanf(info.key + 2, "%4X", &id) == 1 && id <= 0xFFFF &&
+                    (uint16_t)id > max_id) {
+                    max_id = (uint16_t)id;
+                }
+            }
+            err = nvs_entry_next(&it);
+        }
+        if (it) nvs_release_iterator(it);
+        xSemaphoreGive(s_mutex);
+    }
+    // Fold in the writeback overlay (uncommitted creates/updates).
+    MaxIdCtx mctx{ max_id };
+    rule_store_foreach_dirty(max_id_cb, &mctx);
+    return mctx.max_id;
+}
+
+// F (P2-T18 def 3): number of persisted rule slots in NVS (corrupt/stale
+// keys still count — they're whatever `r_*` blobs exist). Cheap key-walk,
+// no blob loads, no overlay merge (callers use it only to detect that the
+// store holds more rules than a fixed-size cache can hold).
+uint16_t rule_store_count() {
+    if (!s_nvs) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nvs_iterator_t it = nullptr;
+    uint16_t n = 0;
+    esp_err_t err = nvs_entry_find("nvs", NVS_NS, NVS_TYPE_BLOB, &it);
+    while (err == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        if (info.key[0] == 'r' && info.key[1] == '_') n++;
+        err = nvs_entry_next(&it);
+    }
+    if (it) nvs_release_iterator(it);
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 bool rule_store_set_enabled(uint16_t rule_id, bool enabled) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     RuleSlot slot{};
