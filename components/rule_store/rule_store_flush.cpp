@@ -9,7 +9,10 @@
 //
 // Read consistency: `rule_store_load` + `rule_store_load_all` consult
 // the dirty table first — callers never observe stale NVS state even
-// within the flush window.
+// within the flush window. That includes the NVS-commit window itself:
+// a slot keeps its state+payload while its write is in flight
+// (`flushing`) and goes CLEAN only after the commit lands, so overlay
+// readers can't fall through to stale NVS mid-write.
 
 #include "rule_store.h"
 #include "esp_log.h"
@@ -26,12 +29,36 @@ static const char* TAG = "rule_flush";
 static constexpr uint32_t FLUSH_TICK_MS   = 1000;
 static constexpr uint32_t MAX_AGE_MS      = 5 * 1000;
 static constexpr size_t   DIRTY_CAP       = 64;  // concurrent dirty rules
+static constexpr uint32_t FLUSH_WAIT_POLL_MS = 10;    // barrier poll period
+static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;  // barrier upper bound
 
 enum DirtyState : uint8_t { CLEAN = 0, WRITE = 1, TOMBSTONE = 2 };
 
+// Slot lifecycle (every transition happens under s_mtx):
+//
+//   CLEAN ──mark──▶ WRITE/TOMBSTONE ──flusher──▶ +flushing ──settle──▶ CLEAN
+//
+//   flushing + mark_dirty/mark_delete → op+payload replaced in place,
+//       remarked=true; settle leaves the slot pending so the newer data
+//       flushes next cycle (the flusher's older snapshot is discarded —
+//       newer wins, no duplicate entry for the same rule_id possible).
+//   flushing + NVS failure → settle leaves state+payload untouched and
+//       retries next tick in place — no re-queue into a free slot, so a
+//       stale snapshot can never race a newer mark into a second slot.
+//
+// `state` keeps carrying the op while the write is in flight, so the
+// overlay readers (rule_store_load_overlay / rule_store_foreach_dirty)
+// keep serving the pending edit until it is truly durable. Invariant:
+// state == CLEAN implies !flushing — the free-list (find_free_locked)
+// can never hand out a slot whose write is still in flight. Only the
+// flusher that set `flushing` settles the slot; concurrent flushers
+// back off, so ownership is unambiguous.
+
 struct DirtySlot {
     uint16_t    rule_id;
-    uint8_t     state;       // DirtyState
+    uint8_t     state;       // DirtyState — pending op; CLEAN = slot free
+    bool        flushing;    // NVS op for this slot is in flight
+    bool        remarked;    // newer mark landed while flushing
     uint32_t    marked_ms;
     RuleSlot    slot;        // full payload for WRITE; zeroed for TOMBSTONE
 };
@@ -58,51 +85,60 @@ static int find_free_locked() {
     return -1;
 }
 
-// Flush one slot outside s_mtx. Returns true when slot is handled.
+// Flush one slot outside s_mtx. Returns true when the pending op is
+// durable (or nothing was pending / another flusher owns the slot);
+// false when our NVS write failed and the slot stays pending for retry.
+//
+// The slot keeps its state+payload while the NVS op is in flight
+// (`flushing` set), so overlay readers still see the edit and
+// rule_store_flush_now() can wait on it; it goes CLEAN only after a
+// successful, un-remarked commit.
 static bool flush_slot(size_t idx) {
     DirtySlot snap;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    if (s_dirty[idx].state == CLEAN) {
+    if (s_dirty[idx].state == CLEAN || s_dirty[idx].flushing) {
         xSemaphoreGive(s_mtx);
-        return true;
+        return true;   // nothing pending, or in flight on another task
     }
-    snap = s_dirty[idx];
-    s_dirty[idx].state = CLEAN;
+    snap = s_dirty[idx];               // op+payload snapshot under lock
+    s_dirty[idx].flushing = true;
+    s_dirty[idx].remarked = false;
     xSemaphoreGive(s_mtx);
 
     bool ok = true;
     if (snap.state == WRITE) {
         ok = rule_store_save(&snap.slot);
+        if (!ok)
+            ESP_LOGE(TAG, "flush failed rule_id=0x%04x — retrying next tick",
+                     snap.rule_id);
     } else if (snap.state == TOMBSTONE) {
         // rule_store_delete returns false if nothing was stored — that's
         // fine for a tombstone created before any commit landed. Don't
-        // re-queue in that case.
+        // retry in that case.
         (void)rule_store_delete(snap.rule_id);
         ok = true;
     }
-    if (!ok) {
-        // Only WRITE reaches here — TOMBSTONE always sets ok=true above.
-        ESP_LOGE(TAG, "flush failed rule_id=0x%04x state=%u — re-queueing",
-                 snap.rule_id, snap.state);
-        xSemaphoreTake(s_mtx, portMAX_DELAY);
-        int slot = find_free_locked();
-        if (slot >= 0) s_dirty[slot] = snap;
-        xSemaphoreGive(s_mtx);
-        if (slot < 0) {
-            // F37 (FINDINGS.md): dirty table full — we can't defer the retry,
-            // so persist synchronously here instead of silently dropping the
-            // edit. May fail again (same NVS error), but then it's logged loud,
-            // not lost in silence.
-            ESP_LOGW(TAG, "dirty table full on re-queue — synchronous save rule_id=0x%04x",
-                     snap.rule_id);
-            if (!rule_store_save(&snap.slot))
-                ESP_LOGE(TAG, "synchronous save ALSO failed rule_id=0x%04x — edit lost",
-                         snap.rule_id);
-            return true;   // slot consumed; nothing left re-queued
-        }
-        return false;
+
+    // Settle. Only we (the flushing owner) may clean the slot; marks that
+    // landed during the write replaced op+payload in place and set
+    // `remarked` — they could not have moved to another slot because this
+    // one stayed visible to find_slot_locked the whole time.
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_dirty[idx].flushing = false;
+    if (s_dirty[idx].remarked) {
+        // Newer mark_dirty/mark_delete during the NVS op: leave the slot
+        // pending — newer wins, our snapshot is obsolete. (Replaces the
+        // old failed-flush re-queue, which could insert a stale snapshot
+        // next to a newer mark and persist the stale copy last.)
+        s_dirty[idx].remarked = false;
+    } else if (ok) {
+        s_dirty[idx].state = CLEAN;    // durable — readers may use NVS now
     }
-    return true;
+    // (!ok && !remarked): slot still holds the same op+payload → retried
+    // next tick in place. No free-slot hunt, nothing to drop on a full
+    // table — supersedes the F37 re-queue fallback.
+    xSemaphoreGive(s_mtx);
+    return ok;
 }
 
 void rule_store_mark_dirty(const RuleSlot* slot) {
@@ -125,6 +161,9 @@ void rule_store_mark_dirty(const RuleSlot* slot) {
     s_dirty[idx].state     = WRITE;
     s_dirty[idx].marked_ms = now_ms();
     s_dirty[idx].slot      = *slot;
+    // Mark landed while this slot's previous op is mid-NVS-write: tell the
+    // flusher to leave the slot pending so this newer payload flushes too.
+    s_dirty[idx].remarked  = s_dirty[idx].flushing;
     xSemaphoreGive(s_mtx);
 }
 
@@ -147,12 +186,49 @@ void rule_store_mark_delete(uint16_t rule_id) {
     s_dirty[idx].state     = TOMBSTONE;
     s_dirty[idx].marked_ms = now_ms();
     memset(&s_dirty[idx].slot, 0, sizeof(RuleSlot));
+    // See rule_store_mark_dirty: keep the slot pending if a write for its
+    // previous op is in flight — the tombstone must still be applied.
+    s_dirty[idx].remarked  = s_dirty[idx].flushing;
     xSemaphoreGive(s_mtx);
+}
+
+// Durability barrier: wait (bounded) until no slot has an NVS op in
+// flight. Returns false on timeout. Must not be called with s_mtx held.
+static bool wait_no_flushing() {
+    for (uint32_t waited = 0;; waited += FLUSH_WAIT_POLL_MS) {
+        bool busy = false;
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        for (size_t i = 0; i < DIRTY_CAP; i++) {
+            if (s_dirty[i].flushing) { busy = true; break; }
+        }
+        xSemaphoreGive(s_mtx);
+        if (!busy) return true;
+        if (waited >= FLUSH_WAIT_MAX_MS) return false;
+        vTaskDelay(pdMS_TO_TICKS(FLUSH_WAIT_POLL_MS));
+    }
 }
 
 void rule_store_flush_now() {
     if (!s_dirty || !s_mtx) return;
-    for (size_t i = 0; i < DIRTY_CAP; i++) flush_slot(i);
+    // Two bounded passes. Pass 1 flushes everything pending; the barrier
+    // then settles ops in flight on the tick task. Pass 2 catches slots
+    // those ops left pending (re-marked mid-write) and retries failures
+    // once. On return, every edit pending at call time is on flash —
+    // except writes that failed twice, which flush_slot logs loudly.
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < DIRTY_CAP; i++) flush_slot(i);
+        if (!wait_no_flushing())
+            ESP_LOGW(TAG, "flush_now: in-flight NVS op did not settle within %lu ms",
+                     (unsigned long)FLUSH_WAIT_MAX_MS);
+        bool pending = false;
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        for (size_t i = 0; i < DIRTY_CAP; i++) {
+            if (s_dirty[i].state != CLEAN) { pending = true; break; }
+        }
+        xSemaphoreGive(s_mtx);
+        if (!pending) return;
+    }
+    ESP_LOGW(TAG, "flush_now: pending entries remain (write failures or concurrent marks)");
 }
 
 // Overlay APIs — consult dirty table before falling through to NVS so
@@ -213,7 +289,8 @@ static void flush_task(void*) {
         size_t due_n = 0;
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         for (size_t i = 0; i < DIRTY_CAP; i++) {
-            if (s_dirty[i].state == CLEAN) continue;
+            // flushing slots are owned by another flusher — skip.
+            if (s_dirty[i].state == CLEAN || s_dirty[i].flushing) continue;
             if (now - s_dirty[i].marked_ms >= MAX_AGE_MS) {
                 due[due_n++] = i;
             }

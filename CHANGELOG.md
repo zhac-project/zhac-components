@@ -383,3 +383,41 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   `xTimerReset(NULL)` and tripped `configASSERT` (:396); now guarded like
   the occupancy timer, with `debounce_pending_flush` set as fallback so the
   merged attrs flush via the sweep instead of sitting in `pending` forever.
+
+### Fixed — High (P1 findings review, flush writeback)
+
+- **zap_store / rule_store**: flush protocol cleared a slot's dirty state
+  BEFORE its NVS write completed (`zap_store_flush_slot` :81,
+  `rule_store_flush_slot` :70 pre-fix), so a concurrent
+  `flush_now`/`flush_device` saw "nothing dirty" and returned while the
+  write was still in flight — breaking the shutdown/OTA durability
+  contract (the P4/S3 flush-before-restart calls could reboot mid-write),
+  and letting rule_store overlay readers fall through to stale NVS during
+  the commit window. Both dirty tables now run a
+  DIRTY → FLUSHING → CLEAN/FREE state machine (replacing the occupancy
+  bool): the slot stays visible and owned for the whole NVS write
+  (transitions under the existing mutex, I/O outside it), a `remarked`
+  flag records marks that land mid-write (settle then leaves the slot
+  dirty so the newer data flushes next cycle), and a failed write reverts
+  the slot in place for next-tick retry — eliminating the old
+  re-queue-into-a-free-slot path, which in rule_store could insert a
+  stale snapshot alongside a newer mark for the same `rule_id`
+  (duplicate entries; index-ordered flushing could persist the stale
+  copy last, :88 pre-fix) and which needed the F37 full-table
+  synchronous-save fallback (now superseded on the retry path; the
+  `mark_dirty` table-full fallback is unchanged).
+- **zap_store / rule_store**: `flush_now()` (and zap's
+  `flush_device()`) are now true durability barriers: they wait
+  (bounded poll, 10 ms × ≤5 s) for FLUSHING slots owned by the tick task
+  to settle, with a second pass for slots re-marked during those writes
+  — on return, state pending at call time is on flash. Both are
+  task-context-only (vTaskDelay); all existing callers qualify
+  (P4 `esp_register_shutdown_handler` handlers run in the task calling
+  `esp_restart`; S3 OTA handler task).
+- **zap_store**: `flush_device(ieee)` resolved the slot index under the
+  mutex, released it, then flushed the index (:169 pre-fix) — the slot
+  could settle and be reused for a different IEEE in that window,
+  force-flushing the wrong device. The flush attempt now revalidates the
+  expected IEEE under the flush lock, and slot reuse during a write is
+  structurally impossible (the free-list skips non-FREE slots, and a
+  FLUSHING slot is not FREE).

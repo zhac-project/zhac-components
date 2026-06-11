@@ -44,4 +44,7 @@ void rule_store_mark_dirty(const RuleSlot* slot);
 void rule_store_mark_delete(uint16_t rule_id);
 
 // Synchronous full flush — call from shutdown handlers / OTA handoff.
+// Durability barrier: also waits (bounded) for commits already in flight
+// on the background flush task, so on return pending edits are on flash.
+// Blocks; task context only (uses vTaskDelay).
 void rule_store_flush_now();
