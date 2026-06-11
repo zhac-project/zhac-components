@@ -336,7 +336,7 @@ bool zap_store_delete_device(uint64_t ieee) {
 
     s_idx_built = false;   // F16: slot order changed — index rebuilt on next save
     store_unlock();
-    free(devs);
+    heap_caps_free(devs);
     if (ok) {
         ESP_LOGI(TAG, "Device deleted ieee=0x%016llx remaining=%u",
                  (unsigned long long)ieee, count);
