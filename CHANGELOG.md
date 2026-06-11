@@ -7,6 +7,34 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — Medium (P2 findings review, T14 HAP correlation edges)
+
+- **hap_session**: enlarged the receive-side dedup `SEEN_RING` 16→64 entries
+  and added a wrap-aware monotonic high-water fast-path. The 16-entry ring
+  evicted a NEEDS_ACK frame's `(seq,type)` after 16 intervening distinct
+  frames, so a burst plus one lost ACK re-dispatched the original on
+  retransmit (double DEVICE_DELETE / double rule-create). The ring now catches
+  recent exact dups; the high-water mark (`seq_diff(high_water, seq) >=
+  WIN_SIZE`, uint16 wrap-safe via the signed-difference trick) catches
+  burst-evicted dups. Both drop-without-dispatch but still re-ACK so the peer
+  stops retransmitting. (FINDINGS §1.3, :252)
+- **hap_session**: session clock `now_ms()` / `WinSlot.sent_ms` moved from a
+  uint32 `xTaskGetTickCount()*portTICK_PERIOD_MS` (wrapped at ~49.7 days, and
+  its `sent_ms==0` sentinel collided with a real post-wrap tick of 0 → one
+  spurious retransmit per slot per wrap) to `int64_t esp_timer_get_time()/1000`.
+  No magic sentinel — the per-slot `active` flag is the armed flag (the tick
+  loop short-circuits inactive slots before reading `sent_ms`). The
+  retransmit-timeout delta `ms - sent_ms < ACK_TIMEOUT_MS` stays exact under
+  int64 (both monotonic ms-from-boot; small positive delta). Added `esp_timer`
+  to the component's PRIV_REQUIRES. (FINDINGS §1.4, :68)
+- **hap_session**: `hap_session_next_seq()` called before init returned 0,
+  which the wire treats as "no correlation" — a roundtrip waiting on that seq
+  silently timed out. It now returns the explicit `SEQ_SENTINEL_UNINIT` (0),
+  and `hap_session_send()` (the shared send path used by BOTH P4 and S3
+  transports) hard-rejects any frame carrying it with an `ESP_LOGE` and
+  `return false`, so a pre-init send fails fast at the call site instead of
+  eating a full timeout. (FINDINGS §1.5, :143)
+
 ### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
 
 - **device_shadow**: the four 32-slot `ZclAttribute` pipeline staging arrays
