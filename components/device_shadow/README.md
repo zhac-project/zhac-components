@@ -51,6 +51,7 @@ frames and reads via REST/WS — it never imports this header.
 | Symbol | Notes |
 |---|---|
 | `uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count)` | Copies up to `max_count` cached attrs into `out`. Returns count copied; 0 means device unknown or empty cache. Thread-safe. |
+| `bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out)` | Single-attr lookup by `key`; copies the matching slot into `*out` and returns true, else returns false (`out` untouched) if device/key absent. Avoids stacking the whole 32-slot array. Leaf-lock only (s_mutex; no NVS / event_bus / other lock); safe from the event-drain task. |
 
 ### Per-device config
 
