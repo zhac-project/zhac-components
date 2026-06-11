@@ -8,6 +8,7 @@
 #include <cstring>
 #include <span>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -223,14 +224,18 @@ std::uint16_t resolve_device_index(std::uint64_t ieee) {
 }
 
 // Merged registry view built from every vendor's kXxxRegistry[].
-// Copied once at init into a PSRAM-resident array; walking a single
-// span is simpler than threading two spans through every call site.
+// Copied once at init; walking a single span is simpler than threading
+// two spans through every call site.
+// PSRAM-resident via EXT_RAM_BSS_ATTR (32 KB of pointers — the old
+// comment claimed PSRAM but the array actually sat in internal .bss).
+// Zero-initialised by startup like any .bss; no initialiser allowed.
+// Walked on device resolve/diagnostics only — never ISR/per-byte hot.
 // Sized generously — bump whenever the total nears the cap.
 // Total ported defs ≈ 5500+ and growing. Cap must stay above the sum
 // or the last-added vendors (tier_e → miboxer, aurora_lighting, …)
 // are silently truncated and lookups mis-route to earlier stubs.
 constexpr std::size_t kMaxRegistry = 8192;
-const zhc::PreparedDefinition* g_merged[kMaxRegistry] = {};
+EXT_RAM_BSS_ATTR const zhc::PreparedDefinition* g_merged[kMaxRegistry];
 std::size_t g_merged_count = 0;
 
 void merge_registries() {

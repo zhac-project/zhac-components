@@ -4,6 +4,7 @@
 #include "tg_gw.h"
 #include "hap_json.h"
 #include "task_stacks.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -187,8 +188,10 @@ static void tg_perform_send(const HapTgSend& m) {
     }
 
     // Build body: {"chat_id":"...","text":"...","parse_mode":"..."}
-    static char body[3500];
-    static char text_esc[3200];
+    // PSRAM: ~6.7 KB of send staging, touched only when a Telegram message
+    // goes out (worker task, never ISR) — cold path.
+    EXT_RAM_BSS_ATTR static char body[3500];
+    EXT_RAM_BSS_ATTR static char text_esc[3200];
     json_escape(m.text, text_esc, sizeof(text_esc));
     int bn = 0;
     if (m.parse_mode_len) {

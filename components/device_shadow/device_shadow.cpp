@@ -487,7 +487,9 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
     // Caller holds `s_mutex` for the entire duration of this function so
     // `static` buffers are safe (single-threaded access guaranteed); they
     // are fully consumed (staged/upserted) before the lock is released.
-    static ZclAttribute filtered[32];
+    // PSRAM (EXT_RAM_BSS_ATTR): ~10.7 KB across the four 32-slot arrays —
+    // warm path (per-report staging, not ISR/DMA), internal DRAM is tighter.
+    EXT_RAM_BSS_ATTR static ZclAttribute filtered[32];
     uint8_t n = shadow_pipeline_filter(&e->config, attrs, count, filtered, 32);
     if (n == 0) return;
 
@@ -513,9 +515,9 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
     if (e->config.debounce_ms > 0) {
-        static ZclAttribute bypass[32];
+        EXT_RAM_BSS_ATTR static ZclAttribute bypass[32];
         uint8_t bypass_count = 0;
-        static ZclAttribute merge[32];
+        EXT_RAM_BSS_ATTR static ZclAttribute merge[32];
         uint8_t merge_count = 0;
 
         for (uint8_t i = 0; i < n; i++) {
@@ -567,7 +569,8 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
 
 static void flush_pending_entry_locked(DeviceShadowEntry* e) {
     // Static — caller holds s_mutex, same reason as apply_pipeline_and_stage.
-    static ZclAttribute out[32];
+    // PSRAM for the same reason as the pipeline arrays above.
+    EXT_RAM_BSS_ATTR static ZclAttribute out[32];
     uint8_t n = shadow_pipeline_flush_pending(&e->pending, out, 32);
     if (n > 0) {
         upsert_cache(e, out, n);

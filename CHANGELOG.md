@@ -7,6 +7,24 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
+
+- **device_shadow**: the four 32-slot `ZclAttribute` pipeline staging arrays
+  (`filtered`/`bypass`/`merge`/`out`, 4 × 2,688 B ≈ 10.7 KB) moved to PSRAM
+  via `EXT_RAM_BSS_ATTR` — warm path (mutex-serialised per-report staging),
+  never ISR/DMA.
+- **zhc_adapter**: `g_merged` (8192-entry merged-registry pointer array,
+  32 KB) was commented as "PSRAM-resident" but actually sat in internal
+  `.bss` — now genuinely placed in `.ext_ram.bss`; the `= {}` initialiser
+  dropped (startup zeroes the section, same semantics).
+- **tg_gw (S3 side)**: Telegram send staging `body`/`text_esc` (6.7 KB) to
+  PSRAM — cold worker-task path.
+- Net effect (`idf.py size`): P4 `.bss` 139,300 → 95,780 B (−43,520 B =
+  device_shadow 10,752 + g_merged 32,768, exact). The tg_gw share lands in
+  the S3 app's −35 KB sweep total. `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`
+  verified in BOTH firmware sdkconfigs, so the attribute is effective on P4
+  as well as S3.
+
 ### Added
 
 - **zhc_adapter / zigbee_mgr**: wire the join-time `configure_write` hook so
