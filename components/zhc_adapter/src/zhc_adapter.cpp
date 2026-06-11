@@ -88,6 +88,24 @@
 
 static const char* TAG = "zhc_adapter";
 
+// ── LOCK MODEL ────────────────────────────────────────────────────────
+// (1) s_slots_mtx guards g_slots / g_slot_count (append + linear scan).
+//     Holds are SHORT: no registry walk, no synth, no radio I/O, no
+//     publish ever runs while it is held.
+// (2) g_pool_mtx (in the fallback) guards the synth definition pool.
+// (3) ORDER: s_slots_mtx → g_pool_mtx, NEVER nested. Slot resolution
+//     releases s_slots_mtx BEFORE any synth/owns() takes g_pool_mtx.
+//     Eviction runs the other way: it holds g_pool_mtx and touches
+//     g_slots LOCKLESSLY via word-atomic pointer clears
+//     (cached_def / cached_supplement = nullptr). Safe because
+//     aligned-pointer stores are atomic on both 32-bit targets AND the
+//     table is append-only (no slot ever moves under the lockless reader).
+// (4) Per-slot cfg_nwk is latched by set_runtime_addr BEFORE the
+//     synchronous try_decode / configure read that consumes it
+//     (latch-before-read) — no cross-call addressing mutex.
+// (5) g_timer_mux (portMUX spinlock, not a mutex) guards the timer slots.
+// ──────────────────────────────────────────────────────────────────────
+
 namespace {
 
 // Wall-clock hook exposed to the library. Returns ms since boot.
@@ -128,6 +146,9 @@ struct IdfTimerSlot {
     // late cancel of a slot that has since fired + been reused for a
     // different timer is rejected (ABA guard). The id is the low 16 bits
     // (slot index +1) packed with the generation in the high 16 bits.
+    // The uint16_t generation wrap is benign: one-shot timer lifetimes are
+    // far shorter than 2^16 reuses of a single slot, so an aliasing
+    // collision across a full wrap is not reachable in practice.
     std::uint16_t      generation;
     bool               in_use;
 };
@@ -275,22 +296,12 @@ zhc::TimerScheduler g_timer_scheduler{
 // registry through 3 strcmp passes. nwk_addr is not a safe key —
 // rejoins rotate it — so we cache by ieee here in the existing slot.
 //
-// Concurrency (P2-T13 findings, defs 2/3/4):
-//  * The table is APPEND-ONLY. A device's slot index, once assigned, is
-//    stable for the life of the process — slots are never moved, recycled
-//    or compacted (`g_slot_count` only grows). This is what lets the
-//    configure_* bridges resolve their per-call address by `device_index`
-//    alone (ieee = the slot's key field; nwk = cfg_nwk below).
-//  * `s_slots_mtx` guards `g_slot_count` (append) and the linear scan in
-//    find_slot_locked/resolve_device_index. Hold times are short — NO registry
-//    walk, synth rebuild or radio I/O ever runs under it.
-//  * Lock order vs the fallback pool mutex (g_pool_mtx): the two are
-//    NEVER nested. Slot resolution (s_slots_mtx) completes and releases
-//    BEFORE any synth/owns() call takes g_pool_mtx, and the eviction path
-//    that calls invalidate_cached_defs_in holds g_pool_mtx but touches
-//    g_slots WITHOUT taking s_slots_mtx (it relies on word-atomic pointer
-//    clears + the append-only invariant — the same relaxed-reader pattern
-//    T4 documented). So no inversion is possible.
+// Concurrency (P2-T13 findings, defs 2/3/4): the table is APPEND-ONLY —
+// a device's slot index, once assigned, is stable for the life of the
+// process, which is what lets the configure_* bridges resolve their
+// per-call address by `device_index` alone (ieee = the slot's key field;
+// nwk = cfg_nwk below). Locking (s_slots_mtx, order vs g_pool_mtx, lockless
+// eviction): see LOCK MODEL at top of file.
 struct IeeeSlot {
     std::uint64_t                  ieee;
     std::uint16_t                  idx;
@@ -345,6 +356,10 @@ IeeeSlot* find_slot_locked(std::uint64_t ieee) {
     return nullptr;
 }
 
+// INVARIANT: APPEND-ONLY — never compact/recycle/reorder slots. Per-call
+// addressing (cfg_nwk by device_index) AND lockless eviction both depend on
+// a slot index being stable for process life. See LOCK MODEL (top of file).
+//
 // Returns the stable slot index for `ieee`, allocating on first sight.
 // Returns kInvalidDeviceIndex iff the table is full (caller must treat
 // that as "drop this device" — never index a real slot).
@@ -358,6 +373,9 @@ std::uint16_t resolve_device_index(std::uint64_t ieee) {
         g_slots[g_slot_count].cfg_nwk           = 0;
         g_slots[g_slot_count].cached_def        = nullptr;
         g_slots[g_slot_count].cached_supplement = nullptr;
+        // INVARIANT: APPEND-ONLY — never compact/recycle/reorder slots. Per-call
+        // addressing (cfg_nwk by device_index) AND lockless eviction both depend on
+        // a slot index being stable for process life. See LOCK MODEL (top of file).
         ++g_slot_count;
         return idx;
     }
@@ -785,22 +803,14 @@ zhac_configure_write_fn_t  g_cfg_write  = nullptr;
 zhac_configure_sleep_fn_t  g_cfg_sleep  = nullptr;
 
 // Per-call addressing (P2-T13, defs 3+4). The zhc library's bridge
-// function-pointer types carry (device_index, ep, cluster, ...) as their
-// first argument — they do NOT carry the device IEEE/NWK. The OLD design
-// stashed the address in a pair of module globals (g_cfg_ieee/g_cfg_nwk)
-// and serialised every configure + decode through a single mutex
-// (g_cfg_addr_mtx), which the radio RX path (try_decode) blocked on
-// portMAX_DELAY while a configure held it across multi-second Wait steps
-// + bind/report radio round-trips — a multi-second frame-intake stall
-// and a deadlock if a configure hook waited on a response the blocked RX
-// task delivers.
-//
-// FIX: the slot table is append-only, so the library-supplied
-// device_index uniquely and stably identifies the device for the life of
-// the call. Each bridge resolves its OWN address from g_slots[idx]
-// (ieee + cfg_nwk) — no shared globals, no cross-call mutex. A configure
-// on one device and a decode on another use different device_index values
-// and never collide, so try_decode takes NO lock for addressing at all.
+// function-pointer types carry (device_index, ep, cluster, ...) but NOT
+// the device IEEE/NWK, so each bridge resolves its OWN address from
+// g_slots[idx] (ieee + cfg_nwk) keyed on device_index — no shared address
+// globals, no cross-call mutex. This read is a SHORT s_slots_mtx scan, NOT
+// the old cross-call g_cfg_addr_mtx that the radio RX path (try_decode)
+// blocked on across multi-second configure Wait/bind/report round-trips
+// (the frame-intake stall + deadlock this fix removes). See LOCK MODEL
+// (top of file).
 struct BridgeAddr { std::uint64_t ieee; std::uint16_t nwk; bool ok; };
 BridgeAddr bridge_addr_for(std::uint16_t idx) {
     SlotsLock lock;
@@ -1062,22 +1072,11 @@ namespace zhc_adapter_internal {
 // silently keep decoding through storage that, after the next rebuild,
 // describes the NEW device (cross-device state corruption).
 //
-// LOCK ORDER (P2-T13): this walk runs UNDER g_pool_mtx (the fallback
-// pool holds it). It deliberately does NOT take s_slots_mtx. The slot
-// resolve path takes s_slots_mtx and later (sequentially, never nested)
-// takes g_pool_mtx for synth/owns(); taking s_slots_mtx here would invert
-// that order (g_pool_mtx → s_slots_mtx) and could deadlock. We are safe
-// without it because:
-//  * The slot table is APPEND-ONLY — entries are never moved, so a
-//    concurrent resolve_device_index append can only add a slot whose
-//    cached_def is still nullptr (cannot point into the victim's range).
-//  * `g_slot_count` only grows; reading it racily here can under-count by
-//    at most the in-flight append, which (per the point above) holds no
-//    pointer into the victim yet — so nothing is missed.
-//  * cached_def / cached_supplement are single aligned pointers —
-//    word-atomic load/store on both 32-bit targets (the codebase's
-//    existing relaxed-reader pattern).
-// Two residual races, both handled:
+// This walk runs UNDER g_pool_mtx and deliberately does NOT take
+// s_slots_mtx — the lockless eviction path described in LOCK MODEL (top of
+// file): append-only table + word-atomic pointer clears make it safe, and
+// taking s_slots_mtx here would invert the lock order. Two residual races,
+// both handled:
 // (a) BENIGN — a decode on another core re-reads a pointer we are
 // about to clear and dispatches one last frame against the still-
 // intact OLD bytes, bounded by the fallback's A/B buffer keeping the
