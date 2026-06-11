@@ -402,6 +402,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   the occupancy timer, with `debounce_pending_flush` set as fallback so the
   merged attrs flush via the sweep instead of sitting in `pending` forever.
 
+**NEEDS HARDWARE TEST** — full 200-device sweep under live radio traffic,
+occupancy timers firing during a sweep, and ZCL_ATTR emit-order parity
+need on-device verification.
+
 ### Fixed — High (P1 findings review, flush writeback)
 
 - **zap_store / rule_store**: flush protocol cleared a slot's dirty state
