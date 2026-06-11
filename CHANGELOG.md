@@ -349,7 +349,11 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   100 ms. Worst-case added persistence latency is one sweep period (~100 ms,
   was: immediate when interval-eligible). Config setters split the F26
   dedupe into decide-under-lock / write-outside-lock halves (`CfgPersist`),
-  and `clear_attrs` erases its NVS key after unlock.
+  and `clear_attrs` erases its NVS key after unlock. Documented residual of
+  that move: a sweep flash write already in flight when `clear_attrs` erases
+  the key can land after the erase and resurrect the pre-clear blob until the
+  next clear/sweep persist cycle — RAM state stays correct, and only a reboot
+  inside that window would load the stale blob.
 - **device_shadow**: ZCL_ATTR events are staged under the lock and published
   after `xSemaphoreGive` via a new `s_emit_mutex` (always taken BEFORE
   `s_mutex`, owns the shared PSRAM staging buffer, held across the publish)

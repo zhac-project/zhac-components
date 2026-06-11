@@ -23,6 +23,12 @@
 static const char* TAG = "device_shadow";
 static const char* NVS_NS = "zap_shadow";
 static constexpr uint32_t NVS_MIN_INTERVAL_S = 300; // max one NVS write per 5min per device
+// task_shadow cadence: the queue-drain timeout AND the housekeeping/
+// persistence sweep period. Comments below cite this constant by name.
+static constexpr uint32_t SWEEP_PERIOD_MS = 100;
+// Depth of s_task_queue (timer-cb → task_shadow messages). Overflow is safe:
+// both timer callbacks fall back to per-entry pending flags the sweep drains.
+static constexpr UBaseType_t TASK_QUEUE_DEPTH = 16;
 
 // Canonical internal attribute names.
 static constexpr const char* KEY_OCCUPANCY = "occupancy";
@@ -258,7 +264,7 @@ static bool nvs_load_config(uint64_t ieee, DeviceConfig* out) {
 // every attr write is deferred to the task_shadow sweep, which honours
 // NVS_MIN_INTERVAL_S per device unless `force` and runs the flash I/O with
 // the lock released. Worst-case added persistence latency: one sweep period
-// (~100 ms). Caller holds s_mutex.
+// (SWEEP_PERIOD_MS). Caller holds s_mutex.
 static void mark_attrs_dirty(DeviceShadowEntry* e, bool force = false) {
     e->nvs_dirty = true;
     if (force) e->nvs_force = true;
@@ -303,11 +309,34 @@ struct StagedAttrs {
 };
 EXT_RAM_BSS_ATTR static StagedAttrs s_staged;
 
+// Truncation accounting for stage_attrs(): attrs past SHADOW_ATTR_MAX in one
+// staging window are dropped from the ZCL_ATTR event stream only (the cache
+// upsert has already run, so RAM/NVS state is unaffected). Counter is
+// volatile for debugger/console reads; it is only mutated under s_emit_mutex.
+static volatile uint32_t s_staged_drop_count  = 0;
+static bool              s_staged_drop_logged = false;
+
 // Caller holds s_emit_mutex (asserted) + s_mutex.
 static void stage_attrs(const DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_t count) {
     configASSERT(xSemaphoreGetMutexHolder(s_emit_mutex) == xTaskGetCurrentTaskHandle());
+    // Staging is per-device (see the StagedAttrs block comment): callers must
+    // publish_staged() before staging a different entry, or the earlier
+    // entry's attrs would be mis-attributed to this ieee.
+    configASSERT(s_staged.count == 0 || s_staged.ieee == e->ieee);
     s_staged.ieee = e->ieee;
-    for (uint8_t i = 0; i < count && s_staged.count < SHADOW_ATTR_MAX; i++) {
+    for (uint8_t i = 0; i < count; i++) {
+        if (s_staged.count >= SHADOW_ATTR_MAX) {
+            // No compound-assign on volatile (deprecated since C++20).
+            s_staged_drop_count = s_staged_drop_count + (uint32_t)(count - i);
+            if (!s_staged_drop_logged) {
+                s_staged_drop_logged = true;
+                ESP_LOGW(TAG, "staged attr buffer full (%u) — dropping %u ZCL_ATTR "
+                              "event(s); cache state unaffected (total dropped %u)",
+                         (unsigned)SHADOW_ATTR_MAX, (unsigned)(count - i),
+                         (unsigned)s_staged_drop_count);
+            }
+            break;
+        }
         s_staged.attrs[s_staged.count++] = attrs[i];
     }
 }
@@ -343,11 +372,20 @@ static void publish_staged() {
 
 // ── Debounce timer callback ──────────────────────────────────────────────
 
+// Log-once for the queue-full fallback below (parity with the occupancy
+// callback). File-scope volatile: written on the timer service task, read
+// anywhere; it only gates log spam, so racy exactness is fine.
+static volatile bool s_debounce_q_full_logged = false;
+
 static void debounce_timer_cb(TimerHandle_t xTimer) {
     DeviceShadowEntry* e = static_cast<DeviceShadowEntry*>(pvTimerGetTimerID(xTimer));
     ShadowTaskMsg msg{ e->ieee, ShadowMsgKind::DebounceFlush };
     if (xQueueSend(s_task_queue, &msg, 0) != pdTRUE) {
         e->debounce_pending_flush = true;
+        if (!s_debounce_q_full_logged) {
+            s_debounce_q_full_logged = true;
+            ESP_LOGW(TAG, "shadow task queue full — debounce flush deferred to sweep");
+        }
     }
 }
 
@@ -357,7 +395,7 @@ static void debounce_timer_cb(TimerHandle_t xTimer) {
 // here on s_mutex with portMAX_DELAY — while an NVS sweep held the lock,
 // every software timer in the firmware froze. Now lock-free: zero-timeout
 // enqueue; task_shadow does the locked work. On a full queue, fall back to a
-// per-entry flag the 100 ms sweep picks up — nothing is dropped, the timeout
+// per-entry flag the SWEEP_PERIOD_MS sweep picks up — nothing is dropped, the timeout
 // just lands one sweep late. Entry slots are never freed (the table is
 // append-only), so the unlocked flag store cannot dangle; same pattern as
 // debounce_pending_flush.
@@ -503,8 +541,8 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
             // through to xTimerReset(NULL) and tripped configASSERT (:396).
             // Guard like the occupancy timer above, but also flag the entry:
             // without a timer the merged attrs would sit in `pending`
-            // forever, so let the 100 ms sweep flush them (debounce degrades
-            // to ~sweep latency, nothing is dropped).
+            // forever, so let the SWEEP_PERIOD_MS sweep flush them (debounce
+            // degrades to ~sweep latency, nothing is dropped).
             e->debounce_pending_flush = true;
         }
 
@@ -559,7 +597,7 @@ EXT_RAM_BSS_ATTR static uint8_t s_sweep_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR
 static void task_shadow(void* arg) {
     ShadowTaskMsg msg{};
     for (;;) {
-        bool got_msg = (xQueueReceive(s_task_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE);
+        bool got_msg = (xQueueReceive(s_task_queue, &msg, pdMS_TO_TICKS(SWEEP_PERIOD_MS)) == pdTRUE);
 
         if (got_msg) {
             xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
@@ -602,7 +640,7 @@ static void task_shadow(void* arg) {
                 // dirty and persists on its next eligible sweep; a FAILED
                 // write re-marks dirty after the stamp, giving a natural
                 // NVS_MIN_INTERVAL_S backoff instead of hammering a failing
-                // flash (and spamming ESP_LOGE) every 100 ms.
+                // flash (and spamming ESP_LOGE) every SWEEP_PERIOD_MS.
                 e->nvs_dirty        = false;
                 e->nvs_force        = false;
                 e->nvs_last_write_s = now_s;
@@ -650,7 +688,7 @@ void device_shadow_init() {
     configASSERT(s_mutex);
     s_emit_mutex = xSemaphoreCreateMutex();
     configASSERT(s_emit_mutex);
-    s_task_queue = xQueueCreate(16, sizeof(ShadowTaskMsg));
+    s_task_queue = xQueueCreate(TASK_QUEUE_DEPTH, sizeof(ShadowTaskMsg));
     configASSERT(s_task_queue);
 
     s_shadow = static_cast<DeviceShadowEntry*>(
@@ -664,7 +702,7 @@ void device_shadow_init() {
 uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) {
     // Pre-fix (:500) this mutated s_shadow/s_count and loaded through the
     // shared s_attr_blob scratch with NO lock, racing task_shadow (spawned
-    // earlier in init) which iterates the table every 100 ms. Now each
+    // earlier in init) which iterates the table every SWEEP_PERIOD_MS. Now each
     // device's NVS reads happen OUTSIDE s_mutex into a boot-only scratch
     // (leaf-lock rule), the table install goes under the lock, and the
     // DEVICE_JOIN publish + zap_store_mark_dirty run after release.
@@ -806,7 +844,7 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
     flush_pending_entry_locked(e);
     // Pre-fix this force-persisted flushed attrs synchronously (under the
     // lock). Same intent, leaf-lock safe: the force flag makes the next
-    // sweep (≤100 ms) write regardless of NVS_MIN_INTERVAL_S.
+    // sweep (≤ SWEEP_PERIOD_MS) write regardless of NVS_MIN_INTERVAL_S.
     if (e->nvs_dirty) e->nvs_force = true;
 
     e->config = *cfg;

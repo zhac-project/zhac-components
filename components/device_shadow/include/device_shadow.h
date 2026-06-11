@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <stdbool.h>
 
+// Concurrency: event-bus FILTERS must not call shadow APIs that emit ZCL_ATTR
+// (process / config setters) — filters run in the publisher's task and
+// self-deadlock on the shadow's outer emit lock; drain-side HANDLERS are fine.
+
 // ── ShadowAttr — one cached attribute slot (84 bytes, string-keyed) ──────
 // Schema v6: ATTR_KEY_MAX widened 20→28 + ATTR_STR_MAX widened 32→48 so
 // long z2m action labels (`brightness_step_up_color_temperature_step_up`,
