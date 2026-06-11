@@ -60,6 +60,30 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   to republish past `MAX_EVENT_HOPS` (8) and logs the offending rule id.
   New host test harness `simple_rules/test/host/` reproduces the wedge and
   verifies the cut. (simple_rules.cpp:411)
+- **zhc_adapter**: the fallback pool (synthetic defs for unmatched devices)
+  rebuilt a slot's `PreparedDefinition` + expose/fz/binding arrays IN PLACE on
+  every `synth_definition()` call with no lock — while the radio task
+  dispatched frames through the same pointers and httpd paths
+  (`build_exposes_json` / `has_def`) triggered concurrent rebuilds: torn
+  counts / nulled expose pointers in normal operation for any fallback
+  device. The pool is now serialized by a FreeRTOS mutex (created from a
+  global ctor, same pattern as `g_cfg_addr_mtx`), and a published def is
+  never rewritten: each slot keeps an A/B double buffer — rebuilds (now
+  gated on `built`/base/label change instead of unconditional) write the
+  inactive half and publish by flipping the active index, so readers holding
+  the old pointer keep seeing consistent bytes for one more generation
+  (contract documented in `zhc_adapter_fallback.hpp`). LRU eviction (and
+  `clear`) now notify a new internal hook
+  `zhc_adapter_internal::invalidate_cached_defs_in(begin,end)` that clears
+  any `IeeeSlot.cached_def`/`cached_supplement` pointing into the victim
+  slot's storage before it is repurposed — previously the evicted device's
+  frames silently kept decoding through the NEW device's def (cross-device
+  state corruption). Eviction also picks a real victim now: `last_used_ms`
+  is stamped from `esp_timer` on every touch instead of the hardcoded
+  `now_ms=0` that always victimized slot 0. Costs ~25 KB extra .bss for the
+  16-slot A/B halves. (zhc_adapter_fallback.cpp:455,92,406) **NEEDS
+  HARDWARE TEST** — component is IDF-only; verified by host syntax check +
+  reader/writer trace, full build gated on the IDF toolchain.
 - **zigbee_mgr**: hold pool mutex across the `on_tc_dev_ind` find-then-mutate
   sequence so a concurrent `pool_remove` (swap-with-last from user delete or
   ZDO_LEAVE_IND) can no longer relocate the entry between lookup and write,

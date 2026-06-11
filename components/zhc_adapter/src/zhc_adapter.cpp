@@ -81,6 +81,7 @@
 #include "zhc/zcl/header.hpp"
 
 #include "zhc_adapter_fallback.hpp"
+#include "zhc_adapter_internal.hpp"
 
 static const char* TAG = "zhc_adapter";
 
@@ -804,6 +805,44 @@ extern "C" void zhac_adapter_invalidate_def_cache(uint64_t ieee) {
     // here unless the caller also wants the cluster data gone (use
     // zhac_adapter_fallback_clear for that).
 }
+
+namespace zhc_adapter_internal {
+
+// Called by the fallback pool (which holds its own pool mutex) right
+// before a victim slot's built-def storage is repurposed for a
+// different device (LRU eviction) or dropped (clear). Walks every
+// IeeeSlot and clears cached pointers that land inside the victim's
+// storage range — without this, the evicted device's frames would
+// silently keep decoding through storage that, after the next rebuild,
+// describes the NEW device (cross-device state corruption).
+//
+// g_slots itself has no mutex yet (Task-13 adds one alongside the
+// resolve_device_index append path). Two benign races remain until
+// then, both bounded by the fallback's A/B buffer keeping the victim's
+// published half byte-stable for one more generation: (a) a decode on
+// another core re-reads a pointer we are about to clear and dispatches
+// one last frame against the still-intact OLD bytes (cached_def is a
+// single aligned pointer — word-atomic load/store on both 32-bit
+// targets, matching the codebase's existing relaxed-reader pattern);
+// (b) a decode that resolved the victim's def just before the eviction
+// took the pool mutex re-caches it just after this walk — that stale
+// entry survives until the slot's next invalidation, but only ever
+// dereferences frozen old-generation bytes, never the new device's
+// def. What can no longer happen is the persistent use-after-repurpose
+// this hook exists to cut.
+void invalidate_cached_defs_in(const void* begin, const void* end) {
+    const auto lo = reinterpret_cast<std::uintptr_t>(begin);
+    const auto hi = reinterpret_cast<std::uintptr_t>(end);
+    for (std::size_t i = 0; i < g_slot_count; ++i) {
+        auto& s = g_slots[i];
+        const auto d = reinterpret_cast<std::uintptr_t>(s.cached_def);
+        if (d >= lo && d < hi) s.cached_def = nullptr;
+        const auto p = reinterpret_cast<std::uintptr_t>(s.cached_supplement);
+        if (p >= lo && p < hi) s.cached_supplement = nullptr;
+    }
+}
+
+}  // namespace zhc_adapter_internal
 
 extern "C" bool zhac_adapter_resolve_labels(const char* model_id,
                                               const char* manufacturer_name,
