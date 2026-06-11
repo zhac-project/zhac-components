@@ -35,6 +35,41 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   `return false`, so a pre-init send fails fast at the call site instead of
   eating a full timeout. (FINDINGS §1.5, :143)
 
+### Fixed — Medium (P2 findings review, T17 zap_store capacity + delete robustness)
+
+- **zap_store**: `zap_store_save_device` had no capacity check. At
+  `count == ZAP_MAX_DEVICES` (200) a new IEEE took `idx = count`, bumped `cnt`
+  past 200, and wrote an unreferenced 522 B blob; every later save of that
+  IEEE re-missed the in-RAM index and re-appended another blob at an
+  ever-higher idx — unbounded NVS growth until partition exhaustion. Now a new
+  device at a full store is rejected with `ESP_LOGE` and `return false` BEFORE
+  any blob write or `cnt` bump; an existing device is always an in-place
+  rewrite and is never rejected. (The in-RAM `pool_add` already guards at 200;
+  this is the persistence-layer safety net.) (FINDINGS §8.1, :150)
+- **zap_store**: `zap_store_delete_device` always allocated
+  `ZAP_MAX_DEVICES × 522 B` (~102 KB) regardless of the actual device count,
+  so delete could fail on a fragmented heap with PSRAM unavailable. It now
+  reads `cnt` under the store lock first and sizes the scratch buffer to the
+  actual count (still PSRAM-preferred with internal-heap fallback); an empty
+  store short-circuits with no allocation. (FINDINGS §8.2, :208)
+- **zap_store**: `zap_store_load_devices` took no `store_lock` (racing
+  save/delete once the flush task runs) and never null-checked `pool`. It now
+  validates `pool`/`max_count` and holds the store lock across the multi-blob
+  scan. Lock order is safe: `s_store_mutex` is the innermost lock — the flush
+  layer always releases its own `s_mtx` before calling save/delete, so this
+  cannot invert against it. (FINDINGS §8.3, :292)
+- **zap_store**: `zap_device_crc` stack-copied the 522 B struct even though the
+  save path already holds a crc-zeroed copy. Split into `zap_device_crc_zeroed`
+  (no copy — save path CRCs its already-zeroed copy in place) and the existing
+  `zap_device_crc` (load path, which must preserve the stored crc32 for the
+  equality check). Same CRC bytes; one fewer 522 B stack frame + memcpy per
+  save. (FINDINGS §8.4, :74)
+- **zap_store**: the NVS namespace now references `zap_nvs::DEVICE_POOL` from
+  the central registry instead of an inlined `"zap_v0"` literal. (FINDINGS §8.5, :17)
+- Added a host test (`test/host/test_zap_store_logic.cpp`) covering the pure
+  capacity-reject decision table and the CRC-in-place ⇔ CRC-with-copy
+  equivalence against the real `ZapDevice` layout (plain cmake, `-Werror`).
+
 ### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
 
 - **device_shadow**: the four 32-slot `ZclAttribute` pipeline staging arrays
