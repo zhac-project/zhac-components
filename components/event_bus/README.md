@@ -118,7 +118,8 @@ cluster(2) + payload_len(1) + payload_hex[80]`.
 
 `MqttMsgEvent` (96 B): `topic[64]` + `payload[32]`.
 
-`RuleEventPayload` (96 B): `name[96]`.
+`RuleEventPayload` (96 B): `name[95]` + `hop(1)` (rule-chain TTL,
+0 = external origin).
 
 `RuleTimerPayload` (96 B): `timer_index(1)` + `_pad[95]`.
 

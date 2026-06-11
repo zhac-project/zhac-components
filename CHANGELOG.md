@@ -49,6 +49,17 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed — Critical
 
+- **simple_rules / event_bus**: a self-feeding rule (`ON Event#x DO event x
+  ENDON`) wedged the P4 main loop forever — the `event` action re-enqueued
+  into the same queue `event_bus_drain` was draining with ticks=0, so the
+  drain never returned, the watchdog rebooted, and the NVS-persisted rule
+  re-wedged every boot. The old `MAX_DISPATCH_DEPTH` counter was dead code
+  (delivery is queue-based; every hop is a fresh dispatch at depth 0) and is
+  removed. `RuleEventPayload` now carries a `hop` TTL (`name` 96→95 B,
+  external producers stay hop 0 via zero-init); the `event` action refuses
+  to republish past `MAX_EVENT_HOPS` (8) and logs the offending rule id.
+  New host test harness `simple_rules/test/host/` reproduces the wedge and
+  verifies the cut. (simple_rules.cpp:411)
 - **zigbee_mgr**: hold pool mutex across the `on_tc_dev_ind` find-then-mutate
   sequence so a concurrent `pool_remove` (swap-with-last from user delete or
   ZDO_LEAVE_IND) can no longer relocate the entry between lookup and write,

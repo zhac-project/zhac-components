@@ -22,8 +22,15 @@
 
 static const char* TAG = "simple_rules";
 
-static constexpr uint8_t MAX_DISPATCH_DEPTH = 8;
-static uint8_t           s_dispatch_depth   = 0;
+// TTL for rule→rule event chains. Replaces the old MAX_DISPATCH_DEPTH
+// counter, which was dead code: rule-event delivery is queue-based, so a
+// self-feeding rule (`ON Event#x DO event x ENDON`) re-enqueues into the
+// queue event_bus_drain is draining and every hop arrives as a fresh
+// dispatch_event call at depth 0 — the drain never returned and the P4
+// main loop wedged until the watchdog rebooted (with the rule persisted,
+// it re-wedged every boot). Instead each RULE_EVENT payload carries a hop
+// counter; the EVENT action drops the republish once the chain is this long.
+static constexpr uint8_t MAX_EVENT_HOPS = 8;
 
 // ── In-memory rule cache ──────────────────────────────────────────────────
 
@@ -342,12 +349,26 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
         }
 
         case ActionType::EVENT: {
-            Event ev{};
-            ev.type = EventType::RULE_EVENT;
-            auto& p = *reinterpret_cast<RuleEventPayload*>(ev.data);
+            // Hop TTL: if this rule was itself triggered by a RULE_EVENT,
+            // carry the chain length forward; any other trigger (attr/
+            // boot/timer/MQTT) starts a fresh chain at hop 0. Refusing to
+            // republish past MAX_EVENT_HOPS cuts self-feeding loops that
+            // would otherwise wedge the drain loop forever.
+            uint8_t src_hop = 0;
+            if (ev && ev->type == EventType::RULE_EVENT)
+                src_hop = reinterpret_cast<const RuleEventPayload*>(ev->data)->hop;
+            if (src_hop >= MAX_EVENT_HOPS) {
+                ESP_LOGW(TAG, "event '%s': rule event loop cut at hop %u (rule %u)",
+                         a.arg0, src_hop, rule.rule_id);
+                break;
+            }
+            Event out{};
+            out.type = EventType::RULE_EVENT;
+            auto& p = *reinterpret_cast<RuleEventPayload*>(out.data);
             strncpy(p.name, a.arg0, sizeof(p.name) - 1);
             p.name[sizeof(p.name) - 1] = '\0';
-            event_bus_publish(ev);
+            p.hop = static_cast<uint8_t>(src_hop + 1);
+            event_bus_publish(out);
             break;
         }
 
@@ -408,11 +429,9 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
 // ── Event dispatch ────────────────────────────────────────────────────────
 
 static void dispatch_event(const Event& ev) {
-    if (s_dispatch_depth >= MAX_DISPATCH_DEPTH) {
-        ESP_LOGE(TAG, "rule dispatch depth limit (%u) reached — possible event loop, dropping event type=%d",
-                 MAX_DISPATCH_DEPTH, static_cast<int>(ev.type));
-        return;
-    }
+    // Event-loop protection lives in the EVENT action (MAX_EVENT_HOPS TTL
+    // carried in RuleEventPayload), not here — see the comment at the
+    // constant for why a dispatch-depth counter could never trip.
 
     // LUA-F8 + CC-F5: do not hold s_mutex across action dispatch.
     // Snapshot the matching rule indices + their stringified event
@@ -429,7 +448,6 @@ static void dispatch_event(const Event& ev) {
     char     matched_val[MAX_MATCHED_PER_EVENT][32];
     uint16_t matched_id [MAX_MATCHED_PER_EVENT];
     uint8_t  matched_count = 0;
-    s_dispatch_depth++;
     for (uint16_t i = 0; i < s_rule_count && matched_count < MAX_MATCHED_PER_EVENT; i++) {
         if (!s_rules[i].enabled) continue;
         char event_val[32] = {};
@@ -441,7 +459,6 @@ static void dispatch_event(const Event& ev) {
             matched_count++;
         }
     }
-    s_dispatch_depth--;
     xSemaphoreGiveRecursive(s_mutex);
 
     for (uint8_t i = 0; i < matched_count; i++) {

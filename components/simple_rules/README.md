@@ -93,7 +93,7 @@ Comparison ops: `ANY`, `==`, `!=`, `>`, `<`, `>=`, `<=`.
 | Symbol | Value | Source |
 |---|---|---|
 | `MAX_CACHED_RULES` | 256 | matches `ZAP_MAX_RULES` in `zap_common.h` |
-| `MAX_DISPATCH_DEPTH` | small, single-digit (configurable in `simple_rules.cpp`) — guards against `RULE_EVENT` infinite loops |
+| `MAX_EVENT_HOPS` | 8 | TTL for rule→rule `RULE_EVENT` chains, carried per-payload (`RuleEventPayload.hop`) — cuts self-feeding loops |
 | `MAX_CRON_FIRES` | 16 | cap on rules that can fire in one minute |
 | `RuleAction.arg{0,1,2}` | 32/20/20 | scratch space for device ref / payload / value |
 | `ParsedRule` | 4 actions per rule | `actions[4]` array |
@@ -126,9 +126,13 @@ rule_type(1) + name(24) + src[500] + crc32(4)`. See
   MQTT broker no longer freezes the whole engine. The 2 s cron
   acquire timeout logs `"task_cron: s_mutex contended >2s — minute
   skipped"` rather than hanging the cron task.
-- `s_dispatch_depth` guards against runaway `RULE_EVENT` loops; once
-  it crosses `MAX_DISPATCH_DEPTH` the offending event is dropped with
-  an `ESP_LOGE`.
+- **Rule-event loop TTL.** `RULE_EVENT` delivery is queue-based, so a
+  self-feeding rule (`ON Event#x DO event x ENDON`) re-enqueues into
+  the queue `event_bus_drain` is draining — a dispatch-depth counter
+  never trips because each hop is a fresh dispatch at depth 0. Instead
+  every `RuleEventPayload` carries a `hop` counter (0 = external
+  origin); the `event` action refuses to republish once the chain
+  reaches `MAX_EVENT_HOPS` and logs a warning.
 
 ## Failure modes
 
@@ -140,7 +144,7 @@ rule_type(1) + name(24) + src[500] + crc32(4)`. See
 | Action target device not found | `zigbee_mgr_zcl_set` returns error; logged; other actions continue |
 | Cron rule with broken expression | `cron_parse` failure during `task_cron` is a per-iteration skip — never aborts the task |
 | Mutex contended >2 s in cron | Minute skipped; logs warning |
-| `s_dispatch_depth` overflow | Event dropped; logs critical |
+| `RULE_EVENT` chain reaches `MAX_EVENT_HOPS` | Republish dropped (loop cut); logs warning with rule id |
 
 ## Integration example
 
