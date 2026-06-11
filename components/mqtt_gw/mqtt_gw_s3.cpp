@@ -38,9 +38,9 @@ static const char* TAG = "mqtt_gw_s3";
 // op — i.e. a rare REST config write — which is acceptable for a
 // single-user gateway and is far simpler / less bug-prone than a
 // snapshot-and-revalidate handshake (which would reintroduce a
-// destroy-vs-use window). All lifecycle helpers below assume the
-// caller does NOT already hold s_client_mtx; restart_client() is the
-// locked primitive and has an _unlocked core for re-entrant callers.
+// destroy-vs-use window). restart_client_locked() below assumes the
+// caller ALREADY holds s_client_mtx; every callsite takes the mutex
+// explicitly around it (there is no separate locking wrapper).
 static SemaphoreHandle_t        s_client_mtx = nullptr;
 
 static esp_mqtt_client_handle_t s_client     = nullptr;
@@ -127,8 +127,8 @@ static void ensure_default_client_id() {
 }
 
 // (Re-)start the MQTT client with current broker URL + client id.
-// CORE: assumes the caller already holds s_client_mtx. Use
-// restart_client() (the locking wrapper) from unlocked contexts.
+// Assumes the caller already holds s_client_mtx — every callsite takes
+// the mutex itself around this call (there is no locking wrapper).
 static void restart_client_locked() {
     if (s_client) {
         esp_mqtt_client_stop(s_client);
@@ -220,6 +220,14 @@ void mqtt_event_handler(void* arg, esp_event_base_t base,
     esp_mqtt_event_handle_t ev = static_cast<esp_mqtt_event_handle_t>(event_data);
     switch (static_cast<esp_mqtt_event_id_t>(event_id)) {
         case MQTT_EVENT_CONNECTED:
+            // NB: this handler runs on esp-mqtt's internal mqtt_task, so it
+            // does NOT take s_client_mtx before subscribe/publish below.
+            // esp_mqtt_client_destroy stop-JOINS this task before freeing the
+            // handle, so s_client stays alive for the whole handler — the
+            // lock-free access is safe. Taking s_client_mtx here would instead
+            // risk a lifecycle-op deadlock (esp-mqtt #163 class): a lifecycle
+            // op holding the mutex while joining this task that is blocked on
+            // the same mutex.
             s_connected = true;
             s_fail_count = 0;
             ESP_LOGI(TAG, "MQTT connected");
@@ -315,8 +323,8 @@ void mqtt_event_handler(void* arg, esp_event_base_t base,
 static void mqtt_rearm_cb(void*) {
     s_fail_count = 0;
     // F1-T19: lock the whole check-then-restart so it can't race a
-    // concurrent stop/destroy/recreate. restart_client_locked() is the
-    // unlocked core; we hold the mutex across the !s_client test.
+    // concurrent stop/destroy/recreate. restart_client_locked() runs
+    // under the mutex we hold here, which also covers the !s_client test.
     if (!s_client_mtx) return;
     xSemaphoreTake(s_client_mtx, portMAX_DELAY);
     if (s_enabled && s_broker_url[0] && !s_client) {
@@ -339,7 +347,7 @@ static void mqtt_pub_worker(void*) {
             // another task. We're the only publisher and we publish
             // under the same lock, so there's no in-flight publish to
             // wait on here — but the lock still fences a concurrent
-            // restart_client() that might be mid esp_mqtt_client_init.
+            // restart_client_locked() that might be mid esp_mqtt_client_init.
             if (s_client_mtx) xSemaphoreTake(s_client_mtx, portMAX_DELAY);
             esp_mqtt_client_handle_t doomed = s_client;
             s_client = nullptr;
@@ -404,8 +412,8 @@ void mqtt_gw_init() {
     // started a client anyway, esp-mqtt's reconnect loop would bang on the
     // network forever even though main.cpp's disabled branch never calls
     // configure(). The client now starts only via mqtt_gw_configure() →
-    // set_broker_url() → restart_client(), or via mqtt_gw_start() from
-    // api_settings_set when the user re-enables.
+    // set_broker_url() → restart_client_locked(), or via mqtt_gw_start()
+    // from api_settings_set when the user re-enables.
 }
 
 void mqtt_gw_start() {

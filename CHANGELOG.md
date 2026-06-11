@@ -70,6 +70,13 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   mid-pack/send, and a stack-local `HapTgSend{}` per call was a 3.2 KB stack
   hit. Both are now `static`, serialized by an init-created `s_send_mutex`
   (same pattern as `mqtt_gw_p4`).
+- Added committed host tests (`mqtt_gw/test/host/` + `tg_gw/test/host/`)
+  pinning the four pure security helpers — `mqtt_topic_ok`, `redact_userinfo`,
+  `json_escape` (incl. the UTF-8 truncation back-off and the chat-id
+  JSON-framing injection case) and the `parse_mode` whitelist — as a
+  regression guard (mirror-source pattern, per the `zap_store/test/host`
+  precedent). Also reworded stale `mqtt_gw_s3.cpp` comments that referenced a
+  deleted `restart_client()` wrapper.
 
 ### Fixed — High/Medium (P2 findings review, T18 simple_rules / cron integrity)
 
