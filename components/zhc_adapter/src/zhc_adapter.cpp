@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "zap_common.h"   // ZAP_MAX_DEVICES — single source of device-count truth
+
 #include "metrics/metrics_macros.h"
 
 #include "zhc/runtime/expose_range.hpp"
@@ -93,11 +95,21 @@ std::uint32_t now_ms() {
     return static_cast<std::uint32_t>(esp_timer_get_time() / 1000ULL);
 }
 
-// Shared runtime state store — small while only a handful of devices
-// use the adapter. Grow alongside `find_definition` as more models
-// get ported. Pinned to 32 entries to stay well under PSRAM budgets.
-constexpr std::size_t kMaxDevices = 32;
-zhc::RuntimeStore<kMaxDevices> g_store;
+// Shared runtime state store — one DeviceRuntimeState per joined device,
+// indexed by the per-IEEE slot index (see IeeeSlot below). Was pinned to
+// 32 (P2-T13 finding): the network can hold up to ZAP_MAX_DEVICES (200),
+// so device 33+ aliased onto slot index 0 and corrupted converter state
+// (press/hold timers, Tuya action de-dup) shared across unrelated devices.
+// Sized to the canonical ZAP_MAX_DEVICES so the slot index is always
+// in-range and every device gets its own runtime state + def cache.
+constexpr std::size_t kMaxDevices = ZAP_MAX_DEVICES;
+// PSRAM-resident (EXT_RAM_BSS_ATTR): RuntimeStore<200> is ~11 KB and the
+// store is only touched from warm task context (decode / configure /
+// command), never from an ISR or DMA — so external RAM is safe and keeps
+// the 200-entry bump off the tight internal DRAM budget (S3 dram0). The
+// `= {}` initialiser is dropped (startup zeroes .ext_ram.bss), matching
+// the g_merged convention.
+EXT_RAM_BSS_ATTR zhc::RuntimeStore<kMaxDevices> g_store;
 
 // ── ESP-IDF timer scheduler ──────────────────────────────────────────
 // Fixed-capacity pool of one-shot esp_timer handles. Mirrors the host
@@ -111,20 +123,65 @@ struct IdfTimerSlot {
     std::uint32_t      user_tag;
     zhc::TimerFiredFn  fn;
     void*              user_data;
+    // Generation tag (P2-T13 finding, def 7): bumped on every (de)alloc
+    // of the slot. A TimerId carries the generation it was minted at so a
+    // late cancel of a slot that has since fired + been reused for a
+    // different timer is rejected (ABA guard). The id is the low 16 bits
+    // (slot index +1) packed with the generation in the high 16 bits.
+    std::uint16_t      generation;
     bool               in_use;
 };
 
 IdfTimerSlot g_timer_slots[kMaxIdfTimers] = {};
 
+// Timer slots are mutated from two contexts: the caller (decode /
+// configure task) via idf_timer_schedule / idf_timer_cancel, and the
+// esp_timer service task via idf_timer_fire_thunk. The `in_use` /
+// `handle` / `generation` fields race between them — a portMUX critical
+// section (not a mutex: fire_thunk runs in a high-prio service task and
+// must not block) serialises the transitions. Matches the spinlock
+// pattern used in znp_driver (znp_worker.cpp s_slot_mux).
+portMUX_TYPE g_timer_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Pack/unpack a TimerId from (slot index, generation). ids are 1-based on
+// the slot so 0 stays reserved for kInvalidTimerId.
+inline zhc::TimerId timer_id_pack(std::size_t i, std::uint16_t gen) {
+    return static_cast<zhc::TimerId>(
+        ((static_cast<std::uint32_t>(gen) << 16) |
+         (static_cast<std::uint32_t>(i) + 1)));
+}
+inline std::size_t   timer_id_slot(zhc::TimerId id) {
+    return static_cast<std::size_t>((static_cast<std::uint32_t>(id) & 0xFFFFu) - 1);
+}
+inline std::uint16_t timer_id_gen(zhc::TimerId id) {
+    return static_cast<std::uint16_t>(static_cast<std::uint32_t>(id) >> 16);
+}
+
 void idf_timer_fire_thunk(void* arg) {
     auto* slot = static_cast<IdfTimerSlot*>(arg);
-    if (!slot || !slot->in_use) return;
-    if (slot->fn) slot->fn(slot->device_index, slot->user_tag, slot->user_data);
-    if (slot->handle) {
-        esp_timer_delete(slot->handle);
+    if (!slot) return;
+    // Snapshot the user callback args + release the slot under the mux so
+    // a concurrent cancel can't double-delete the handle. The fn itself
+    // runs OUTSIDE the critical section (it may re-enter the timer API).
+    zhc::TimerFiredFn  fn        = nullptr;
+    std::uint16_t      dev_index = 0;
+    std::uint32_t      tag       = 0;
+    void*              user      = nullptr;
+    esp_timer_handle_t to_delete = nullptr;
+    portENTER_CRITICAL(&g_timer_mux);
+    if (slot->in_use) {
+        fn        = slot->fn;
+        dev_index = slot->device_index;
+        tag       = slot->user_tag;
+        user      = slot->user_data;
+        to_delete = slot->handle;
         slot->handle = nullptr;
+        slot->in_use = false;
+        ++slot->generation;   // invalidate any outstanding TimerId for this slot
     }
-    slot->in_use = false;
+    portEXIT_CRITICAL(&g_timer_mux);
+    if (to_delete) esp_timer_delete(to_delete);
+    if (fn) fn(dev_index, tag, user);
 }
 
 zhc::TimerId idf_timer_schedule(void*,
@@ -134,47 +191,73 @@ zhc::TimerId idf_timer_schedule(void*,
                                  zhc::TimerFiredFn fn,
                                  void* user_data) {
     for (std::size_t i = 0; i < kMaxIdfTimers; ++i) {
-        if (g_timer_slots[i].in_use) continue;
+        std::uint16_t gen;
+        portENTER_CRITICAL(&g_timer_mux);
+        if (g_timer_slots[i].in_use) { portEXIT_CRITICAL(&g_timer_mux); continue; }
         auto& s = g_timer_slots[i];
         s.device_index = device_index;
         s.user_tag     = user_tag;
         s.fn           = fn;
         s.user_data    = user_data;
+        s.handle       = nullptr;
         s.in_use       = true;
+        gen            = s.generation;
+        portEXIT_CRITICAL(&g_timer_mux);
 
         esp_timer_create_args_t args{};
         args.callback        = &idf_timer_fire_thunk;
-        args.arg             = &s;
+        args.arg             = &g_timer_slots[i];
         args.dispatch_method = ESP_TIMER_TASK;
         args.name            = "zhc";
-        if (esp_timer_create(&args, &s.handle) != ESP_OK) {
-            s.in_use = false;
+        esp_timer_handle_t h = nullptr;
+        if (esp_timer_create(&args, &h) != ESP_OK) {
+            portENTER_CRITICAL(&g_timer_mux);
+            g_timer_slots[i].in_use = false;
+            ++g_timer_slots[i].generation;
+            portEXIT_CRITICAL(&g_timer_mux);
             return zhc::kInvalidTimerId;
         }
-        if (esp_timer_start_once(s.handle,
+        // Publish the handle before arming so a fire/cancel sees it.
+        portENTER_CRITICAL(&g_timer_mux);
+        g_timer_slots[i].handle = h;
+        portEXIT_CRITICAL(&g_timer_mux);
+        if (esp_timer_start_once(h,
                                    static_cast<uint64_t>(delay_ms) * 1000ULL) != ESP_OK) {
-            esp_timer_delete(s.handle);
-            s.handle = nullptr;
-            s.in_use = false;
+            portENTER_CRITICAL(&g_timer_mux);
+            g_timer_slots[i].handle = nullptr;
+            g_timer_slots[i].in_use = false;
+            ++g_timer_slots[i].generation;
+            portEXIT_CRITICAL(&g_timer_mux);
+            esp_timer_delete(h);
             return zhc::kInvalidTimerId;
         }
-        // ids are 1-based so 0 stays reserved for kInvalidTimerId.
-        return static_cast<zhc::TimerId>(i + 1);
+        return timer_id_pack(i, gen);
     }
     ESP_LOGW("zhc_adapter", "timer pool exhausted (cap=%zu)", kMaxIdfTimers);
     return zhc::kInvalidTimerId;
 }
 
 void idf_timer_cancel(void*, zhc::TimerId id) {
-    if (id == zhc::kInvalidTimerId || id > kMaxIdfTimers) return;
-    auto& s = g_timer_slots[id - 1];
-    if (!s.in_use) return;
-    if (s.handle) {
-        esp_timer_stop(s.handle);
-        esp_timer_delete(s.handle);
-        s.handle = nullptr;
+    if (id == zhc::kInvalidTimerId) return;
+    const std::size_t i = timer_id_slot(id);
+    if (i >= kMaxIdfTimers) return;
+    const std::uint16_t want_gen = timer_id_gen(id);
+    esp_timer_handle_t to_delete = nullptr;
+    portENTER_CRITICAL(&g_timer_mux);
+    auto& s = g_timer_slots[i];
+    // ABA guard: reject the cancel if the slot has been reused since this
+    // id was minted (fired + rescheduled for a different timer).
+    if (s.in_use && s.generation == want_gen) {
+        to_delete = s.handle;
+        s.handle  = nullptr;
+        s.in_use  = false;
+        ++s.generation;
     }
-    s.in_use = false;
+    portEXIT_CRITICAL(&g_timer_mux);
+    if (to_delete) {
+        esp_timer_stop(to_delete);
+        esp_timer_delete(to_delete);
+    }
 }
 
 zhc::TimerScheduler g_timer_scheduler{
@@ -191,9 +274,34 @@ zhc::TimerScheduler g_timer_scheduler{
 // subsequent frame. Without it each frame walks the 5000+ merged
 // registry through 3 strcmp passes. nwk_addr is not a safe key —
 // rejoins rotate it — so we cache by ieee here in the existing slot.
+//
+// Concurrency (P2-T13 findings, defs 2/3/4):
+//  * The table is APPEND-ONLY. A device's slot index, once assigned, is
+//    stable for the life of the process — slots are never moved, recycled
+//    or compacted (`g_slot_count` only grows). This is what lets the
+//    configure_* bridges resolve their per-call address by `device_index`
+//    alone (ieee = the slot's key field; nwk = cfg_nwk below).
+//  * `s_slots_mtx` guards `g_slot_count` (append) and the linear scan in
+//    find_slot_locked/resolve_device_index. Hold times are short — NO registry
+//    walk, synth rebuild or radio I/O ever runs under it.
+//  * Lock order vs the fallback pool mutex (g_pool_mtx): the two are
+//    NEVER nested. Slot resolution (s_slots_mtx) completes and releases
+//    BEFORE any synth/owns() call takes g_pool_mtx, and the eviction path
+//    that calls invalidate_cached_defs_in holds g_pool_mtx but touches
+//    g_slots WITHOUT taking s_slots_mtx (it relies on word-atomic pointer
+//    clears + the append-only invariant — the same relaxed-reader pattern
+//    T4 documented). So no inversion is possible.
 struct IeeeSlot {
     std::uint64_t                  ieee;
     std::uint16_t                  idx;
+    // Per-call addressing (def 3+4). Latched by zhac_adapter_set_runtime_addr
+    // (radio task, before try_decode) and by zhac_adapter_configure, keyed
+    // on this slot's device_index. The configure_* bridges read THESE —
+    // indexed by the library-supplied device_index — instead of a pair of
+    // cross-call module globals, so a configure on one device and a decode
+    // on another can run in parallel without clobbering each other's
+    // destination address. nwk rotates on rejoin; ieee is the stable key.
+    std::uint16_t                  cfg_nwk;
     const zhc::PreparedDefinition* cached_def;
     // Supplementary fallback def — populated when a registry match
     // exists but the device advertises additional clusters the
@@ -202,25 +310,121 @@ struct IeeeSlot {
     // emitted, or when the primary IS the fallback (pure synth path).
     const zhc::PreparedDefinition* cached_supplement;
 };
-std::array<IeeeSlot, kMaxDevices> g_slots{};
+// PSRAM-resident (EXT_RAM_BSS_ATTR): IeeeSlot is ~32 B; ZAP_MAX_DEVICES
+// (200) entries ≈ 6.4 KB. Warm-path only (task context), never ISR — so
+// external RAM is safe, matching g_merged / g_store. `= {}` dropped
+// (.ext_ram.bss is zeroed at startup).
+EXT_RAM_BSS_ATTR IeeeSlot g_slots[kMaxDevices];
 std::size_t g_slot_count = 0;
 
-IeeeSlot* find_slot(std::uint64_t ieee) {
+// Returned by resolve_device_index when the (now ZAP_MAX_DEVICES-sized)
+// table is genuinely full. NEVER alias to 0 — that is a real device's
+// slot and aliasing corrupts its converter state (the bug this fixes).
+constexpr std::uint16_t kInvalidDeviceIndex = 0xFFFF;
+
+// Slot-table mutex (def 2). Created at static-init time (global ctor),
+// matching the fallback pool's PoolMtxInit style — NOT lazily, so the
+// very first radio frame already has a valid lock. See lock-order note
+// on IeeeSlot above.
+SemaphoreHandle_t s_slots_mtx = nullptr;
+struct SlotsMtxInit { SlotsMtxInit() { s_slots_mtx = xSemaphoreCreateMutex(); } };
+SlotsMtxInit s_slots_mtx_init;
+
+struct SlotsLock {
+    SlotsLock()  { if (s_slots_mtx) xSemaphoreTake(s_slots_mtx, portMAX_DELAY); }
+    ~SlotsLock() { if (s_slots_mtx) xSemaphoreGive(s_slots_mtx); }
+    SlotsLock(const SlotsLock&)            = delete;
+    SlotsLock& operator=(const SlotsLock&) = delete;
+};
+
+// Caller must hold s_slots_mtx. Append-only scan.
+IeeeSlot* find_slot_locked(std::uint64_t ieee) {
     for (std::size_t i = 0; i < g_slot_count; ++i) {
         if (g_slots[i].ieee == ieee) return &g_slots[i];
     }
     return nullptr;
 }
 
+// Returns the stable slot index for `ieee`, allocating on first sight.
+// Returns kInvalidDeviceIndex iff the table is full (caller must treat
+// that as "drop this device" — never index a real slot).
 std::uint16_t resolve_device_index(std::uint64_t ieee) {
-    if (auto* s = find_slot(ieee)) return s->idx;
+    SlotsLock lock;
+    if (auto* s = find_slot_locked(ieee)) return s->idx;
     if (g_slot_count < kMaxDevices) {
-        g_slots[g_slot_count] = { ieee,
-                                   static_cast<std::uint16_t>(g_slot_count),
-                                   nullptr, nullptr };
-        return static_cast<std::uint16_t>(g_slot_count++);
+        const auto idx = static_cast<std::uint16_t>(g_slot_count);
+        g_slots[g_slot_count].ieee              = ieee;
+        g_slots[g_slot_count].idx               = idx;
+        g_slots[g_slot_count].cfg_nwk           = 0;
+        g_slots[g_slot_count].cached_def        = nullptr;
+        g_slots[g_slot_count].cached_supplement = nullptr;
+        ++g_slot_count;
+        return idx;
     }
-    return 0;  // recycle slot 0 when full — informational only
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        ESP_LOGE(TAG, "slot table full (cap=%zu) — device 0x%016llx dropped; "
+                       "bump kMaxDevices/ZAP_MAX_DEVICES if the network grew",
+                  kMaxDevices, static_cast<unsigned long long>(ieee));
+    }
+    return kInvalidDeviceIndex;
+}
+
+// Negative-match sentinel for cached_def (def 5). A distinct, non-null,
+// non-dereferenceable pointer meaning "we resolved this ieee and it
+// matched NO definition" — so subsequent frames skip the 5500-def
+// registry walk instead of re-walking + re-logging every frame. Kept
+// separate from the cached_supplement==primary sentinel (def 8, which
+// means "no SUPPLEMENT needed"). Invalidated on register_endpoint /
+// fallback_clear / invalidate_def_cache exactly like a real cached_def,
+// so a device that later DOES match (new cluster data → synth) is not
+// masked. The address of a file-scope object is unique and never a valid
+// PreparedDefinition*, so it can never collide with a registry/pool def.
+char g_miss_sentinel_storage = 0;
+const zhc::PreparedDefinition* const kMissSentinel =
+    reinterpret_cast<const zhc::PreparedDefinition*>(&g_miss_sentinel_storage);
+
+// Drop the cached def + supplement for one ieee (takes s_slots_mtx).
+// Used by every invalidation hook (register_endpoint, fallback_clear,
+// invalidate_def_cache). Clears the negative-miss sentinel too, so a
+// device that newly matches is re-resolved on the next frame.
+void clear_cached_defs_for(std::uint64_t ieee) {
+    SlotsLock lock;
+    if (auto* slot = find_slot_locked(ieee)) {
+        slot->cached_def        = nullptr;
+        slot->cached_supplement = nullptr;
+    }
+}
+
+// Snapshot of a slot's cached state, taken under s_slots_mtx and copied
+// out so callers never dereference g_slots without the lock. `present`
+// is false when no slot exists for the ieee yet.
+struct SlotSnapshot {
+    bool                           present;
+    std::uint16_t                  idx;
+    std::uint16_t                  cfg_nwk;
+    const zhc::PreparedDefinition* cached_def;
+    const zhc::PreparedDefinition* cached_supplement;
+};
+
+SlotSnapshot snapshot_slot(std::uint64_t ieee) {
+    SlotsLock lock;
+    if (auto* s = find_slot_locked(ieee)) {
+        return { true, s->idx, s->cfg_nwk, s->cached_def, s->cached_supplement };
+    }
+    return { false, kInvalidDeviceIndex, 0, nullptr, nullptr };
+}
+
+// Store the resolved def/supplement back into the slot (takes the lock).
+void store_cached_defs(std::uint64_t ieee,
+                       const zhc::PreparedDefinition* def,
+                       const zhc::PreparedDefinition* supp) {
+    SlotsLock lock;
+    if (auto* s = find_slot_locked(ieee)) {
+        s->cached_def        = def;
+        s->cached_supplement = supp;
+    }
 }
 
 // Merged registry view built from every vendor's kXxxRegistry[].
@@ -390,21 +594,25 @@ const zhc::PreparedDefinition* resolve_supplement(std::uint64_t ieee,
     if (ieee == 0 || !primary) return nullptr;
     if (find_definition(model_id, manu_name) == nullptr) return nullptr;
 
-    // Check per-slot cache before running synth.
-    if (IeeeSlot* slot = find_slot(ieee)) {
-        if (slot->cached_supplement == primary) {
+    // Check per-slot cache before running synth. The snapshot reads the
+    // cached_supplement state under s_slots_mtx and copies it out — synth
+    // (which takes g_pool_mtx) NEVER runs while we hold the slot lock, so
+    // the two mutexes are sequential, never nested.
+    const SlotSnapshot snap = snapshot_slot(ieee);
+    if (snap.present) {
+        if (snap.cached_supplement == primary) {
             // Negative sentinel: previously computed, no supplement needed.
             return nullptr;
         }
-        if (slot->cached_supplement != nullptr) {
+        if (snap.cached_supplement != nullptr) {
             // Positive cache hit.
-            return slot->cached_supplement;
+            return snap.cached_supplement;
         }
-        // Cache miss — compute, then store result.
+        // Cache miss — compute (slot lock released), then store result.
         const zhc::PreparedDefinition* result =
             zhc_fallback::synth_definition(ieee, model_id, manu_name, primary);
         // Store sentinel (primary) for negative result, real pointer for positive.
-        slot->cached_supplement = result ? result : primary;
+        const zhc::PreparedDefinition* to_store = result ? result : primary;
         // Race (b) closure, same shape as the decode-miss path: synth ran
         // without this caller holding the pool mutex, so the pool entry
         // backing `result` may have been evicted / repurposed between
@@ -415,8 +623,17 @@ const zhc::PreparedDefinition* resolve_supplement(std::uint64_t ieee,
         // negative sentinel (registry `primary`) is not pool storage and
         // always passes owns(). The local `result` still serves this one
         // call — same one-generation A/B-buffer argument as decode-miss.
-        if (!zhc_fallback::owns(ieee, slot->cached_supplement)) {
-            slot->cached_supplement = nullptr;
+        if (!zhc_fallback::owns(ieee, to_store)) {
+            to_store = nullptr;
+        }
+        // Re-find the slot under the lock to store (it can't have moved —
+        // append-only — but another invalidation may have cleared it; the
+        // store is idempotent either way).
+        {
+            SlotsLock lock;
+            if (auto* slot = find_slot_locked(ieee)) {
+                slot->cached_supplement = to_store;
+            }
         }
         return result;
     }
@@ -566,64 +783,76 @@ zhac_configure_cmd_fn_t    g_cfg_cmd    = nullptr;
 zhac_configure_read_fn_t   g_cfg_read   = nullptr;
 zhac_configure_write_fn_t  g_cfg_write  = nullptr;
 zhac_configure_sleep_fn_t  g_cfg_sleep  = nullptr;
-// Per-bridge-call addressing. The zhc library's bridge function-pointer
-// types only carry (idx, ep, cluster, ...) — they have no slot for
-// device IEEE/NWK — so we cannot push the address through ctx without
-// changing the upstream typedefs. Until the library API gains that, we
-// fall back to module-level globals guarded by a FreeRTOS mutex.
-//
-// On dual-core ESP32-P4 the configure task (zhac_adapter_configure) and
-// the ZCL decode task (try_decode + zhac_adapter_set_runtime_addr) can
-// run in parallel. Without the mutex the configure-task's globals could
-// be overwritten mid-bridge by a ZCL frame from a different device,
-// causing a configure_cmd_bridge call to deliver the right command to
-// the wrong destination. Holding the mutex from "set globals" through
-// "consume globals in bridges" through "clear globals" makes the
-// configure call atomic with respect to set_runtime_addr.
-std::uint64_t              g_cfg_ieee   = 0;
-std::uint16_t              g_cfg_nwk    = 0;
-SemaphoreHandle_t          g_cfg_addr_mtx = nullptr;
-struct CfgAddrInit { CfgAddrInit() { g_cfg_addr_mtx = xSemaphoreCreateMutex(); } };
-CfgAddrInit                g_cfg_addr_init;
 
-bool configure_bind_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
-                            std::uint16_t cluster) {
-    return g_cfg_bind ? g_cfg_bind(g_cfg_ieee, ep, cluster) : false;
+// Per-call addressing (P2-T13, defs 3+4). The zhc library's bridge
+// function-pointer types carry (device_index, ep, cluster, ...) as their
+// first argument — they do NOT carry the device IEEE/NWK. The OLD design
+// stashed the address in a pair of module globals (g_cfg_ieee/g_cfg_nwk)
+// and serialised every configure + decode through a single mutex
+// (g_cfg_addr_mtx), which the radio RX path (try_decode) blocked on
+// portMAX_DELAY while a configure held it across multi-second Wait steps
+// + bind/report radio round-trips — a multi-second frame-intake stall
+// and a deadlock if a configure hook waited on a response the blocked RX
+// task delivers.
+//
+// FIX: the slot table is append-only, so the library-supplied
+// device_index uniquely and stably identifies the device for the life of
+// the call. Each bridge resolves its OWN address from g_slots[idx]
+// (ieee + cfg_nwk) — no shared globals, no cross-call mutex. A configure
+// on one device and a decode on another use different device_index values
+// and never collide, so try_decode takes NO lock for addressing at all.
+struct BridgeAddr { std::uint64_t ieee; std::uint16_t nwk; bool ok; };
+BridgeAddr bridge_addr_for(std::uint16_t idx) {
+    SlotsLock lock;
+    if (idx < g_slot_count) {
+        return { g_slots[idx].ieee, g_slots[idx].cfg_nwk, true };
+    }
+    return { 0, 0, false };
 }
 
-bool configure_report_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
+bool configure_bind_bridge(std::uint16_t idx, std::uint8_t ep,
+                            std::uint16_t cluster) {
+    const auto a = bridge_addr_for(idx);
+    return (g_cfg_bind && a.ok) ? g_cfg_bind(a.ieee, ep, cluster) : false;
+}
+
+bool configure_report_bridge(std::uint16_t idx, std::uint8_t ep,
                               std::uint16_t cluster, std::uint16_t attr,
                               std::uint8_t type, std::uint16_t mn,
                               std::uint16_t mx, std::uint32_t change,
                               std::uint16_t manu_code) {
-    return g_cfg_report ? g_cfg_report(g_cfg_ieee, ep, cluster, attr,
-                                         type, mn, mx, change, manu_code)
-                         : false;
+    const auto a = bridge_addr_for(idx);
+    return (g_cfg_report && a.ok)
+        ? g_cfg_report(a.ieee, ep, cluster, attr,
+                        type, mn, mx, change, manu_code)
+        : false;
 }
 
-bool configure_cmd_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
+bool configure_cmd_bridge(std::uint16_t idx, std::uint8_t ep,
                            std::uint16_t cluster, std::uint8_t cmd,
                            const std::uint8_t* payload,
                            std::uint8_t payload_len,
                            std::uint8_t flags) {
-    return g_cfg_cmd
-        ? g_cfg_cmd(g_cfg_ieee, g_cfg_nwk, ep, cluster, cmd, payload,
+    const auto a = bridge_addr_for(idx);
+    return (g_cfg_cmd && a.ok)
+        ? g_cfg_cmd(a.ieee, a.nwk, ep, cluster, cmd, payload,
                      payload_len, flags)
         : false;
 }
 
-bool configure_read_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
+bool configure_read_bridge(std::uint16_t idx, std::uint8_t ep,
                             std::uint16_t cluster,
                             const std::uint8_t* attr_ids_le,
                             std::uint8_t attr_count,
                             std::uint16_t manu_code) {
-    return g_cfg_read
-        ? g_cfg_read(g_cfg_ieee, g_cfg_nwk, ep, cluster, attr_ids_le,
+    const auto a = bridge_addr_for(idx);
+    return (g_cfg_read && a.ok)
+        ? g_cfg_read(a.ieee, a.nwk, ep, cluster, attr_ids_le,
                       attr_count, manu_code)
         : false;
 }
 
-bool configure_write_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
+bool configure_write_bridge(std::uint16_t idx, std::uint8_t ep,
                              std::uint16_t cluster, std::uint16_t attr,
                              std::uint8_t type, const std::uint8_t* value,
                              std::size_t len, std::uint16_t manu_code) {
@@ -634,8 +863,9 @@ bool configure_write_bridge(std::uint16_t /*idx*/, std::uint8_t ep,
     // here — guard against a malformed >255 spec rather than truncating
     // silently into a corrupt frame.
     if (len > 0xFF) return false;
-    return g_cfg_write
-        ? g_cfg_write(g_cfg_ieee, g_cfg_nwk, ep, cluster, attr, type, value,
+    const auto a = bridge_addr_for(idx);
+    return (g_cfg_write && a.ok)
+        ? g_cfg_write(a.ieee, a.nwk, ep, cluster, attr, type, value,
                        static_cast<std::uint8_t>(len), manu_code)
         : false;
 }
@@ -675,12 +905,27 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
     const zhc::PreparedDefinition* supp =
         resolve_supplement(ieee, model_id, manu_name, def);
 
+    const std::uint16_t idx = resolve_device_index(ieee);
+    if (idx == kInvalidDeviceIndex) {
+        ESP_LOGE(TAG, "[configure] no slot for ieee=0x%016llx (table full)",
+                  static_cast<unsigned long long>(ieee));
+        return false;
+    }
+    // Latch this device's NWK into its own slot so the configure_* bridges
+    // resolve the right destination by device_index. No cross-call globals,
+    // no addr mutex — a parallel configure/decode on a DIFFERENT device
+    // touches a different slot and cannot clobber this one. (def 3+4)
+    {
+        SlotsLock lock;
+        if (idx < g_slot_count) g_slots[idx].cfg_nwk = nwk;
+    }
+
     zhc::RuntimeContext ctx{};
     ctx.now_ms           = &now_ms;
     ctx.store            = &g_store;
     ctx.store_get        = &zhc::RuntimeStore<kMaxDevices>::get;
     ctx.timers           = &g_timer_scheduler;
-    ctx.device_index     = resolve_device_index(ieee);
+    ctx.device_index     = idx;
     ctx.device_nwk       = nwk;
     ctx.configure_bind   = g_cfg_bind   ? &configure_bind_bridge   : nullptr;
     ctx.configure_report = g_cfg_report ? &configure_report_bridge : nullptr;
@@ -689,13 +934,6 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
     ctx.configure_write  = g_cfg_write  ? &configure_write_bridge  : nullptr;
     ctx.configure_sleep  = g_cfg_sleep  ? &configure_sleep_bridge  : nullptr;
 
-    // Hold the addr mutex across the whole bridge-consuming section so a
-    // parallel zhac_adapter_set_runtime_addr (from the ZCL decode task on
-    // the other P4 core) can't rewrite g_cfg_ieee / g_cfg_nwk mid-call
-    // and route this device's bridge ZCL frames to a different node.
-    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
-    g_cfg_ieee = ieee;
-    g_cfg_nwk  = nwk;
     bool ok = zhc::run_configure(*def, ctx);
     if (supp) {
         const bool supp_ok = zhc::run_configure(*supp, ctx);
@@ -729,9 +967,6 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
         }
     }
 
-    g_cfg_ieee = 0;
-    g_cfg_nwk  = 0;
-    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
     return ok;
 }
 
@@ -796,28 +1031,21 @@ extern "C" void zhac_adapter_register_endpoint(uint64_t ieee,
                                      in_clusters, n_in_clusters,
                                      out_clusters, n_out_clusters);
     // New cluster data could promote a device from UNMATCHED to MATCHED
-    // via synth; drop any cached `cached_def=nullptr` so the next
-    // try_decode re-runs resolution. Also drop the supplement cache
-    // because the added clusters may change what the supplement emits.
-    if (auto* slot = find_slot(ieee)) {
-        slot->cached_def        = nullptr;
-        slot->cached_supplement = nullptr;
-    }
+    // via synth; drop any cached def (including the negative-miss
+    // sentinel) so the next try_decode re-runs resolution. Also drop the
+    // supplement cache because the added clusters may change what the
+    // supplement emits. This is the epoch-invariant pairing the fallback
+    // header documents (rebuild trigger ⇔ cached_def invalidation).
+    clear_cached_defs_for(ieee);
 }
 
 extern "C" void zhac_adapter_fallback_clear(uint64_t ieee) {
     zhc_fallback::clear(ieee);
-    if (auto* slot = find_slot(ieee)) {
-        slot->cached_def        = nullptr;
-        slot->cached_supplement = nullptr;
-    }
+    clear_cached_defs_for(ieee);
 }
 
 extern "C" void zhac_adapter_invalidate_def_cache(uint64_t ieee) {
-    if (auto* s = find_slot(ieee)) {
-        s->cached_def        = nullptr;
-        s->cached_supplement = nullptr;
-    }
+    clear_cached_defs_for(ieee);
     // The synthesized fallback def is rebuilt on demand from cluster
     // data still cached in zhc_adapter_fallback; no extra clear needed
     // here unless the caller also wants the cluster data gone (use
@@ -834,23 +1062,35 @@ namespace zhc_adapter_internal {
 // silently keep decoding through storage that, after the next rebuild,
 // describes the NEW device (cross-device state corruption).
 //
-// g_slots itself has no mutex yet (Task-13 adds one alongside the
-// resolve_device_index append path). Two races exist around this walk:
+// LOCK ORDER (P2-T13): this walk runs UNDER g_pool_mtx (the fallback
+// pool holds it). It deliberately does NOT take s_slots_mtx. The slot
+// resolve path takes s_slots_mtx and later (sequentially, never nested)
+// takes g_pool_mtx for synth/owns(); taking s_slots_mtx here would invert
+// that order (g_pool_mtx → s_slots_mtx) and could deadlock. We are safe
+// without it because:
+//  * The slot table is APPEND-ONLY — entries are never moved, so a
+//    concurrent resolve_device_index append can only add a slot whose
+//    cached_def is still nullptr (cannot point into the victim's range).
+//  * `g_slot_count` only grows; reading it racily here can under-count by
+//    at most the in-flight append, which (per the point above) holds no
+//    pointer into the victim yet — so nothing is missed.
+//  * cached_def / cached_supplement are single aligned pointers —
+//    word-atomic load/store on both 32-bit targets (the codebase's
+//    existing relaxed-reader pattern).
+// Two residual races, both handled:
 // (a) BENIGN — a decode on another core re-reads a pointer we are
 // about to clear and dispatches one last frame against the still-
 // intact OLD bytes, bounded by the fallback's A/B buffer keeping the
-// victim's published half byte-stable for one more generation
-// (cached_def is a single aligned pointer — word-atomic load/store on
-// both 32-bit targets, matching the codebase's existing relaxed-reader
-// pattern); (b) NOT benign if left open — a decode that resolved the
-// victim's def just before the eviction took the pool mutex could
-// re-cache it just after this walk. Such a stale entry would survive
-// the repurposed slot's FIRST rebuild (which writes the other half),
-// but the slot's SECOND rebuild rewrites the very bytes it points at —
-// the old device's frames would then decode through the NEW device's
-// def. The decode-miss path therefore re-validates every cache fill
-// against the pool under its mutex (zhc_fallback::owns) and drops the
-// fill if the slot no longer belongs to that ieee, closing (b).
+// victim's published half byte-stable for one more generation.
+// (b) NOT benign if left open — a decode that resolved the victim's def
+// just before the eviction took the pool mutex could re-cache it just
+// after this walk. Such a stale entry would survive the repurposed
+// slot's FIRST rebuild (which writes the other half), but the slot's
+// SECOND rebuild rewrites the very bytes it points at — the old device's
+// frames would then decode through the NEW device's def. The decode-miss
+// path therefore re-validates every cache fill against the pool under its
+// mutex (zhc_fallback::owns) and drops the fill if the slot no longer
+// belongs to that ieee, closing (b).
 void invalidate_cached_defs_in(const void* begin, const void* end) {
     const auto lo = reinterpret_cast<std::uintptr_t>(begin);
     const auto hi = reinterpret_cast<std::uintptr_t>(end);
@@ -1046,13 +1286,25 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     _METRIC_TIMER_SCOPE(METRIC_ZHC_DECODE);
     _METRIC_COUNTER_INC(METRIC_ZB_RX_FRAMES_TOTAL, 1);
 
-    // Fast path: per-ieee def cache. Fills on first frame per device
-    // from find_definition (which walks 5000+ entries); subsequent
-    // frames dereference the pointer directly. See
-    // `zhac_adapter_invalidate_def_cache` for the eviction path.
-    IeeeSlot* slot = find_slot(ieee);
-    const zhc::PreparedDefinition* def = slot ? slot->cached_def : nullptr;
-    const zhc::PreparedDefinition* supp = slot ? slot->cached_supplement : nullptr;
+    // Fast path: per-ieee def cache (snapshotted under s_slots_mtx so the
+    // radio task never dereferences g_slots without the lock). Fills on
+    // first frame per device from find_definition (which walks 5500+
+    // entries); subsequent frames dereference the cached pointer directly.
+    // See `zhac_adapter_invalidate_def_cache` for the eviction path.
+    SlotSnapshot snap = snapshot_slot(ieee);
+    const zhc::PreparedDefinition* def  = snap.present ? snap.cached_def : nullptr;
+    const zhc::PreparedDefinition* supp = snap.present ? snap.cached_supplement : nullptr;
+
+    // Negative-miss cache (def 5): a device we resolved and that matched
+    // NOTHING is tagged with kMissSentinel so its frames don't re-walk the
+    // 5500-def registry (and re-log) every time. Cleared on register_
+    // endpoint / fallback_clear / invalidate_def_cache, so a device that
+    // later gains cluster data and matches via synth is NOT masked.
+    if (def == kMissSentinel) {
+        _METRIC_COUNTER_INC(METRIC_ADAPTER_CACHE_HIT, 1);
+        _METRIC_COUNTER_INC(METRIC_ZHC_UNHANDLED_TOTAL, 1);
+        return false;
+    }
 
     if (def) {
         _METRIC_COUNTER_INC(METRIC_ADAPTER_CACHE_HIT, 1);
@@ -1060,7 +1312,11 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         _METRIC_COUNTER_INC(METRIC_ADAPTER_CACHE_MISS, 1);
         def  = resolve_definition(ieee, model_id, manufacturer_name);
         supp = resolve_supplement(ieee, model_id, manufacturer_name, def);
-        ESP_LOGI(TAG,
+        // Demoted to DEBUG (def 5): this fired at INFO on EVERY frame of an
+        // unmatched device on the radio task. With the miss cache below it
+        // now logs at most once per device until invalidation, and the
+        // routine resolve detail is debug-level.
+        ESP_LOGD(TAG,
                  "[zhc-lib] def resolve ieee=0x%016llx model='%s' mfg='%s' "
                  "-> %s/%s%s (reg=%zu, cached)",
                  static_cast<unsigned long long>(ieee),
@@ -1070,13 +1326,12 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
                  def && def->model  ? def->model  : "-",
                  supp ? " +fallback" : "",
                  g_merged_count);
-        if (!slot) {
+        if (!snap.present) {
             (void)resolve_device_index(ieee);
-            slot = find_slot(ieee);
+            snap = snapshot_slot(ieee);
         }
-        if (slot && def) {
-            slot->cached_def        = def;
-            slot->cached_supplement = supp;
+        if (snap.present && def) {
+            store_cached_defs(ieee, def, supp);
             // Race (b) closure (see invalidate_cached_defs_in): the
             // resolve above ran without the fallback pool mutex, so a
             // pool-backed def may belong to a slot that was evicted /
@@ -1093,15 +1348,26 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
             // as benign race (a)).
             if (!zhc_fallback::owns(ieee, def) ||
                 !zhc_fallback::owns(ieee, supp)) {
-                slot->cached_def        = nullptr;
-                slot->cached_supplement = nullptr;
+                store_cached_defs(ieee, nullptr, nullptr);
             }
+        } else if (snap.present && !def) {
+            // Resolved, no match → tag the slot so we don't re-walk every
+            // frame. kMissSentinel is never dereferenced (guard above).
+            store_cached_defs(ieee, kMissSentinel, nullptr);
         }
     }
 
     if (!def) {
         _METRIC_COUNTER_INC(METRIC_ZHC_UNHANDLED_TOTAL, 1);
         return false;           // device not yet ported — skip silently
+    }
+    // Slot-table overflow (def 1): we have a def but no slot (table full at
+    // ZAP_MAX_DEVICES). FAIL the decode rather than dispatch with an
+    // invalid device_index — never alias onto slot 0 and corrupt another
+    // device's converter state. resolve_device_index already logged once.
+    if (!snap.present || snap.idx == kInvalidDeviceIndex) {
+        _METRIC_COUNTER_INC(METRIC_ZHC_UNHANDLED_TOTAL, 1);
+        return false;
     }
     if (!zcl || zcl_len == 0) return false;
 
@@ -1145,25 +1411,25 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     ctx.store        = &g_store;
     ctx.store_get    = &zhc::RuntimeStore<kMaxDevices>::get;
     ctx.timers       = &g_timer_scheduler;
-    ctx.device_index = resolve_device_index(ieee);
-    // Some fz converters (Zosung IR runtime, Tuya MCU sync time) emit
-    // ZCL commands back to the device while handling an inbound frame.
-    // Reuse the configure_* hooks — they're a generic "send a ZCL
-    // frame" interface, not configure-only. `g_cfg_ieee` / `g_cfg_nwk`
-    // are populated by `zhac_adapter_set_runtime_addr` from the radio
-    // bridge before each `try_decode`.
+    ctx.device_index = snap.idx;
+    // Per-call addressing (def 3+4) — NO mutex on the RX path. Some fz
+    // converters (Zosung IR runtime, Tuya MCU sync-time) emit ZCL commands
+    // back to the device while handling an inbound frame, via the reused
+    // configure_* hooks (a generic "send a ZCL frame" interface). Those
+    // bridges resolve the destination from g_slots[device_index] — the
+    // slot this very frame's ieee owns — so there is NOTHING shared with a
+    // parallel configure to protect. ctx.device_nwk (used directly by the
+    // Tuya kick below + the library's Callback op) comes from the same
+    // slot, latched by zhac_adapter_set_runtime_addr before this call.
+    // This removes the old g_cfg_addr_mtx that the RX task blocked on
+    // portMAX_DELAY across multi-second configure Wait steps (the stall +
+    // deadlock this fix targets).
+    ctx.device_nwk = snap.cfg_nwk;
     ctx.configure_bind   = g_cfg_bind   ? &configure_bind_bridge   : nullptr;
     ctx.configure_report = g_cfg_report ? &configure_report_bridge : nullptr;
     ctx.configure_cmd    = g_cfg_cmd    ? &configure_cmd_bridge    : nullptr;
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
     ctx.configure_write  = g_cfg_write  ? &configure_write_bridge  : nullptr;
-
-    // Hold the addr mutex from the snapshot of g_cfg_nwk through the
-    // full dispatch — the bridges below consume g_cfg_ieee/g_cfg_nwk
-    // (no per-call context for them), and a parallel configure on the
-    // other core would otherwise rewrite the globals mid-dispatch.
-    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
-    ctx.device_nwk = g_cfg_nwk;
 
     auto result = zhc::dispatch_from_zigbee(msg, dp_span, *def, raw, ctx);
 
@@ -1175,7 +1441,6 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     if (!result.any_matched && supp) {
         result = zhc::dispatch_from_zigbee(msg, dp_span, *supp, raw, ctx);
         if (result.any_matched) {
-            if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
             log_payload(ieee, *supp, result, cluster_id, &msg, zcl, zcl_len);
             fire_shadow_updates(ieee, result);
             return true;
@@ -1195,7 +1460,6 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         ESP_LOGI(TAG, "[zhc-lib] mcuVersionResp seen ieee=0x%016llx — sent dataQuery",
                  static_cast<unsigned long long>(ieee));
     }
-    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
 
     log_payload(ieee, *def, result, cluster_id, &msg, zcl, zcl_len);
     if (result.any_matched) fire_shadow_updates(ieee, result);
@@ -1212,8 +1476,25 @@ bool dispatch_and_send(uint64_t ieee,
                         uint16_t nwk_addr, uint8_t dst_ep,
                         const char* key, const zhc::Value& value) {
     if (!model_id || !key) return false;
-    const zhc::PreparedDefinition* def =
-        resolve_definition(ieee, model_id, manu_name);
+
+    // Reuse the per-ieee cached def that try_decode maintains (def 6)
+    // instead of re-walking the 5500-def registry (or rebuilding a
+    // fallback) on every command. Snapshot under s_slots_mtx; the cached
+    // pointer is honoured only if it is a real def (not null, not the
+    // negative-miss sentinel) AND still owned by this ieee in the pool
+    // (the one-generation A/B lifetime rule — revalidate via owns() under
+    // g_pool_mtx, sequential with the slot lock, never nested). Otherwise
+    // fall back to a fresh resolve. We do NOT write the cache here — that
+    // stays try_decode's job, keeping the eviction/invalidation contract
+    // in one place.
+    const SlotSnapshot snap = snapshot_slot(ieee);
+    const zhc::PreparedDefinition* def = nullptr;
+    if (snap.present && snap.cached_def && snap.cached_def != kMissSentinel &&
+        zhc_fallback::owns(ieee, snap.cached_def)) {
+        def = snap.cached_def;
+    } else {
+        def = resolve_definition(ieee, model_id, manu_name);
+    }
     if (!def) {
         ESP_LOGW(TAG, "[zhc-send] 0x%016llx model=%s no definition",
                  static_cast<unsigned long long>(ieee), model_id);
@@ -1231,6 +1512,7 @@ bool dispatch_and_send(uint64_t ieee,
     ctx.store_get    = &zhc::RuntimeStore<kMaxDevices>::get;
     ctx.timers       = &g_timer_scheduler;
     ctx.device_index = resolve_device_index(ieee);
+    ctx.device_nwk   = nwk_addr;
 
     // Multi-endpoint Tz routing. If the def opts in via endpoint_map
     // and `key` ends with `_<label>` matching a registered endpoint,
@@ -1293,13 +1575,17 @@ extern "C" void zhac_adapter_register_send(zhac_af_send_fn_t fn) {
 }
 
 extern "C" void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk) {
-    // Mutex pairs with the configure-call section: blocks while a configure
-    // is in-flight on the other core so we can't overwrite its IEEE/NWK
-    // mid-bridge. Brief contention only — both producers are short-lived.
-    if (g_cfg_addr_mtx) xSemaphoreTake(g_cfg_addr_mtx, portMAX_DELAY);
-    g_cfg_ieee = ieee;
-    g_cfg_nwk  = nwk;
-    if (g_cfg_addr_mtx) xSemaphoreGive(g_cfg_addr_mtx);
+    // Per-call addressing (def 3+4): latch this device's current NWK into
+    // ITS OWN slot (keyed on the stable ieee), so the converter-response
+    // bridges (Tuya sync-time etc.) resolve the right destination by
+    // device_index during the subsequent try_decode. No global address,
+    // no cross-device clobber — a different device's set_runtime_addr or a
+    // configure writes a DIFFERENT slot. Allocates the slot if first-seen
+    // so the very first frame's response routes correctly.
+    const std::uint16_t idx = resolve_device_index(ieee);
+    if (idx == kInvalidDeviceIndex) return;   // table full — logged once
+    SlotsLock lock;
+    if (idx < g_slot_count) g_slots[idx].cfg_nwk = nwk;
 }
 
 extern "C" bool zhac_adapter_send_bool(uint64_t ieee,

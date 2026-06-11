@@ -261,6 +261,83 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 - **metrics**: register `METRIC_MQTT_DROPPED_MSGS` in the shared
   metric registry; needed by F-07.
 
+### Fixed — High (P2 findings review, zhc_adapter slot table + decode locking)
+
+- **zhc_adapter**: the per-IEEE slot table (`g_slots` / `RuntimeStore
+  g_store`) was capped at 32 (`kMaxDevices`) while the network holds up
+  to `ZAP_MAX_DEVICES` (200). Device 33+ aliased onto slot index 0 —
+  permanently sharing device 0's `RuntimeStore` entry (press/hold timers,
+  Tuya action de-dup state corrupted across unrelated devices) and never
+  getting a def cache, so EVERY frame re-walked the 5500-def × 3-pass
+  registry on the radio task. Capped to `ZAP_MAX_DEVICES` (single source
+  of truth, included from `zap_common`); both `g_slots` (~4.8 KB) and the
+  grown `g_store` (~10.4 KB) moved to PSRAM via `EXT_RAM_BSS_ATTR`
+  (warm-path, never ISR) so the bump costs zero internal DRAM — the
+  32-entry `g_store` previously sat in internal `.bss`, so this nets a
+  small dram0 *saving* on S3. On genuine overflow the device is dropped
+  with a log-once `ESP_LOGE`, never aliased to slot 0. (F §9 def 1, :221)
+- **zhc_adapter**: `g_slots` / `g_slot_count` were mutated lock-free from
+  five tasks (radio `try_decode`, `configure`, command `dispatch_and_send`,
+  interview `register_endpoint`, httpd `resolve_supplement`) → duplicate
+  slots + torn `cached_def` reads. Added `s_slots_mtx` (global-ctor mutex,
+  matching the fallback pool's `PoolMtxInit` style) guarding the
+  append-only table and all lookups; callers now go through
+  `snapshot_slot` / `store_cached_defs` / `clear_cached_defs_for` so the
+  radio task never dereferences `g_slots` without the lock. Hold times are
+  short — NO registry walk / synth / radio I/O under the mutex.
+  **Lock order**: `s_slots_mtx` and the fallback `g_pool_mtx` are NEVER
+  nested — slot resolve releases before any `owns()`/synth takes the pool
+  lock, and the eviction walk (`invalidate_cached_defs_in`) holds the pool
+  lock but touches `g_slots` via word-atomic pointer clears + the
+  append-only invariant, so no inversion is possible. (F §9 def 2, :219)
+- **zhc_adapter**: `try_decode` (radio RX hot path) blocked `portMAX_DELAY`
+  on a shared addressing mutex (`g_cfg_addr_mtx`) that `zhac_adapter_
+  configure` held across `run_configure` — including 1500 ms Wait steps
+  and bind/report radio round-trips — causing multi-second frame-intake
+  stalls and a deadlock if a configure hook awaited a response the blocked
+  RX task delivers. **Removed the cross-call address globals
+  (`g_cfg_ieee` / `g_cfg_nwk` / `g_cfg_addr_mtx`) entirely.** The
+  library's `configure_*` bridge fn-ptrs carry the per-call
+  `device_index`; since the slot table is append-only that index stably
+  identifies the device, so each bridge now resolves its OWN destination
+  from `g_slots[idx]` (`ieee` + a new per-slot `cfg_nwk`, latched by
+  `zhac_adapter_set_runtime_addr` / `configure`). `try_decode` takes NO
+  lock for addressing — a configure on one device and a decode on another
+  use different slots and can't collide. The Tuya MCU sync-time / dataQuery
+  response path threads the per-call nwk through `ctx.device_nwk` from the
+  same slot, so converter replies route to the correct node.
+  (F §9 defs 3+4, :1086 / :1087)
+- **zhc_adapter**: unmatched devices are now negative-cached — a resolved
+  no-match tags the slot with a distinct `kMissSentinel` def-ptr (separate
+  from the `cached_supplement == primary` sentinel) so their frames skip
+  the 5500-def registry re-walk; cleared on `register_endpoint` /
+  `fallback_clear` / `invalidate_def_cache` so a device that later gains
+  cluster data and matches via synth is not masked. The per-frame "no
+  definition" resolve log demoted INFO → DEBUG. (F §9 def 5, :1001)
+- **zhc_adapter**: `dispatch_and_send` (command path) re-resolved the
+  definition on every command (full registry walk, or a fallback rebuild
+  for synth devices). It now reuses the per-IEEE `cached_def` that
+  `try_decode` maintains — snapshotted under `s_slots_mtx` and revalidated
+  via `zhc_fallback::owns()` (one-generation A/B lifetime rule) before
+  use, falling back to a fresh resolve only on miss. (F §9 def 6, :1137)
+- **zhc_adapter**: the ESP-IDF one-shot timer pool raced between the caller
+  (`idf_timer_schedule` / `_cancel`, decode/configure tasks) and the
+  `esp_timer` service task (`idf_timer_fire_thunk`) on the slot's `in_use`
+  / `handle` fields — a `_cancel` concurrent with a fire opened a
+  double-`esp_timer_delete` window and an ABA cancel of a reused slot id.
+  Slot transitions now run under a `portMUX` critical section (spinlock —
+  fire-thunk must not block), the deletable handle is claimed under the
+  lock and deleted outside it, and the `TimerId` is generation-tagged
+  (`gen << 16 | slot+1`) so a cancel of a slot reused since the id was
+  minted is a no-op. (F §9 def 7, :166)
+- **zhc_adapter (CMake)**: added `zap_common` to `PRIV_REQUIRES` for the
+  `ZAP_MAX_DEVICES` header.
+- **HW-GATE**: host build cannot exercise the radio path. Pending hardware
+  verification: decode burst during another device's configure (no
+  stall/deadlock), Tuya sync-time frames route to the correct nwk, and the
+  33rd+ device gets a real decode + its own runtime state (no index-0
+  aliasing).
+
 ### Fixed — High (P1 findings review, zigbee_pool)
 
 - **zigbee_mgr / zigbee_pool**: new locked-visitor API
