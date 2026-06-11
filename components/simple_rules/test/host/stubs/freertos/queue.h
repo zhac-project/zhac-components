@@ -19,3 +19,7 @@ void          vQueueDelete(QueueHandle_t q);
 // runaway flag and return pdFALSE so the test process survives to report.
 void stub_queue_set_receive_budget(unsigned long n);
 bool stub_queue_runaway(void);
+
+// Make the next xQueueCreate return nullptr (one-shot) — exercises the
+// allocation-failure path in event_bus_subscribe. Default off.
+void stub_queue_fail_next_create(void);

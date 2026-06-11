@@ -280,4 +280,53 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   across find + read/mutate. (F6/F35)
 - **zigbee_pool**: `s_hash_dirty` was missing `static` — internal hash
   state leaked into the global namespace.
-</content>
+
+### Fixed — High (P1 findings review, event_bus)
+
+- **event_bus**: drain-vs-unsubscribe use-after-free — `event_bus_drain`
+  read the subscriber table, blocked in `xQueueReceive`, and invoked the
+  handler with no lock at all; a concurrent `event_bus_unsubscribe` could
+  `vQueueDelete` the very queue the drain was blocked on and null the
+  `std::function` it was about to call. Drains now resolve the slot under
+  the bus lock, pin the queue with a per-slot `inflight` count across the
+  unlocked receive, and re-validate the subscription generation after every
+  wake before dispatching (on a private handler copy, taken once per drain
+  call). Unsubscribe never deletes a queue with users in flight: it marks
+  the slot dying, wakes blocked drainers with a poison event, and the queue
+  is reaped by a later publish/subscribe/drain once `inflight` hits 0
+  (`s_dying` gates the scan, so the publish hot path pays one compare).
+- **event_bus**: publish held the single global mutex across the whole
+  fan-out including user filter callbacks — one slow filter stalled every
+  publisher, and filters re-entered the bus with the lock held (cross-task
+  ordering deadlock surface; device_shadow publishes while holding its own
+  mutex). Publish now snapshots queue handles + filter copies (copied only
+  when non-null — no in-tree subscriber sets one) under the lock and
+  evaluates filters / sends outside it, pinned by `inflight`.
+- **event_bus**: handles are now generation-stamped
+  (`[type|gen|pos]` packing, still `uint16_t`/opaque) and bumped on both
+  subscribe and unsubscribe — a stale double-unsubscribe after slot reuse
+  previously deleted the new subscriber's queue; now it is rejected and
+  logged. Residual: `uint8_t` gen wraps after 256 sub/unsub cycles on one
+  slot (documented; memory-safe either way, and nothing in-tree even calls
+  unsubscribe today).
+- **event_bus**: `xQueueCreate` failure in subscribe was `configASSERT`-only
+  — with asserts compiled out the null queue was stored and the handler ran
+  synchronously under the global lock. Now unlocks and returns
+  `EVENT_SUB_INVALID` (the queue-less direct-handler publish path is gone
+  with it).
+- **event_bus**: new `event_bus_drain_handle(handle, timeout_ms)` drains
+  exactly one subscription; `event_bus_drain(type, …)` is kept (deprecated
+  by comment — `[[deprecated]]` would `-Werror` the in-tree single-
+  dispatcher main loop, which intentionally drains all types in one task)
+  and rebuilt on the same gen+inflight core, preserving its
+  timeout-on-first-queue semantics.
+- **event_bus**: unsubscribe also clears the slot's `filter` (its captures
+  leaked before); `event_bus_init` is re-init-guarded (warn + no-op — a
+  second call used to wipe the table, leaking every live queue and
+  orphaning all subscriptions; house style per hap_session Q19);
+  `EVENT_TYPE_COUNT` now derives from a new `EventType::_COUNT` enum
+  sentinel instead of a hand-maintained `11` (source-only; the 96-byte
+  payload ABI asserts are untouched). Host test harness added at
+  `components/event_bus/test/host/` reusing the simple_rules shims (which
+  gained a one-shot `stub_queue_fail_next_create()` knob); also removed a
+  stray `</content>` paste artifact that ended this file.

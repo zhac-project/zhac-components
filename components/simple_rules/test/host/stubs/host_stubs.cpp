@@ -43,7 +43,12 @@ void stub_queue_set_receive_budget(unsigned long n) {
 
 bool stub_queue_runaway(void) { return s_runaway; }
 
+static bool s_fail_next_create = false;
+
+void stub_queue_fail_next_create(void) { s_fail_next_create = true; }
+
 QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size) {
+    if (s_fail_next_create) { s_fail_next_create = false; return nullptr; }
     auto* q = static_cast<StubQueue*>(calloc(1, sizeof(StubQueue)));
     if (!q) return nullptr;
     q->buf = static_cast<uint8_t*>(calloc(length, item_size));

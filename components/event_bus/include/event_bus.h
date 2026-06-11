@@ -17,6 +17,12 @@ enum class EventType : uint8_t {
     MQTT_MSG         = 8,   // MQTT message received
     RULE_EVENT       = 9,   // custom named event (rule chaining)
     RULE_TIMER_FIRE  = 10,  // rule timer N fired
+
+    // Sentinel — one past the highest valid type. Sizes the subscriber
+    // table (event_bus.cpp); NOT a publishable type. Keep last. Source-only
+    // addition: no payload struct references it, so the 96-byte event ABI
+    // is untouched.
+    _COUNT,
 };
 
 // ── ZCL_ATTR payload (one attribute per event) — string-keyed, 96 B ──────
@@ -97,10 +103,41 @@ void           event_bus_publish(const Event& e);
 
 // Subscribe to events of the given type. Optionally supply a filter predicate
 // so the subscriber only receives matching events (e.g. a specific IEEE address).
+// The filter is COPIED into the publish snapshot on every matching publish and
+// runs outside the bus lock — keep captures small (SSO-sized) and non-blocking.
+// Returns EVENT_SUB_INVALID on bad type, full table, or queue allocation
+// failure. Handles are generation-stamped: a handle outlives its subscription
+// only as a safely-rejected stale value.
 EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
                                    EventFilter filter = nullptr);
+
+// Remove a subscription. Generation-checked: a stale or double unsubscribe is
+// ignored (logged). Contract:
+//   - After return, no NEW handler/filter invocation begins for this handle
+//     (drains re-validate the generation before dispatching). One delivery
+//     that already passed validation concurrently with this call may still
+//     complete — it runs on a private std::function copy, so captures stay
+//     valid for that delivery even though the slot's handler/filter are
+//     cleared here.
+//   - The backing queue may outlive this call while drains/publishes are
+//     in flight on it; it is reclaimed (vQueueDelete) by a later
+//     publish/subscribe/drain once no task can be inside a queue op.
+//   - A drain blocked on this subscription's queue is woken with a poison
+//     event and returns without dispatching it.
 void           event_bus_unsubscribe(EventSubHandle handle);
 
-// Drain queued events for a given type — call from subscriber task.
-// Returns number of events processed.
+// Drain queued events for ONE subscription — call from the subscriber's own
+// task. Returns the number of events dispatched; 0 for a stale/invalid handle.
+// Blocks up to timeout_ms for the first event, then drains greedily.
+// Safe against concurrent unsubscribe (generation re-validated after every
+// queue wake; the queue cannot be deleted while a drain is inside it).
+uint8_t event_bus_drain_handle(EventSubHandle handle, uint32_t timeout_ms);
+
+// DEPRECATED — drain ALL subscriptions of a type in the calling task; with
+// 2+ subscribers their handlers all execute here, in whatever task drains
+// first, and the blocking timeout applies only to the first queue. Kept for
+// the single-dispatcher main loop (P4 task_event_bus); new code should keep
+// its EventSubHandle and use event_bus_drain_handle(). Comment-only
+// deprecation: [[deprecated]] would -Werror existing in-tree callers.
+// Returns number of events processed across all subscriptions.
 uint8_t event_bus_drain(EventType type, uint32_t timeout_ms);
