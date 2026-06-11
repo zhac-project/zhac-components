@@ -17,7 +17,7 @@
 //     defer (DYING), the next received event must fail gen re-validation
 //     and not dispatch, and drain exit must reap the queue.
 // Not coverable single-threaded: a DYING slot surviving past drain exit
-// (reap-on-next-publish then runs its s_dying==0 fast path only).
+// (reap-on-next-publish then runs its s_dying_count==0 fast path only).
 #include "event_bus.h"
 #include "freertos/queue.h"   // host shim instrumentation
 

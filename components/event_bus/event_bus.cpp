@@ -16,6 +16,7 @@ static constexpr uint8_t QUEUE_DEPTH       = 16;
 // ── Subscription slots ────────────────────────────────────────────────────
 //
 // Slot lifecycle:   FREE ──subscribe──▶ ACTIVE ──unsubscribe──▶ FREE | DYING
+//                   DYING ──reap_locked(inflight==0)──▶ FREE   (poison-woken)
 //   FREE   queue == nullptr, !alive           (gen persists across reuse)
 //   ACTIVE queue != nullptr,  alive
 //   DYING  queue != nullptr, !alive — unsubscribed while publishes/drains
@@ -31,9 +32,10 @@ struct SubEntry {
     // the returned handle. A stale handle (slot since unsubscribed and/or
     // reused) fails the gen check in unsubscribe/drain instead of acting on
     // the new occupant (pre-fix: stale double-unsubscribe deleted the new
-    // subscriber's queue). ABA residual: uint8 wraps after 256 sub/unsub
-    // cycles on the SAME slot, so a handle retained across exactly k*256
-    // cycles could false-validate — accepted: in-tree code never even calls
+    // subscriber's queue). ABA residual: uint8 wraps after 128 sub/unsub
+    // cycles on the SAME slot (gen bumps twice per sub/unsub cycle), so a
+    // handle retained across exactly k*128 cycles could
+    // false-validate — accepted: in-tree code never even calls
     // unsubscribe today, every access is still memory-safe (gen+alive gate
     // queue use; queues are reaped via inflight), and widening gen would
     // break the 16-bit EventSubHandle ABI.
@@ -53,7 +55,7 @@ static SubEntry s_subs[EVENT_TYPE_COUNT][MAX_SUBS_PER_TYPE];
 static uint8_t  s_sub_hwm[EVENT_TYPE_COUNT];
 // Count of DYING slots across all types — gates the reap scan so the publish
 // hot path pays one integer compare when nothing is pending deletion.
-static uint8_t  s_dying = 0;
+static uint8_t  s_dying_count = 0;
 static bool     s_inited = false;
 
 // ── Handle packing ────────────────────────────────────────────────────────
@@ -98,14 +100,14 @@ static void recalc_hwm_locked(uint8_t t) {
 // raised under the lock, so inflight == 0 here proves no task is inside —
 // or can newly enter (gen already bumped) — a queue op on the handle.
 static void reap_locked() {
-    if (s_dying == 0) return;
-    for (uint8_t t = 1; t < EVENT_TYPE_COUNT && s_dying > 0; t++) {
+    if (s_dying_count == 0) return;
+    for (uint8_t t = 1; t < EVENT_TYPE_COUNT && s_dying_count > 0; t++) {
         for (uint8_t i = 0; i < MAX_SUBS_PER_TYPE; i++) {
             SubEntry& s = s_subs[t][i];
             if (!s.alive && s.queue && s.inflight == 0) {
                 vQueueDelete(s.queue);
                 s.queue = nullptr;
-                s_dying--;
+                s_dying_count--;
                 recalc_hwm_locked(t);
             }
         }
@@ -132,7 +134,7 @@ void event_bus_init() {
             s_subs[t][i].alive    = false;
         }
     }
-    s_dying  = 0;
+    s_dying_count  = 0;
     s_inited = true;
     ESP_LOGI(TAG, "event_bus init OK");
 }
@@ -224,7 +226,7 @@ void event_bus_unsubscribe(EventSubHandle handle) {
         // queue wakes the drainer by itself.
         Event poison{};
         (void)xQueueSend(s.queue, &poison, 0);
-        s_dying++;
+        s_dying_count++;
     }
     bus_unlock();
 
@@ -246,6 +248,7 @@ void event_bus_publish(const Event& e) {
     // SSO-sized captures don't heap-allocate, so the per-publish cost on the
     // hot path (every device attr event) is nil. `inflight` pins each
     // snapshotted queue against deletion by a concurrent unsubscribe+reap.
+    // Snapshot costs ~0.3 KB caller stack (Target[8], std::function-dominated).
     struct Target {
         QueueHandle_t q;
         EventFilter   filter;
@@ -334,6 +337,10 @@ static uint8_t drain_slot(uint8_t idx, uint8_t pos, uint8_t gen, uint32_t timeou
 
     bus_lock();
     s.inflight--;
+    if (!s.alive && s.queue && s.inflight > 0) {
+        Event poison{};                      // hand the wake on to the next blocked drainer
+        (void)xQueueSend(s.queue, &poison, 0);
+    }
     reap_locked();   // we may have been the last user of a dying queue
     bus_unlock();
     return count;

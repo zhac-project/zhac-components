@@ -99,6 +99,11 @@ using EventSubHandle = uint16_t;
 static constexpr EventSubHandle EVENT_SUB_INVALID = 0xFFFF;
 
 void           event_bus_init();
+
+// Publish an event to every live subscriber of e.type. Per-subscriber FIFO
+// ordering; on a full queue the OLDEST event is overwritten (newest wins).
+// Never blocks. Subscriber filters run here, in the publisher's task — keep
+// them fast. An invalid/sentinel type is a silent no-op.
 void           event_bus_publish(const Event& e);
 
 // Subscribe to events of the given type. Optionally supply a filter predicate
@@ -131,11 +136,15 @@ void           event_bus_unsubscribe(EventSubHandle handle);
 // Blocks up to timeout_ms for the first event, then drains greedily.
 // Safe against concurrent unsubscribe (generation re-validated after every
 // queue wake; the queue cannot be deleted while a drain is inside it).
+// Intended one drainer per subscription (the owning task); concurrent drains
+// on the same handle compete for events.
 uint8_t event_bus_drain_handle(EventSubHandle handle, uint32_t timeout_ms);
 
 // DEPRECATED — drain ALL subscriptions of a type in the calling task; with
 // 2+ subscribers their handlers all execute here, in whatever task drains
-// first, and the blocking timeout applies only to the first queue. Kept for
+// first, and the blocking timeout applies only to the first queue. The full
+// timeout may be consumed blocking on an empty first queue while later
+// queues already hold events. Kept for
 // the single-dispatcher main loop (P4 task_event_bus); new code should keep
 // its EventSubHandle and use event_bus_drain_handle(). Comment-only
 // deprecation: [[deprecated]] would -Werror existing in-tree callers.
