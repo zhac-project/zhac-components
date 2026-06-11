@@ -150,6 +150,24 @@ bool zigbee_pool_with_device_by_nwk(uint16_t nwk,
     return dev != nullptr;
 }
 
+bool zigbee_pool_snapshot(uint64_t ieee, ZapDevice* out) {
+    if (!out) return false;
+    lock();
+    const ZapDevice* dev = pool_find_by_ieee(ieee);
+    if (dev) *out = *dev;
+    unlock();
+    return dev != nullptr;
+}
+
+bool zigbee_pool_snapshot_by_nwk(uint16_t nwk, ZapDevice* out) {
+    if (!out) return false;
+    lock();
+    const ZapDevice* dev = pool_find_by_nwk(nwk);
+    if (dev) *out = *dev;
+    unlock();
+    return dev != nullptr;
+}
+
 // ── Add / Remove ─────────────────────────────────────────────────────────────
 ZapDevice* pool_add() {
     lock();

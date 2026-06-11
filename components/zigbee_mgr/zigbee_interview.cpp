@@ -259,7 +259,8 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     // unlock; a concurrent swap-with-last pool_remove could relocate the
     // slot and a late write would land on the wrong record. The pipeline
     // now runs entirely on `work`, a detached stack copy taken under the
-    // lock (522 B, zb_interview stack is 8 KiB), and the results are
+    // lock (`work` + the commit-block `snap` ≈ 1044 B of the 8 KiB
+    // zb_interview stack), and the results are
     // committed field-by-field under a re-acquired lock at the end (see
     // the commit block) — skipped if the device vanished mid-interview.
     ZapDevice work = *dev;

@@ -68,7 +68,8 @@ ZapDevice* pool_find_by_nwk(uint16_t nwk);
 
 // ── Locked visitor API ──────────────────────────────────────────────
 // Runs fn(dev, ctx) under the pool mutex iff the device exists; returns
-// false when the device is absent (fn not called). The mutex held is the
+// false when the device is absent (fn not called) — and also when fn is
+// null, so false strictly means "fn did not run". The mutex held is the
 // same internal recursive mutex taken by zigbee_pool_lock() and by every
 // pool mutator, so pool_remove()'s swap-with-last cannot retarget the
 // slot while fn runs — the pointer handed to fn is valid for exactly
@@ -84,6 +85,13 @@ bool zigbee_pool_with_device(uint64_t ieee,
 bool zigbee_pool_with_device_by_nwk(uint16_t nwk,
                                     void (*fn)(ZapDevice* dev, void* ctx),
                                     void* ctx);
+
+// Locked find+copy convenience: snapshot the device into *out under the
+// pool mutex — pattern (a) above without the boilerplate. Returns false
+// if absent (also when out/fn args invalid — callers only need
+// exists/ran; failures inside visitors flow via ctx).
+bool zigbee_pool_snapshot(uint64_t ieee, ZapDevice* out);
+bool zigbee_pool_snapshot_by_nwk(uint16_t nwk, ZapDevice* out);
 
 // Force hash rebuild on the next lookup. Must be called after in-place
 // mutation of any field consulted by pool_find_by_nwk (currently

@@ -254,7 +254,9 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   `pool_find_by_ieee` / `pool_find_by_nwk` doc-comments now spell out the
   hazard: the returned pointer is only valid under `zigbee_pool_lock()` —
   snapshot under lock (house pattern, `zhc_shadow_bridge.cpp`) or use the
-  visitor. (F6/F35)
+  visitor; plus `zigbee_pool_snapshot(ieee, out)` /
+  `zigbee_pool_snapshot_by_nwk(nwk, out)` — locked find+copy convenience
+  wrapping the snapshot pattern for pure-copy callers. (F6/F35)
 - **zigbee_mgr**: `zcl_attr_task` no longer dereferences the
   `pool_find_by_nwk` pointer across the liveness write and the
   multi-second `zhac_adapter_try_decode` — find + liveness stamp +
