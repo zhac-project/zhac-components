@@ -381,13 +381,30 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
             uint32_t ms = (uint32_t)strtoul(a.arg1, nullptr, 10);
             if (ms == 0) ms = 1;
             TimerHandle_t& tmr = s_timers[idx - 1];
+            // P1-T8: block-time-0 timer commands return pdFAIL on a full
+            // timer command queue — previously ignored, so the rule's
+            // timer action was silently lost. Warn (once per boot, this
+            // can fire per event under a storm) so it's visible.
+            bool armed = true;
             if (tmr) {
-                xTimerChangePeriod(tmr, pdMS_TO_TICKS(ms), 0);
-                xTimerReset(tmr, 0);
+                if (xTimerChangePeriod(tmr, pdMS_TO_TICKS(ms), 0) != pdPASS)
+                    armed = false;
+                if (xTimerReset(tmr, 0) != pdPASS)
+                    armed = false;
             } else {
                 tmr = xTimerCreate("rule_tmr", pdMS_TO_TICKS(ms),
                                    pdFALSE, (void*)(uintptr_t)(uint8_t)idx, timer_cb);
-                if (tmr) xTimerStart(tmr, 0);
+                if (!tmr || xTimerStart(tmr, 0) != pdPASS)
+                    armed = false;
+            }
+            if (!armed) {
+                static bool s_timer_warned = false;
+                if (!s_timer_warned) {
+                    s_timer_warned = true;
+                    ESP_LOGW(TAG, "timer %d: arm failed (command queue full "
+                                  "or create failed) — action lost; further "
+                                  "drops suppressed", idx);
+                }
             }
             break;
         }

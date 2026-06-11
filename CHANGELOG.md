@@ -421,3 +421,54 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   expected IEEE under the flush lock, and slot reuse during a write is
   structurally impossible (the free-list skips non-FREE slots, and a
   FLUSHING slot is not FREE).
+
+### Fixed — High (P1 findings review, NVS error propagation)
+
+- **zap_common**: new header-only `nvs_checked.h` — `nvs_seq(&acc, op,
+  TAG, "what")` logs every failing NVS op and accumulates the first
+  error of a multi-op sequence, making the honest check-every-return
+  pattern a one-liner. Host ctest suite added at `zap_common/test/host/`
+  (local esp_err/esp_log shims with an ESP_LOGE counter).
+- **zap_store**: the schema-mismatch wipe ignored
+  `nvs_erase_all`/`nvs_set_u16`/`nvs_commit` (:107 pre-fix) — a failed
+  erase followed by the version overwrite would present stale-layout
+  blobs as current. The version marker is now written only after a clean
+  erase and every op is checked (first-boot marker write checked too).
+  "Device saved" was logged even when the commit failed (:195 pre-fix);
+  the log is gated on the commit now and the commit error is logged (the
+  return value was already honest). The delete-path erase-all/rewrite
+  loop ignored per-key erase/set errors and committed anyway
+  (:259-:265 pre-fix) — it now aborts WITHOUT the commit on the first
+  failure, so a half-compacted slot table can never become durable.
+- **rule_store**: the boot-time schema check ignored its
+  `set_u16`/`commit` returns (:91 pre-fix) — a failed marker write
+  silently re-wiped the rule store on every boot. Each op now logs its
+  failure (marker written only after a clean wipe). Corrupt-entry
+  cleanup erases (load + load_all) stay best-effort but log failures.
+- **rule_store**: tombstone tri-state (T9 follow-up).
+  `rule_store_delete` collapsed "not found" and "erase/commit failed"
+  into one `false`, and the flush settle forced tombstones ok — a
+  genuine erase failure cleaned the tombstone and the deleted rule
+  resurrected from NVS on reboot. New internal
+  `rule_store_delete_err()` distinguishes `ESP_OK` /
+  `ESP_ERR_NVS_NOT_FOUND` / failure; the flush settles not-found
+  (nothing was stored) and keeps the slot pending for next-tick retry on
+  real failures, per the T9 FLUSHING protocol. Public bool API and
+  semantics unchanged (no external callers; not-found no longer spams
+  ESP_LOGE from the tombstone path).
+- **device_shadow**: the v7 version bump ignored
+  `erase_all`/`set_u8`/`commit` (:469 pre-fix) — a failed erase plus the
+  marker overwrite would hide stale v6 blobs behind the v7 marker. The
+  marker is now written only after a clean erase; the attr-cache clear's
+  `erase_key`+`commit` are checked too (not-found stays silent — the
+  device may never have persisted).
+- **zap_store / rule_store flush**: `xTaskCreate` returns were ignored
+  and `s_task_started` stayed true on failure (zap :206 pre-fix) — dirty
+  marks would defer into a table no task ever drains (silent persistence
+  loss). On create failure the flag rolls back so marks fall through to
+  the direct-save/delete path, and the failure is logged.
+- **simple_rules**: the TIMER action's block-time-0
+  `xTimerChangePeriod`/`xTimerReset`/`xTimerStart` (and `xTimerCreate`)
+  returns were ignored (:364 pre-fix) — on a full timer command queue
+  the timer action was silently lost. Arm failures now warn once per
+  boot.

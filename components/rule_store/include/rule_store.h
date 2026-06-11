@@ -13,7 +13,9 @@ bool rule_store_save(const RuleSlot* slot);
 // Load a single RuleSlot by rule_id. Returns false if not found.
 bool rule_store_load(uint16_t rule_id, RuleSlot* out);
 
-// Delete a rule. Returns false if not found.
+// Delete a rule. Returns false if not found OR if the erase/commit
+// failed (the flush path distinguishes the two via the internal
+// rule_store_delete_err tri-state).
 bool rule_store_delete(uint16_t rule_id);
 
 // Load all saved RuleSlots into out[0..max_count-1]. Returns count loaded.

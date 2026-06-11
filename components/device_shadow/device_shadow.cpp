@@ -14,6 +14,7 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "nvs_checked.h"
 #include "esp_rom_crc.h"   // F26: esp_rom_crc32_le for blob integrity
 #include <cstring>
 #include <cstdio>
@@ -670,10 +671,21 @@ void device_shadow_init() {
     if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
         if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
-            nvs_erase_all(s_nvs);
-            nvs_set_u8(s_nvs, "ver", NVS_SHADOW_VERSION);
-            nvs_commit(s_nvs);
-            ESP_LOGW(TAG, "shadow NVS format upgraded v%d — cache cleared", NVS_SHADOW_VERSION);
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, nvs_erase_all(s_nvs), TAG, "erase_all shadow");
+            if (acc == ESP_OK) {
+                // Version marker only after a clean wipe — writing v7 over
+                // a failed erase would park stale v6 blobs behind the new
+                // marker (the F26 header check rejects them on load, but
+                // the namespace must not claim an upgrade it didn't do).
+                nvs_seq(&acc, nvs_set_u8(s_nvs, "ver", NVS_SHADOW_VERSION),
+                        TAG, "set_u8 ver");
+                nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit ver");
+            }
+            if (acc == ESP_OK)
+                ESP_LOGW(TAG, "shadow NVS format upgraded v%d — cache cleared", NVS_SHADOW_VERSION);
+            else
+                ESP_LOGE(TAG, "shadow NVS upgrade incomplete — retried next boot");
         }
     } else {
         // SHA-F12: surface the consequence — without persistence the
@@ -911,8 +923,12 @@ void device_shadow_clear_attrs(uint64_t ieee) {
     if (found && s_nvs) {
         char key[16];
         shadow_key(key, 'a', ieee);   // Q76: full 64-bit IEEE, base36
-        nvs_erase_key(s_nvs, key);
-        nvs_commit(s_nvs);
+        esp_err_t e = nvs_erase_key(s_nvs, key);
+        if (e != ESP_ERR_NVS_NOT_FOUND) {  // never persisted → nothing to do
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, e, TAG, "erase_key attr clear");
+            nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit attr clear");
+        }
     }
     ESP_LOGI(TAG, "Cleared shadow attr cache ieee=0x%016llX", (unsigned long long)ieee);
 }

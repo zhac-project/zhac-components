@@ -4,6 +4,7 @@
 #include "zap_store.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "nvs_checked.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
@@ -104,14 +105,26 @@ void zap_store_init() {
                 ESP_LOGW(TAG, "NVS schema version mismatch: stored=%u current=%u — "
                          "erasing device store",
                          stored_ver, ZAP_STORE_SCHEMA_VERSION);
-                nvs_erase_all(h);
-                nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION);
-                nvs_commit(h);
+                esp_err_t acc = ESP_OK;
+                nvs_seq(&acc, nvs_erase_all(h), TAG, "erase_all devpool");
+                if (acc == ESP_OK) {
+                    // Version marker only after a clean wipe — writing the
+                    // new version over a failed erase would let stale-layout
+                    // blobs sit behind the current marker.
+                    nvs_seq(&acc, nvs_set_u16(h, "schema_ver",
+                                              ZAP_STORE_SCHEMA_VERSION),
+                            TAG, "set_u16 schema_ver");
+                    nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
+                }
+                if (acc != ESP_OK)
+                    ESP_LOGE(TAG, "schema wipe incomplete — retried next boot");
             }
         } else {
             // First boot with versioning — write current version
-            nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION);
-            nvs_commit(h);
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION),
+                    TAG, "set_u16 schema_ver");
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
         }
         nvs_close(h);
     }
@@ -181,19 +194,23 @@ bool zap_store_save_device(const ZapDevice* dev) {
         return false;
     }
 
-    err = nvs_commit(h);
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool save");
     nvs_close(h);
 
     // F16: keep the index in sync on success. NVS commits atomically, so on
     // failure NVS is unchanged and the index must stay as-is.
-    if (err == ESP_OK && idx < ZAP_MAX_DEVICES) {
+    if (acc == ESP_OK && idx < ZAP_MAX_DEVICES) {
         s_idx_ieee[idx] = dev->ieee_addr;
         if (idx >= s_idx_count) s_idx_count = static_cast<uint16_t>(idx + 1);
     }
     store_unlock();
 
-    ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
-    return err == ESP_OK;
+    // Success log gated on the commit — a failed save must not read as
+    // "Device saved" in the log while the function returns false.
+    if (acc == ESP_OK)
+        ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
+    return acc == ESP_OK;
 }
 
 // ── Delete device — atomic read-all / erase-all / rewrite / commit ───────
@@ -253,25 +270,27 @@ bool zap_store_delete_device(uint64_t ieee) {
         h = open_ns(NVS_READWRITE);
         if (!h) break;
 
+        // Any erase/rewrite failure aborts WITHOUT the commit: a partial
+        // rewrite must not become durable (committing after a failed
+        // erase/set could persist a half-compacted slot table).
+        esp_err_t acc = ESP_OK;
         uint16_t old_count = count + 1;  // +1 for the removed device
-        for (uint16_t i = 0; i < old_count; i++) {
+        for (uint16_t i = 0; i < old_count && acc == ESP_OK; i++) {
             char key[8]; dev_key(key, i);
-            nvs_erase_key(h, key);
+            nvs_seq(&acc, nvs_erase_key(h, key), TAG, "erase_key devpool");
         }
-        for (uint16_t i = 0; i < count; i++) {
+        for (uint16_t i = 0; i < count && acc == ESP_OK; i++) {
             char key[8]; dev_key(key, i);
-            nvs_set_blob(h, key, &devs[i], sizeof(ZapDevice));
+            nvs_seq(&acc, nvs_set_blob(h, key, &devs[i], sizeof(ZapDevice)),
+                    TAG, "set_blob devpool");
         }
-        nvs_set_u16(h, "cnt", count);
-
-        esp_err_t err = nvs_commit(h);
+        if (acc == ESP_OK)
+            nvs_seq(&acc, nvs_set_u16(h, "cnt", count), TAG, "set_u16 cnt");
+        if (acc == ESP_OK)
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool delete");
         nvs_close(h);
 
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "nvs_commit failed during delete: %s",
-                     esp_err_to_name(err));
-            break;
-        }
+        if (acc != ESP_OK) break;
         ok = true;
     } while (0);
 

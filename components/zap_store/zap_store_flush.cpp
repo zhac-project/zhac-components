@@ -313,5 +313,13 @@ void zap_store_flush_init() {
     if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
     configASSERT(s_mtx);
     s_task_started = true;
-    xTaskCreate(flush_task, "zap_flush", zhac::stack::kZapFlush, nullptr, 3, nullptr);
+    if (xTaskCreate(flush_task, "zap_flush", zhac::stack::kZapFlush,
+                    nullptr, 3, nullptr) != pdPASS) {
+        // P1-T8: with the flag left true, dirty marks would defer into a
+        // table no task ever drains (silent persistence loss). Roll back
+        // so marks fall through to the immediate-save path.
+        s_task_started = false;
+        ESP_LOGE(TAG, "flush task create failed — writeback disabled, "
+                      "saves go direct to NVS");
+    }
 }

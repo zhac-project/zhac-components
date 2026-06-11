@@ -17,6 +17,7 @@
 #include "rule_store.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"   // ESP_ERR_NVS_NOT_FOUND for the tombstone settle
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +26,11 @@
 #include "task_stacks.h"
 
 static const char* TAG = "rule_flush";
+
+// Tri-state delete from rule_store.cpp (P1-T8): ESP_OK = erased+committed,
+// ESP_ERR_NVS_NOT_FOUND = nothing stored (settles a tombstone), anything
+// else = erase/commit failure (tombstone must stay pending and retry).
+extern "C" esp_err_t rule_store_delete_err(uint16_t rule_id);
 
 static constexpr uint32_t FLUSH_TICK_MS   = 1000;
 static constexpr uint32_t MAX_AGE_MS      = 5 * 1000;
@@ -114,11 +120,17 @@ static bool flush_slot(size_t idx) {
             ESP_LOGE(TAG, "flush failed rule_id=0x%04x — retrying next tick",
                      snap.rule_id);
     } else if (snap.state == TOMBSTONE) {
-        // rule_store_delete returns false if nothing was stored — that's
-        // fine for a tombstone created before any commit landed. Don't
-        // retry in that case.
-        (void)rule_store_delete(snap.rule_id);
-        ok = true;
+        // Tri-state settle (P1-T8): not-found is fine for a tombstone
+        // created before any commit landed — nothing to erase, settle it.
+        // A genuine erase/commit failure must keep the tombstone pending
+        // (retry next tick per the FLUSHING protocol): settling it would
+        // let the deleted rule resurrect from NVS on reboot.
+        esp_err_t de = rule_store_delete_err(snap.rule_id);
+        ok = (de == ESP_OK) || (de == ESP_ERR_NVS_NOT_FOUND);
+        if (!ok)
+            ESP_LOGE(TAG, "tombstone flush failed rule_id=0x%04x: %s — "
+                          "retrying next tick",
+                     snap.rule_id, esp_err_to_name(de));
     }
 
     // Settle. Only we (the flushing owner) may clean the slot; marks that
@@ -321,5 +333,13 @@ void rule_store_flush_init() {
     // 3072 was overflowing under burst: due[DIRTY_CAP]=256B + NVS commit
     // path (~2 KB) + printf in log line (~1.5 KB) easily exceeds. 6144
     // gives ~2x headroom and matches other NVS-touching tasks.
-    xTaskCreate(flush_task, "rule_flush", zhac::stack::kRuleFlush, nullptr, 3, nullptr);
+    if (xTaskCreate(flush_task, "rule_flush", zhac::stack::kRuleFlush,
+                    nullptr, 3, nullptr) != pdPASS) {
+        // P1-T8: with the flag left true, marks would defer into a table
+        // no task ever drains. Roll back so they fall through to the
+        // direct rule_store_save/_delete path.
+        s_task_started = false;
+        ESP_LOGE(TAG, "flush task create failed — writeback disabled, "
+                      "edits go direct to NVS");
+    }
 }

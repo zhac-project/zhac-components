@@ -3,6 +3,7 @@
 #include "rule_store.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "nvs_checked.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
@@ -58,14 +59,18 @@ static bool rule_store_load_unlocked(uint16_t rule_id, RuleSlot* out) {
     if (len != sizeof(RuleSlot)) {
         ESP_LOGW(TAG, "size mismatch rule_id=0x%04x (%u != %u) — erasing",
                  rule_id, (unsigned)len, (unsigned)sizeof(RuleSlot));
-        nvs_erase_key(s_nvs, key);
-        nvs_commit(s_nvs);
+        // Best-effort cleanup — a failed erase only means the corrupt blob
+        // re-logs on the next load; surface it instead of hiding it.
+        esp_err_t acc = ESP_OK;
+        nvs_seq(&acc, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
+        nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
         return false;
     }
     if (out->crc32 != rule_slot_crc(out)) {
         ESP_LOGW(TAG, "CRC32 mismatch rule_id=0x%04x — erasing", rule_id);
-        nvs_erase_key(s_nvs, key);
-        nvs_commit(s_nvs);
+        esp_err_t acc = ESP_OK;
+        nvs_seq(&acc, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
+        nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
         return false;
     }
     return true;
@@ -87,13 +92,25 @@ void rule_store_init() {
         if (stored_ver != RULE_STORE_SCHEMA_VERSION) {
             ESP_LOGE(TAG, "rule_store schema mismatch stored=%u current=%u — wiping",
                      stored_ver, RULE_STORE_SCHEMA_VERSION);
-            nvs_erase_all(s_nvs);
-            nvs_set_u16(s_nvs, "schema_ver", RULE_STORE_SCHEMA_VERSION);
-            nvs_commit(s_nvs);
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, nvs_erase_all(s_nvs), TAG, "erase_all rules");
+            if (acc == ESP_OK) {
+                // Version marker only after a clean wipe (see zap_store).
+                nvs_seq(&acc, nvs_set_u16(s_nvs, "schema_ver",
+                                          RULE_STORE_SCHEMA_VERSION),
+                        TAG, "set_u16 schema_ver");
+                nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit schema_ver");
+            }
+            // A failed marker write means this wipe repeats every boot —
+            // that was silent before; now each failing op logs above.
+            if (acc != ESP_OK)
+                ESP_LOGE(TAG, "schema wipe incomplete — re-wiped next boot");
         }
     } else {
-        nvs_set_u16(s_nvs, "schema_ver", RULE_STORE_SCHEMA_VERSION);
-        nvs_commit(s_nvs);
+        esp_err_t acc = ESP_OK;
+        nvs_seq(&acc, nvs_set_u16(s_nvs, "schema_ver", RULE_STORE_SCHEMA_VERSION),
+                TAG, "set_u16 schema_ver");
+        nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit schema_ver");
     }
     ESP_LOGI(TAG, "rule_store ready (namespace=%s, schema=%u)", NVS_NS, RULE_STORE_SCHEMA_VERSION);
 }
@@ -126,16 +143,34 @@ bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
     return ok;
 }
 
-bool rule_store_delete(uint16_t rule_id) {
-    if (!s_nvs) return false;
+// Tri-state delete (P1-T8, T9 follow-up). Returns:
+//   ESP_OK                 — erased and committed;
+//   ESP_ERR_NVS_NOT_FOUND  — nothing stored under the key (a tombstone
+//                            for a never-committed rule settles on this);
+//   ESP_ERR_INVALID_STATE  — store unavailable (nvs_open failed at init);
+//   anything else          — erase/commit failure, caller must retry.
+// The old bool API collapsed not-found and erase-failure into `false`,
+// which let rule_store_flush settle a tombstone whose erase genuinely
+// failed — the deleted rule resurrected from NVS on reboot.
+// extern "C" so rule_store_flush.cpp declares it without a header round
+// trip (same pattern as the overlay hooks above).
+extern "C" esp_err_t rule_store_delete_err(uint16_t rule_id) {
+    if (!s_nvs) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     char key[8];
     snprintf(key, sizeof(key), "r_%04X", rule_id);
     esp_err_t err = nvs_erase_key(s_nvs, key);
     if (err == ESP_OK) err = nvs_commit(s_nvs);
-    if (err != ESP_OK) ESP_LOGE(TAG, "rule_store_delete: %s", esp_err_to_name(err));
     xSemaphoreGive(s_mutex);
-    return (err == ESP_OK);
+    // not-found is an expected outcome (delete of a never-persisted rule),
+    // not an error — don't spam the log for it.
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+        ESP_LOGE(TAG, "rule_store_delete: %s", esp_err_to_name(err));
+    return err;
+}
+
+bool rule_store_delete(uint16_t rule_id) {
+    return rule_store_delete_err(rule_id) == ESP_OK;  // not-found stays false
 }
 
 // Overlay iteration callback: removes tombstoned rules from the NVS
@@ -216,12 +251,14 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     }
     if (it) nvs_release_iterator(it);
 
+    esp_err_t eacc = ESP_OK;
     for (size_t i = 0; i < bad_n; i++) {
-        if (nvs_erase_key(s_nvs, bad_keys[i]) == ESP_OK) {
+        if (nvs_seq(&eacc, nvs_erase_key(s_nvs, bad_keys[i]),
+                    TAG, "erase_key corrupt rule") == ESP_OK) {
             ESP_LOGI(TAG, "erased corrupt rule key=%s", bad_keys[i]);
         }
     }
-    if (bad_n) nvs_commit(s_nvs);
+    if (bad_n) nvs_seq(&eacc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
     xSemaphoreGive(s_mutex);
 
     // Merge writeback-overlay entries so readers see uncommitted edits.
