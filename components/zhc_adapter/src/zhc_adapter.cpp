@@ -400,6 +400,19 @@ const zhc::PreparedDefinition* resolve_supplement(std::uint64_t ieee,
             zhc_fallback::synth_definition(ieee, model_id, manu_name, primary);
         // Store sentinel (primary) for negative result, real pointer for positive.
         slot->cached_supplement = result ? result : primary;
+        // Race (b) closure, same shape as the decode-miss path: synth ran
+        // without this caller holding the pool mutex, so the pool entry
+        // backing `result` may have been evicted / repurposed between
+        // resolve and the store above — and the invalidation walk may
+        // have run BEFORE the store landed, missing it. Store first,
+        // then re-validate ownership under the pool lock; on failure
+        // drop the cached copy so no stale pool pointer persists. The
+        // negative sentinel (registry `primary`) is not pool storage and
+        // always passes owns(). The local `result` still serves this one
+        // call — same one-generation A/B-buffer argument as decode-miss.
+        if (!zhc_fallback::owns(ieee, slot->cached_supplement)) {
+            slot->cached_supplement = nullptr;
+        }
         return result;
     }
 
