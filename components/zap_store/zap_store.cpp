@@ -117,7 +117,7 @@ void zap_store_init() {
                     nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
                 }
                 if (acc != ESP_OK)
-                    ESP_LOGE(TAG, "schema wipe incomplete — retried next boot");
+                    ESP_LOGE(TAG, "schema wipe incomplete — will retry next boot");
             }
         } else {
             // First boot with versioning — write current version

@@ -685,7 +685,7 @@ void device_shadow_init() {
             if (acc == ESP_OK)
                 ESP_LOGW(TAG, "shadow NVS format upgraded v%d — cache cleared", NVS_SHADOW_VERSION);
             else
-                ESP_LOGE(TAG, "shadow NVS upgrade incomplete — retried next boot");
+                ESP_LOGE(TAG, "shadow NVS upgrade incomplete — will retry next boot");
         }
     } else {
         // SHA-F12: surface the consequence — without persistence the
@@ -920,17 +920,28 @@ void device_shadow_clear_attrs(uint64_t ieee) {
     // traffic re-marks dirty, so ≤ NVS_MIN_INTERVAL_S). Millisecond-wide
     // window, RAM state stays correct, and only a reboot inside it would
     // ever load the stale blob — accepted over flash I/O under the lock.
+    bool nvs_ok = true;
     if (found && s_nvs) {
         char key[16];
         shadow_key(key, 'a', ieee);   // Q76: full 64-bit IEEE, base36
         esp_err_t e = nvs_erase_key(s_nvs, key);
         if (e != ESP_ERR_NVS_NOT_FOUND) {  // never persisted → nothing to do
-            esp_err_t acc = ESP_OK;
-            nvs_seq(&acc, e, TAG, "erase_key attr clear");
-            nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit attr clear");
+            // nullptr acc: nvs_seq still logs each failing op; the two
+            // results gate the summary line below. `&=` keeps the commit
+            // attempted even after a failed erase (no short-circuit).
+            nvs_ok = nvs_seq(nullptr, e, TAG, "erase_key attr clear") == ESP_OK;
+            nvs_ok &= nvs_seq(nullptr, nvs_commit(s_nvs), TAG,
+                              "commit attr clear") == ESP_OK;
         }
     }
-    ESP_LOGI(TAG, "Cleared shadow attr cache ieee=0x%016llX", (unsigned long long)ieee);
+    if (nvs_ok) {
+        ESP_LOGI(TAG, "Cleared shadow attr cache ieee=0x%016llX",
+                 (unsigned long long)ieee);
+    } else {
+        ESP_LOGW(TAG, "Shadow attr cache ieee=0x%016llX: RAM cleared; NVS erase "
+                      "failed — cached attrs may resurface on reboot",
+                 (unsigned long long)ieee);
+    }
 }
 
 bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {

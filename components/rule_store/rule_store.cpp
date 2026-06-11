@@ -60,17 +60,15 @@ static bool rule_store_load_unlocked(uint16_t rule_id, RuleSlot* out) {
         ESP_LOGW(TAG, "size mismatch rule_id=0x%04x (%u != %u) — erasing",
                  rule_id, (unsigned)len, (unsigned)sizeof(RuleSlot));
         // Best-effort cleanup — a failed erase only means the corrupt blob
-        // re-logs on the next load; surface it instead of hiding it.
-        esp_err_t acc = ESP_OK;
-        nvs_seq(&acc, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
-        nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
+        // re-logs on the next load; nullptr acc = per-op logging only.
+        nvs_seq(nullptr, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
+        nvs_seq(nullptr, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
         return false;
     }
     if (out->crc32 != rule_slot_crc(out)) {
         ESP_LOGW(TAG, "CRC32 mismatch rule_id=0x%04x — erasing", rule_id);
-        esp_err_t acc = ESP_OK;
-        nvs_seq(&acc, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
-        nvs_seq(&acc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
+        nvs_seq(nullptr, nvs_erase_key(s_nvs, key), TAG, "erase_key corrupt rule");
+        nvs_seq(nullptr, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
         return false;
     }
     return true;
@@ -104,7 +102,7 @@ void rule_store_init() {
             // A failed marker write means this wipe repeats every boot —
             // that was silent before; now each failing op logs above.
             if (acc != ESP_OK)
-                ESP_LOGE(TAG, "schema wipe incomplete — re-wiped next boot");
+                ESP_LOGE(TAG, "schema wipe incomplete — will re-wipe next boot");
         }
     } else {
         esp_err_t acc = ESP_OK;
@@ -251,14 +249,15 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     }
     if (it) nvs_release_iterator(it);
 
-    esp_err_t eacc = ESP_OK;
+    // Best-effort cleanup — nullptr acc = per-op logging only; the
+    // passthrough return still gates the per-key "erased" info line.
     for (size_t i = 0; i < bad_n; i++) {
-        if (nvs_seq(&eacc, nvs_erase_key(s_nvs, bad_keys[i]),
+        if (nvs_seq(nullptr, nvs_erase_key(s_nvs, bad_keys[i]),
                     TAG, "erase_key corrupt rule") == ESP_OK) {
             ESP_LOGI(TAG, "erased corrupt rule key=%s", bad_keys[i]);
         }
     }
-    if (bad_n) nvs_seq(&eacc, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
+    if (bad_n) nvs_seq(nullptr, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
     xSemaphoreGive(s_mutex);
 
     // Merge writeback-overlay entries so readers see uncommitted edits.

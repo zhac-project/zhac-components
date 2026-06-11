@@ -18,6 +18,8 @@
 //     beats log-once when diagnosing which op of a sequence died);
 //   - `*acc` keeps the FIRST error of the sequence (later failures are
 //     logged but do not overwrite it);
+//   - `acc` may be nullptr — pass nullptr when only per-op logging is
+//     wanted (best-effort sites that never branch on overall success);
 //   - the call returns `r` unchanged, so callers can still branch on the
 //     individual op (e.g. skip a version-marker write after a failed
 //     erase_all) while the accumulator tracks overall success.
@@ -30,7 +32,7 @@ static inline esp_err_t nvs_seq(esp_err_t* acc, esp_err_t r,
                                 const char* tag, const char* op) {
     if (r != ESP_OK) {
         ESP_LOGE(tag, "nvs %s: %s", op, esp_err_to_name(r));
-        if (*acc == ESP_OK) *acc = r;
+        if (acc && *acc == ESP_OK) *acc = r;
     }
     return r;
 }

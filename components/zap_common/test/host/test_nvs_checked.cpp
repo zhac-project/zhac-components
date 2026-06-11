@@ -7,7 +7,9 @@
 //   - every op is attempted (no short-circuit) and every failing op is
 //     logged exactly once (counted via the local ESP_LOGE stub);
 //   - nvs_seq returns its `r` argument unchanged (passthrough), even
-//     when acc already holds an earlier failure.
+//     when acc already holds an earlier failure;
+//   - acc == nullptr is allowed (best-effort sites): per-op logging and
+//     passthrough still work, nothing is dereferenced.
 #include "nvs_checked.h"
 
 #include <cstdio>
@@ -85,6 +87,18 @@ int main() {
         CHECK(r == ESP_OK && acc == kErrA,
               "OK op after failure: passthrough OK, acc untouched");
         CHECK(g_esp_loge_count == 0, "OK op after failure: no log");
+    }
+
+    // ── 5. nullptr acc: log-only mode for best-effort sites ──────────────
+    {
+        s_ops_attempted = 0;
+        g_esp_loge_count = 0;
+        esp_err_t r1 = nvs_seq(nullptr, op(kErrA),  TAG, "op1");
+        esp_err_t r2 = nvs_seq(nullptr, op(ESP_OK), TAG, "op2");
+        CHECK(r1 == kErrA && r2 == ESP_OK,
+              "nullptr acc: passthrough returns r unchanged, no crash");
+        CHECK(g_esp_loge_count == 1, "nullptr acc: failing op still logged");
+        CHECK(s_ops_attempted == 2, "nullptr acc: both ops attempted");
     }
 
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS",

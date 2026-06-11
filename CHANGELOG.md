@@ -429,6 +429,14 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   error of a multi-op sequence, making the honest check-every-return
   pattern a one-liner. Host ctest suite added at `zap_common/test/host/`
   (local esp_err/esp_log shims with an ESP_LOGE counter).
+- **zap_common**: polish fold — `nvs_seq` accepts `acc == nullptr` for
+  best-effort sites that only want per-op logging (host test added);
+  rule_store / device_shadow best-effort cleanups drop their dead
+  accumulators. `device_shadow_clear_attrs` gates its summary line: the
+  unconditional "Cleared" INFO becomes a WARN ("RAM cleared; NVS erase
+  failed — cached attrs may resurface on reboot") when the erase/commit
+  failed. Log tense honesty: "retried / re-wiped next boot" → "will
+  retry / will re-wipe next boot" (zap_store, device_shadow, rule_store).
 - **zap_store**: the schema-mismatch wipe ignored
   `nvs_erase_all`/`nvs_set_u16`/`nvs_commit` (:107 pre-fix) — a failed
   erase followed by the version overwrite would present stale-layout
