@@ -7,6 +7,7 @@
 // uxTaskGetStackHighWaterMark watermark.
 #pragma once
 #include <cstdint>
+#include <cstring>       // std::strcmp
 #include "sdkconfig.h"   // CONFIG_IDF_TARGET_ESP32P4 / ESP32S3
 
 namespace zhac::stack {
@@ -112,10 +113,7 @@ inline constexpr Entry kTable[] = {
 inline uint32_t task_stack_size_for(const char* name) {
     if (!name) return 0;
     for (const Entry* e = kTable; e->name != nullptr; ++e) {
-        const char* a = name;
-        const char* b = e->name;
-        while (*a && *a == *b) { ++a; ++b; }
-        if (*a == 0 && *b == 0) return e->size;
+        if (std::strcmp(name, e->name) == 0) return e->size;
     }
     return 0;
 }

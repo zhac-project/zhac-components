@@ -70,8 +70,10 @@ void zhac_adapter_fallback_clear(uint64_t ieee);
 
 // Try to decode a single inbound ZCL frame with the new library.
 // Returns true when the library both matched a prepared definition
-// and produced ≥1 attribute. Output is logged at INFO level; nothing
-// flows into device_shadow / the event bus.
+// and produced ≥1 attribute. Each emitted key/value is forwarded to
+// device_shadow (via zhc_shadow_bridge -> device_shadow_process), which
+// runs the debounce/throttle/NVS pipeline and publishes onto the event
+// bus; the decode itself also logs a summary at INFO level.
 //
 // - ieee:             device IEEE (for logging only).
 // - model_id:         Basic cluster modelIdentifier; null / empty → skip.
