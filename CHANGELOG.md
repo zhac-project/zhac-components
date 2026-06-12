@@ -27,6 +27,29 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   split + reassembly (30 devices → 4 chunks → full list), single-chunk and
   empty-list edges.
 
+### Fixed — Low (P5 findings tail, T32)
+
+Conservative LOW-tail sweep of `zhac-components`. Most LOW rows were already
+resolved incidentally during the P0–P4 batches (verified against current code);
+only the genuinely-open, zero-risk quick wins below were changed. Concurrency /
+hot-path / design-required LOW rows were deliberately left for a dedicated pass.
+
+- **zhc_adapter** (LOW DOC, FINDINGS §9, `zhc_adapter.h` `zhac_adapter_try_decode`
+  doc): the header claimed decode output "is logged at INFO level; nothing flows
+  into device_shadow / the event bus" — stale. Each emitted key/value is in fact
+  forwarded to `device_shadow_process` via `zhc_shadow_bridge.cpp:91` (debounce/
+  throttle/NVS pipeline + event-bus publish). Comment corrected to match the live
+  forwarding path. Doc-only; no behaviour change.
+- **zap_common** (LOW DUP, FINDINGS §8, `task_stacks.h:116` `task_stack_size_for`):
+  replaced the hand-rolled character-by-character string compare with
+  `std::strcmp` (added `<cstring>`). Identical semantics, one fewer open-coded
+  loop to maintain.
+- **mqtt_gw** (LOW SMELL, FINDINGS §7, `mqtt_gw_p4.cpp:49` publish payload cap):
+  a publish payload larger than the fixed 512 B `HapMqttPublish::payload` was
+  silently truncated (producing partial / invalid-JSON on the wire). Added a
+  one-shot (rate-limited) `ESP_LOGW` so an over-large publish is diagnosable;
+  the cap + NUL-terminate behaviour is unchanged.
+
 ### Fixed — Medium (P4 findings batch, T31 HAP leftovers)
 
 - **hap_protocol** (MED, FINDINGS HAP, `hap_protocol.cpp` `hap_decode_stream`

@@ -55,6 +55,17 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     // HapMqttPublish::payload is a fixed char[512]; cap + NUL-terminate.
     const size_t n = payload_len < sizeof(s_msg.payload) - 1
                        ? payload_len : sizeof(s_msg.payload) - 1;
+    if (n < payload_len) {
+        // Truncation produces a partial (likely invalid-JSON) payload on the
+        // wire. Warn once so a too-large publish is diagnosable instead of
+        // silently corrupt; rate-limited to avoid flooding the log.
+        static bool s_trunc_logged = false;
+        if (!s_trunc_logged) {
+            s_trunc_logged = true;
+            ESP_LOGW(TAG, "mqtt_publish: payload %u B > %u cap — truncated topic=%s",
+                     (unsigned)payload_len, (unsigned)(sizeof(s_msg.payload) - 1), topic);
+        }
+    }
     memcpy(s_msg.payload, payload, n);
     s_msg.payload[n] = '\0';
     s_msg.qos    = static_cast<uint8_t>(qos < 0 ? 0 : (qos > 2 ? 2 : qos));   // F23: clamp 0..2
