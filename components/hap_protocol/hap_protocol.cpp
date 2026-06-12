@@ -23,6 +23,7 @@ uint8_t hap_crc8(const uint8_t* data, size_t len) {
     return crc;
 }
 
+// v3 single-frame path — see header banner; no live callers (tests only).
 size_t hap_encode(const HapFrame& f, uint8_t* buf, size_t buf_size) {
     // Q16 (QWEN_FINDINGS triage): reject a frame that declares payload_len > 0
     // but supplies no payload pointer — otherwise the header length says N while
@@ -92,7 +93,7 @@ HapDecodeResult hap_decode_stream(const uint8_t* buf, size_t len,
         if (consumed) *consumed = 0;
         return r;
     }
-    for (size_t i = 1; i + 3 < len; i++) {
+    for (size_t i = 1; i + 2 < len; i++) {
         if (buf[i]   == HAP_PREAMBLE[0] &&
             buf[i+1] == HAP_PREAMBLE[1] &&
             buf[i+2] == HAP_PREAMBLE[2]) {
@@ -104,7 +105,13 @@ HapDecodeResult hap_decode_stream(const uint8_t* buf, size_t len,
             return HAP_DECODE_RESYNC;
         }
     }
-    if (consumed) *consumed = (len > 3) ? (len - 3) : 0;
+    // No candidate preamble anywhere in the buffer (the forward scan above
+    // now covers every full-preamble start position, tail included). The head
+    // is undecodable and nothing downstream can resync, so discard the whole
+    // buffer rather than re-presenting the same bad head next call. (A preamble
+    // fragment straddling a read boundary is acceptably lost on this non-DMA
+    // v3 path; the live P4<->S3 link uses the fixed-size two-stage DMA decoder.)
+    if (consumed) *consumed = len;
     return r;
 }
 

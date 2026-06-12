@@ -27,6 +27,40 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   split + reassembly (30 devices → 4 chunks → full list), single-chunk and
   empty-list edges.
 
+### Fixed — Medium (P4 findings batch, T31 HAP leftovers)
+
+- **hap_protocol** (MED, FINDINGS HAP, `hap_protocol.cpp` `hap_decode_stream`
+  resync scan): off-by-one in the forward resync loop bound. The loop reads
+  `buf[i+2]` but stopped at `i + 3 < len`, so a candidate preamble whose 3rd
+  byte landed on the final buffer index was missed. Tightened to `i + 2 < len`
+  (the true last startable position), so the scan now covers every full-preamble
+  start position including the tail.
+- **hap_protocol** (MED, FINDINGS HAP, `hap_protocol.cpp` `hap_decode_stream`
+  no-candidate consume): when the scan finds NO candidate preamble anywhere, the
+  old code left 3 trailing bytes (`len - 3`), re-presenting the same undecodable
+  head every call (slow re-parse loop). With the scan bound fixed to cover the
+  tail, a "no candidate" verdict is authoritative, so the whole buffer is now
+  consumed (`*consumed = len`). A preamble fragment straddling a read boundary is
+  acceptably lost on this non-DMA v3 path; the live P4↔S3 link uses the
+  fixed-size two-stage DMA decoder, not this scanner.
+- **hap_protocol** (DOC, FINDINGS HAP, `hap_protocol.cpp` + `hap_protocol.h`):
+  documented the v3 single-frame API (`hap_encode` / `hap_decode` /
+  `hap_decode_stream`, CRC8 header) as retained for the host test suite and
+  non-DMA / single-shot transports ONLY — it has zero live callers; the wire
+  path is the v4 two-stage CRC16 DMA helpers (`hap_encode_stage1` /
+  `hap_decode_stage1` / `hap_encode_stage2` / `hap_verify_stage2`). Resolves a
+  stale-comment finding by documenting, not deleting (the functions stay).
+- **hap_session** (MED, FINDINGS HAP, `hap_session.cpp` `STALE_BEHIND_THRESHOLD`):
+  widened the monotonic high-water stale-dup threshold from `WIN_SIZE` (16) to
+  `2 * WIN_SIZE` (32) to close a retransmit false-drop. At `WIN_SIZE` the band
+  had ZERO margin: a legitimate in-window frame (reordered or retransmitted) can
+  sit up to `WIN_SIZE - 1` (15) behind the high-water, and the drop triggered at
+  exactly 16 — one boundary reorder false-dropped a real retransmit. The valid
+  band is strictly `(WIN_SIZE, SEEN_RING_SIZE)` = (16, 64); `2 * WIN_SIZE` sits
+  squarely in the middle with margin on both sides, locked by a `static_assert`.
+  The dedup unit test exercises the exact-match ring (same-seq dup), not the
+  high-water gap, so no test change was needed.
+
 ### Fixed — Medium (P4 findings batch, T30 rule_store)
 
 - **rule_store** (MED, FINDINGS §7, `rule_store.cpp` `rule_store_set_enabled`):

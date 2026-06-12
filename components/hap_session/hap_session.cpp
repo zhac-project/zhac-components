@@ -77,13 +77,16 @@ static SemaphoreHandle_t  s_mutex;
 //      double rule-create). Enlarged 16→64 (entries are 4 B each ⇒ 256 B) so
 //      the window comfortably exceeds the peer's WIN_SIZE retransmit window.
 //
-//  (b) Monotonic high-water fast-path — tracks the highest seq seen per peer
-//      and drops any frame that is more than WIN_SIZE behind it as a definite
-//      stale duplicate, regardless of ring eviction. This is wrap-aware: seqs
-//      are uint16 and roll 0xFFFF→0x0001, so we compare via the signed
-//      difference trick (see seq_diff) rather than a raw `<`. The peer never
-//      has more than WIN_SIZE (=peer-side) frames outstanding, so a seq that
-//      far behind the high-water mark cannot be a fresh in-window frame.
+//  (b) Monotonic high-water fast-path — a defensive backstop to (a): tracks the
+//      highest NEEDS_ACK seq seen per peer and drops a frame far enough behind
+//      it to be a definite stale dup, regardless of ring eviction. Wrap-aware:
+//      seqs are uint16 and roll 0xFFFF→0x0001, so we compare via the signed
+//      difference trick (see seq_diff), not a raw `<`. NOTE the seq space is a
+//      SINGLE monotonic counter shared by all frame types, but only NEEDS_ACK
+//      frames advance the high-water (NO_ACK / ACK / SYNC bypass the window and
+//      never mark) — so the seq-distance between two NEEDS_ACK frames is
+//      inflated by any NO_ACK / heartbeat traffic interleaved between them.
+//      That cuts both ways for the threshold below; see STALE_BEHIND_THRESHOLD.
 struct SeenEntry { uint16_t seq; uint8_t type; };
 static constexpr size_t SEEN_RING_SIZE = 64;
 static SeenEntry s_seen_ring[SEEN_RING_SIZE] = {};
@@ -93,10 +96,27 @@ static uint8_t   s_seen_head = 0;
 // cold-start case (no frame seen yet) so seq 0-vs-uninitialised is unambiguous.
 static uint16_t s_rx_high_water = 0;
 static bool     s_rx_high_water_valid = false;
-// A frame this far (or more) behind the high-water mark is a definite stale
-// dup. The peer's outstanding window is WIN_SIZE; allow a generous margin so a
-// merely-reordered in-window frame is never mistaken for stale.
-static constexpr int16_t STALE_BEHIND_THRESHOLD = WIN_SIZE;
+// A frame this far (or more) behind the monotonic high-water is treated as a
+// stale dup. Choosing the threshold is a trade-off on the SHARED seq counter
+// (see (b) above), so neither bound is a hard seq-unit guarantee:
+//   Lower bound — too small false-drops a legit reordered/retransmitted
+//   in-window frame. Such a frame is <= WIN_SIZE-1 *NEEDS_ACK frames* behind,
+//   but its seq spread can EXCEED WIN_SIZE when NO_ACK frames interleave, so no
+//   finite threshold fully eliminates reorder false-drops here. 2*WIN_SIZE adds
+//   real margin over the old WIN_SIZE (which had none); the residual needs
+//   WIN_SIZE-1 reordered NEEDS_ACK frames with heavy NO_ACK interleave — rare on
+//   the largely-in-order SPI link, and pre-existing (tracked in FINDINGS §1).
+//   Upper bound — must stay < SEEN_RING_SIZE so a dup evicted from ring (a) is
+//   still caught. A ring-evicted dup is >= SEEN_RING_SIZE NEEDS_ACK frames old;
+//   interleaved gaps only WIDEN its seq-distance, so the catch is conservative
+//   (more reliable, never less). Real dups are <= WIN_SIZE NEEDS_ACK frames
+//   behind and already caught by (a) — (b) is purely a burst backstop.
+// 2*WIN_SIZE sits in (WIN_SIZE, SEEN_RING_SIZE) with margin on both sides.
+static constexpr int16_t STALE_BEHIND_THRESHOLD = 2 * WIN_SIZE;   // 32, band (16,64)
+static_assert(STALE_BEHIND_THRESHOLD > WIN_SIZE &&
+              STALE_BEHIND_THRESHOLD < static_cast<int16_t>(SEEN_RING_SIZE),
+              "high-water threshold must lie strictly between the peer window "
+              "spread (WIN_SIZE) and the exact-match ring size (SEEN_RING_SIZE)");
 
 // uint16 wrap-aware ordering. Returns a>b as a small signed delta: positive ⇒
 // a is "ahead" of b, negative ⇒ "behind". Correct across the 0xFFFF→0x0001
