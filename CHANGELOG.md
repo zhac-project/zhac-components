@@ -7,6 +7,210 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — High/Medium (P2 findings review, T19 mqtt_gw / tg_gw lifecycle & injection)
+
+- **mqtt_gw (S3)** (HIGH, FINDINGS §7, `mqtt_gw_s3.cpp:53`): the `s_client`
+  stop/destroy/recreate ran UNSYNCHRONIZED from REST handlers, the esp_timer
+  re-arm/deferred-start callbacks, the STA-up handler, and the pub-worker's
+  deferred-disable while the worker could be inside `esp_mqtt_client_publish`
+  → use-after-free of the client handle. A new `s_client_mtx` (created in
+  `mqtt_gw_init` at single-threaded boot) now fences EVERY
+  `esp_mqtt_client_*` lifecycle call (init/start/stop/destroy/subscribe/
+  unsubscribe) AND the worker's publish; the worker snapshots the handle
+  under the lock and publishes under it. Publish-under-lock chosen over a
+  snapshot-revalidate handshake: the worker is the sole publisher (already
+  serialized by the queue), so the only task that can stall behind a blocking
+  QoS>0 publish is a rare concurrent config write — acceptable for a gateway
+  and far simpler/safer than reopening a destroy-vs-use window. The
+  esp-mqtt **event-handler** subscribe/publish (CONNECTED) stay unlocked by
+  design (they run on the mqtt task, which cannot destroy its own client and
+  must not block on a mutex a lifecycle op could hold).
+- **mqtt_gw (S3)** (MED, `:172`): `MQTT_EVENT_DATA` ignored fragmentation —
+  payloads > the 4608 B buffer were forwarded to `rx_cb` truncated to the
+  first chunk with no indication. Now drops any event where
+  `data_len != total_data_len` and logs a one-shot warning; continuation
+  chunks (`topic_len==0`) remain dropped by the existing guard. Reassembly
+  is intentionally not added (the inbound command contract is sub-buffer).
+- **mqtt_gw (S3)** (MED, `:419`): a rule/Lua publish topic was not sanitized
+  for MQTT wildcards (`+`/`#`) or control chars — one wildcard PUBLISH makes a
+  spec-compliant broker drop the connection (reconnect churn). New
+  `mqtt_topic_ok()` rejects `+`, `#`, NUL/control/DEL bytes, and overlong
+  names; the prefix-format overflow path (was silently publishing to the
+  UNPREFIXED topic) now DROPS instead. Host-proven.
+- **mqtt_gw (S3)** (MED, `:112`, `:306`, `:335`): the broker URL (sole carrier
+  of `mqtt://user:pass@host` creds) was logged verbatim at INFO on every
+  (re)start. New `redact_userinfo()` prints `scheme://host:port` only and is
+  applied at all three log sites. Host-proven.
+- **mqtt_gw (S3)** (LOW, `:407`): re-subscribe overwrote the single stored
+  filter without unsubscribing the previous one (old subscription kept
+  delivering until reconnect). Now unsubscribes the prior live filter before
+  replacing it.
+- **mqtt_gw (P4)** (MED, `mqtt_gw_p4.cpp:40`): the publish-path serialization
+  mutex was lazily created (`if(!s_mutex)…`) in the hot path — two first
+  callers each created one (one leaked, serialization broken). Created once in
+  `mqtt_gw_init` at single-threaded boot.
+- **tg_gw (S3)** (HIGH, FINDINGS §7, `tg_gw_s3.cpp:196`): `chat_id` and
+  `parse_mode` (HAP/NVS-sourced, reachable from Lua via `tg_gw_setchat`/`send`)
+  were interpolated UNESCAPED into the Telegram API JSON body — a `"` injected
+  arbitrary request fields. Both are now run through `json_escape`, and
+  `parse_mode` is whitelisted to {`Markdown`,`MarkdownV2`,`HTML`} (any other
+  value is rejected and the send dropped). Host-proven.
+- **tg_gw (S3/P4)** (MED, `tg_gw_s3.cpp:29` / `tg_gw_p4.cpp:29`): token-length
+  cap drift — S3 rejected >80, P4 accepted up to 96, so an 81–96-char token was
+  forwarded by P4 then silently dropped on S3. A single `TG_TOKEN_MAX` (80,
+  comfortably over the ~46-char real token and within the 96-byte HAP field)
+  now lives in `tg_gw.h` and is used by both cores.
+- **tg_gw (S3)** (LOW, `tg_gw_s3.cpp:127`): `json_escape` truncated byte-wise
+  and could split a UTF-8 multibyte sequence → invalid JSON the Telegram API
+  rejects (HTTP 400). On truncation it now backs off to the previous UTF-8
+  code-point boundary. Host-proven.
+- **tg_gw (P4)** (MED, `tg_gw_p4.cpp:95`/`:76`): the static ~3.2 KB pack buffer
+  (and the ~3.2 KB `HapTgSend`) were used WITHOUT a mutex — concurrent
+  `tg_gw_send` from two tasks (rules + Lua) could corrupt the frame
+  mid-pack/send, and a stack-local `HapTgSend{}` per call was a 3.2 KB stack
+  hit. Both are now `static`, serialized by an init-created `s_send_mutex`
+  (same pattern as `mqtt_gw_p4`).
+- Added committed host tests (`mqtt_gw/test/host/` + `tg_gw/test/host/`)
+  pinning the four pure security helpers — `mqtt_topic_ok`, `redact_userinfo`,
+  `json_escape` (incl. the UTF-8 truncation back-off and the chat-id
+  JSON-framing injection case) and the `parse_mode` whitelist — as a
+  regression guard (mirror-source pattern, per the `zap_store/test/host`
+  precedent). Also reworded stale `mqtt_gw_s3.cpp` comments that referenced a
+  deleted `restart_client()` wrapper.
+
+### Fixed — High/Medium (P2 findings review, T18 simple_rules / cron integrity)
+
+- **simple_rules / rule_store** (HIGH, FINDINGS §7, `simple_rules.cpp:84`):
+  `next_rule_id()` scanned only the 64-entry in-memory cache for the max id,
+  but `rule_store` persists up to 256 NVS slots — a persisted-but-uncached
+  rule's id was reissued and the deferred `rule_store_mark_dirty` silently
+  overwrote the original (permanent data loss). New `rule_store_max_id()`
+  walks every `r_%04X` NVS key + the writeback overlay (no blob loads);
+  `next_rule_id` derives `max(store, cache) + 1`, and the wraparound free-id
+  scan probes the store too. Host-proven (65 persisted, empty cache → next id
+  = 66, never 1).
+- **dsl_parser** (HIGH, FINDINGS §7, `dsl_parser.cpp:206`): an unclamped
+  `strtod`→`int32_t` cast was UB for out-of-range literals (e.g. a
+  REST/cloud-supplied `#temp>1e20`). Now checks `errno==ERANGE` and the
+  rounded magnitude against the int32 bounds before the cast; `1e20`,
+  `-1e20`, `99999999999`, and garbage all return `ERR_BAD_TRIGGER`, while
+  `2147483647` (INT32_MAX) still round-trips. Follow-up: the magnitude-only
+  guard let `nan` slip through (`nan>=X` / `nan<=Y` are both false) into
+  `(int32_t)nan` = UB; a `!std::isfinite(d)` check now rejects `nan`/`-nan`/
+  `inf`/`-inf` too (confirmed via UBSan `float-cast-overflow`).
+- **simple_rules** (MED, FINDINGS §7, `:580`): a full active-rule cache used
+  to persist to NVS yet return `true`, so the rule was accepted but never
+  evaluated (silent no-op). `add` now returns `false` and sets
+  `dsl_last_error()` = "rule cache full (max 64 active rules)"; the HAP
+  `RULE_CREATE` handler already relays `dsl_last_error()` to the SPA/cloud, so
+  no net-core change was needed.
+- **simple_rules** (MED, FINDINGS §7, `:101`): `reload_locked` loaded only the
+  first 64 NVS slots and silently dropped the rest. The 64-active cap is kept
+  intentionally (raising to 256 = +~130 KB P4 DRAM); a new `rule_store_count()`
+  drives an `ESP_LOGW` with the count of persisted-but-inert rules, and the
+  64-active limit is documented in `simple_rules/README.md`.
+- **simple_rules / dsl_parser** (MED, FINDINGS §7, `:574` + `dsl_parser.cpp:336`):
+  a DSL ≥ 500 B parsed in full for the live rule but persisted truncated to
+  499 (`slot.src`), so the rule mutated/failed-parse after reboot. `add`/`update`
+  now reject `dsl_len >= sizeof(slot.src)` with "rule DSL too long (max 499
+  bytes)"; an action-section overrun returns the new `ERR_ACTION_TOO_LONG`
+  instead of a silent clamp. No truncate-persist path remains.
+- **cron_parser** (MED, FINDINGS §7, `cron_parser.cpp:95`/`:54`): an expression
+  or per-field buffer ≥ 128 chars was silently `strncpy`-truncated and could
+  still parse into a WRONG schedule. Both now reject (`strlen >= sizeof(buf)`).
+- **cron_parser** (MED, FINDINGS §7, `cron_parser.cpp:260`): `cron_next` did
+  `t += 60 - tm_sec`, which is `+0` when `tm_sec == 60` (leap second; reachable
+  on glibc host tests) → infinite loop. `tm_sec` is now clamped to 59 before
+  the jump, matching `cron_matches`. New host suite under
+  `cron_parser/test/host/`.
+- **device_shadow / simple_rules** (MED, FINDINGS §7, `simple_rules.cpp:297`):
+  the `ZIGBEE_TOGGLE` action put a `ShadowAttr[32]` (~2.7 KB) + a 522 B device
+  snapshot on the shared event-drain task stack just to read one attr by key.
+  New `device_shadow_get_attr(ieee, key, out)` (LEAF s_mutex only — no NVS,
+  publish, or nested lock, per T10) returns the single slot; the toggle stack
+  arrays are dropped.
+
+### Fixed — Medium (P2 findings review, T14 HAP correlation edges)
+
+- **hap_session**: enlarged the receive-side dedup `SEEN_RING` 16→64 entries
+  and added a wrap-aware monotonic high-water fast-path. The 16-entry ring
+  evicted a NEEDS_ACK frame's `(seq,type)` after 16 intervening distinct
+  frames, so a burst plus one lost ACK re-dispatched the original on
+  retransmit (double DEVICE_DELETE / double rule-create). The ring now catches
+  recent exact dups; the high-water mark (`seq_diff(high_water, seq) >=
+  WIN_SIZE`, uint16 wrap-safe via the signed-difference trick) catches
+  burst-evicted dups. Both drop-without-dispatch but still re-ACK so the peer
+  stops retransmitting. (FINDINGS §1.3, :252)
+- **hap_session**: session clock `now_ms()` / `WinSlot.sent_ms` moved from a
+  uint32 `xTaskGetTickCount()*portTICK_PERIOD_MS` (wrapped at ~49.7 days, and
+  its `sent_ms==0` sentinel collided with a real post-wrap tick of 0 → one
+  spurious retransmit per slot per wrap) to `int64_t esp_timer_get_time()/1000`.
+  No magic sentinel — the per-slot `active` flag is the armed flag (the tick
+  loop short-circuits inactive slots before reading `sent_ms`). The
+  retransmit-timeout delta `ms - sent_ms < ACK_TIMEOUT_MS` stays exact under
+  int64 (both monotonic ms-from-boot; small positive delta). Added `esp_timer`
+  to the component's PRIV_REQUIRES. (FINDINGS §1.4, :68)
+- **hap_session**: `hap_session_next_seq()` called before init returned 0,
+  which the wire treats as "no correlation" — a roundtrip waiting on that seq
+  silently timed out. It now returns the explicit `SEQ_SENTINEL_UNINIT` (0),
+  and `hap_session_send()` (the shared send path used by BOTH P4 and S3
+  transports) hard-rejects any frame carrying it with an `ESP_LOGE` and
+  `return false`, so a pre-init send fails fast at the call site instead of
+  eating a full timeout. (FINDINGS §1.5, :143)
+
+### Fixed — Medium (P2 findings review, T17 zap_store capacity + delete robustness)
+
+- **zap_store**: `zap_store_save_device` had no capacity check. At
+  `count == ZAP_MAX_DEVICES` (200) a new IEEE took `idx = count`, bumped `cnt`
+  past 200, and wrote an unreferenced 522 B blob; every later save of that
+  IEEE re-missed the in-RAM index and re-appended another blob at an
+  ever-higher idx — unbounded NVS growth until partition exhaustion. Now a new
+  device at a full store is rejected with `ESP_LOGE` and `return false` BEFORE
+  any blob write or `cnt` bump; an existing device is always an in-place
+  rewrite and is never rejected. (The in-RAM `pool_add` already guards at 200;
+  this is the persistence-layer safety net.) (FINDINGS §8.1, :150)
+- **zap_store**: `zap_store_delete_device` always allocated
+  `ZAP_MAX_DEVICES × 522 B` (~102 KB) regardless of the actual device count,
+  so delete could fail on a fragmented heap with PSRAM unavailable. It now
+  reads `cnt` under the store lock first and sizes the scratch buffer to the
+  actual count (still PSRAM-preferred with internal-heap fallback); an empty
+  store short-circuits with no allocation. (FINDINGS §8.2, :208)
+- **zap_store**: `zap_store_load_devices` took no `store_lock` (racing
+  save/delete once the flush task runs) and never null-checked `pool`. It now
+  validates `pool`/`max_count` and holds the store lock across the multi-blob
+  scan. Lock order is safe: `s_store_mutex` is the innermost lock — the flush
+  layer always releases its own `s_mtx` before calling save/delete, so this
+  cannot invert against it. (FINDINGS §8.3, :292)
+- **zap_store**: `zap_device_crc` stack-copied the 522 B struct even though the
+  save path already holds a crc-zeroed copy. Split into `zap_device_crc_zeroed`
+  (no copy — save path CRCs its already-zeroed copy in place) and the existing
+  `zap_device_crc` (load path, which must preserve the stored crc32 for the
+  equality check). Same CRC bytes; one fewer 522 B stack frame + memcpy per
+  save. (FINDINGS §8.4, :74)
+- **zap_store**: the NVS namespace now references `zap_nvs::DEVICE_POOL` from
+  the central registry instead of an inlined `"zap_v0"` literal. (FINDINGS §8.5, :17)
+- Added a host test (`test/host/test_zap_store_logic.cpp`) covering the pure
+  capacity-reject decision table and the CRC-in-place ⇔ CRC-with-copy
+  equivalence against the real `ZapDevice` layout (plain cmake, `-Werror`).
+
+### Changed — DRAM→PSRAM static buffer sweep (P1, T12)
+
+- **device_shadow**: the four 32-slot `ZclAttribute` pipeline staging arrays
+  (`filtered`/`bypass`/`merge`/`out`, 4 × 2,688 B ≈ 10.7 KB) moved to PSRAM
+  via `EXT_RAM_BSS_ATTR` — warm path (mutex-serialised per-report staging),
+  never ISR/DMA.
+- **zhc_adapter**: `g_merged` (8192-entry merged-registry pointer array,
+  32 KB) was commented as "PSRAM-resident" but actually sat in internal
+  `.bss` — now genuinely placed in `.ext_ram.bss`; the `= {}` initialiser
+  dropped (startup zeroes the section, same semantics).
+- **tg_gw (S3 side)**: Telegram send staging `body`/`text_esc` (6.7 KB) to
+  PSRAM — cold worker-task path.
+- Net effect (`idf.py size`): P4 `.bss` 139,300 → 95,780 B (−43,520 B =
+  device_shadow 10,752 + g_merged 32,768, exact). The tg_gw share lands in
+  the S3 app's −35 KB sweep total. `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y`
+  verified in BOTH firmware sdkconfigs, so the attribute is effective on P4
+  as well as S3.
+
 ### Added
 
 - **zhc_adapter / zigbee_mgr**: wire the join-time `configure_write` hook so
@@ -49,6 +253,47 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed — Critical
 
+- **simple_rules / event_bus**: a self-feeding rule (`ON Event#x DO event x
+  ENDON`) wedged the P4 main loop forever — the `event` action re-enqueued
+  into the same queue `event_bus_drain` was draining with ticks=0, so the
+  drain never returned, the watchdog rebooted, and the NVS-persisted rule
+  re-wedged every boot. The old `MAX_DISPATCH_DEPTH` counter was dead code
+  (delivery is queue-based; every hop is a fresh dispatch at depth 0) and is
+  removed. `RuleEventPayload` now carries a `hop` TTL (`name` 96→95 B,
+  external producers stay hop 0 via zero-init); the `event` action refuses
+  to republish past `MAX_EVENT_HOPS` (8) and logs the offending rule id.
+  New host test harness `simple_rules/test/host/` reproduces the wedge and
+  verifies the cut. (simple_rules.cpp:411)
+- **zhc_adapter**: the fallback pool (synthetic defs for unmatched devices)
+  rebuilt a slot's `PreparedDefinition` + expose/fz/binding arrays IN PLACE on
+  every `synth_definition()` call with no lock — while the radio task
+  dispatched frames through the same pointers and httpd paths
+  (`build_exposes_json` / `has_def`) triggered concurrent rebuilds: torn
+  counts / nulled expose pointers in normal operation for any fallback
+  device. The pool is now serialized by a FreeRTOS mutex (created from a
+  global ctor, same pattern as `g_cfg_addr_mtx`), and a published def is
+  never rewritten: each slot keeps an A/B double buffer — rebuilds (now
+  gated on `built`/base/label change instead of unconditional) write the
+  inactive half and publish by flipping the active index, so readers holding
+  the old pointer keep seeing consistent bytes for one more generation
+  (contract documented in `zhc_adapter_fallback.hpp`). LRU eviction (and
+  `clear`) now notify a new internal hook
+  `zhc_adapter_internal::invalidate_cached_defs_in(begin,end)` that clears
+  any `IeeeSlot.cached_def`/`cached_supplement` pointing into the victim
+  slot's storage before it is repurposed — previously the evicted device's
+  frames silently kept decoding through the NEW device's def (cross-device
+  state corruption). Eviction also picks a real victim now: `last_used_ms`
+  is stamped from `esp_timer` on every touch instead of the hardcoded
+  `now_ms=0` that always victimized slot 0. Costs ~25 KB extra .bss for the
+  16-slot A/B halves. (zhc_adapter_fallback.cpp:455,92,406) **NEEDS
+  HARDWARE TEST** — component is IDF-only; verified by host syntax check +
+  reader/writer trace, full build gated on the IDF toolchain.
+  Review follow-up: cache invalidation centralized in `reset_slot()` (now
+  also covers the empty-slot realloc path), the decode-miss re-cache race
+  closed via an ownership re-check under the pool mutex
+  (`zhc_fallback::owns`), and `g_pool` moved to PSRAM (`EXT_RAM_BSS_ATTR`,
+  freeing the full ~48 KB — including the pre-existing ~23 KB — of internal
+  .bss).
 - **zigbee_mgr**: hold pool mutex across the `on_tc_dev_ind` find-then-mutate
   sequence so a concurrent `pool_remove` (swap-with-last from user delete or
   ZDO_LEAVE_IND) can no longer relocate the entry between lookup and write,
@@ -201,4 +446,322 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   supply-chain hazard. (F-09)
 - **metrics**: register `METRIC_MQTT_DROPPED_MSGS` in the shared
   metric registry; needed by F-07.
-</content>
+
+### Fixed — High (P2 findings review, zhc_adapter slot table + decode locking)
+
+- **zhc_adapter**: the per-IEEE slot table (`g_slots` / `RuntimeStore
+  g_store`) was capped at 32 (`kMaxDevices`) while the network holds up
+  to `ZAP_MAX_DEVICES` (200). Device 33+ aliased onto slot index 0 —
+  permanently sharing device 0's `RuntimeStore` entry (press/hold timers,
+  Tuya action de-dup state corrupted across unrelated devices) and never
+  getting a def cache, so EVERY frame re-walked the 5500-def × 3-pass
+  registry on the radio task. Capped to `ZAP_MAX_DEVICES` (single source
+  of truth, included from `zap_common`); both `g_slots` (~4.8 KB) and the
+  grown `g_store` (~10.4 KB) moved to PSRAM via `EXT_RAM_BSS_ATTR`
+  (warm-path, never ISR) so the bump costs zero internal DRAM — the
+  32-entry `g_store` previously sat in internal `.bss`, so this nets a
+  small dram0 *saving* on S3. On genuine overflow the device is dropped
+  with a log-once `ESP_LOGE`, never aliased to slot 0. (F §9 def 1, :221)
+- **zhc_adapter**: `g_slots` / `g_slot_count` were mutated lock-free from
+  five tasks (radio `try_decode`, `configure`, command `dispatch_and_send`,
+  interview `register_endpoint`, httpd `resolve_supplement`) → duplicate
+  slots + torn `cached_def` reads. Added `s_slots_mtx` (global-ctor mutex,
+  matching the fallback pool's `PoolMtxInit` style) guarding the
+  append-only table and all lookups; callers now go through
+  `snapshot_slot` / `store_cached_defs` / `clear_cached_defs_for` so the
+  radio task never dereferences `g_slots` without the lock. Hold times are
+  short — NO registry walk / synth / radio I/O under the mutex.
+  **Lock order**: `s_slots_mtx` and the fallback `g_pool_mtx` are NEVER
+  nested — slot resolve releases before any `owns()`/synth takes the pool
+  lock, and the eviction walk (`invalidate_cached_defs_in`) holds the pool
+  lock but touches `g_slots` via word-atomic pointer clears + the
+  append-only invariant, so no inversion is possible. (F §9 def 2, :219)
+- **zhc_adapter**: `try_decode` (radio RX hot path) blocked `portMAX_DELAY`
+  on a shared addressing mutex (`g_cfg_addr_mtx`) that `zhac_adapter_
+  configure` held across `run_configure` — including 1500 ms Wait steps
+  and bind/report radio round-trips — causing multi-second frame-intake
+  stalls and a deadlock if a configure hook awaited a response the blocked
+  RX task delivers. **Removed the cross-call address globals
+  (`g_cfg_ieee` / `g_cfg_nwk` / `g_cfg_addr_mtx`) entirely.** The
+  library's `configure_*` bridge fn-ptrs carry the per-call
+  `device_index`; since the slot table is append-only that index stably
+  identifies the device, so each bridge now resolves its OWN destination
+  from `g_slots[idx]` (`ieee` + a new per-slot `cfg_nwk`, latched by
+  `zhac_adapter_set_runtime_addr` / `configure`). `try_decode` takes NO
+  lock for addressing — a configure on one device and a decode on another
+  use different slots and can't collide. The Tuya MCU sync-time / dataQuery
+  response path threads the per-call nwk through `ctx.device_nwk` from the
+  same slot, so converter replies route to the correct node.
+  (F §9 defs 3+4, :1086 / :1087)
+- **zhc_adapter**: unmatched devices are now negative-cached — a resolved
+  no-match tags the slot with a distinct `kMissSentinel` def-ptr (separate
+  from the `cached_supplement == primary` sentinel) so their frames skip
+  the 5500-def registry re-walk; cleared on `register_endpoint` /
+  `fallback_clear` / `invalidate_def_cache` so a device that later gains
+  cluster data and matches via synth is not masked. The per-frame "no
+  definition" resolve log demoted INFO → DEBUG. (F §9 def 5, :1001)
+- **zhc_adapter**: `dispatch_and_send` (command path) re-resolved the
+  definition on every command (full registry walk, or a fallback rebuild
+  for synth devices). It now reuses the per-IEEE `cached_def` that
+  `try_decode` maintains — snapshotted under `s_slots_mtx` and revalidated
+  via `zhc_fallback::owns()` (one-generation A/B lifetime rule) before
+  use, falling back to a fresh resolve only on miss. (F §9 def 6, :1137)
+- **zhc_adapter**: the ESP-IDF one-shot timer pool raced between the caller
+  (`idf_timer_schedule` / `_cancel`, decode/configure tasks) and the
+  `esp_timer` service task (`idf_timer_fire_thunk`) on the slot's `in_use`
+  / `handle` fields — a `_cancel` concurrent with a fire opened a
+  double-`esp_timer_delete` window and an ABA cancel of a reused slot id.
+  Slot transitions now run under a `portMUX` critical section (spinlock —
+  fire-thunk must not block), the deletable handle is claimed under the
+  lock and deleted outside it, and the `TimerId` is generation-tagged
+  (`gen << 16 | slot+1`) so a cancel of a slot reused since the id was
+  minted is a no-op. (F §9 def 7, :166)
+- **zhc_adapter (CMake)**: added `zap_common` to `PRIV_REQUIRES` for the
+  `ZAP_MAX_DEVICES` header.
+- **HW-GATE**: host build cannot exercise the radio path. Pending hardware
+  verification: decode burst during another device's configure (no
+  stall/deadlock), Tuya sync-time frames route to the correct nwk, and the
+  33rd+ device gets a real decode + its own runtime state (no index-0
+  aliasing).
+
+### Fixed — High (P1 findings review, zigbee_pool)
+
+- **zigbee_mgr / zigbee_pool**: new locked-visitor API
+  `zigbee_pool_with_device(ieee, fn, ctx)` /
+  `zigbee_pool_with_device_by_nwk(nwk, fn, ctx)` — runs `fn` under the
+  pool's internal recursive mutex (the same one `zigbee_pool_lock()` and
+  `pool_remove()` take), so the `ZapDevice*` handed to `fn` cannot be
+  retargeted by a concurrent swap-with-last remove for `fn`'s duration.
+  `pool_find_by_ieee` / `pool_find_by_nwk` doc-comments now spell out the
+  hazard: the returned pointer is only valid under `zigbee_pool_lock()` —
+  snapshot under lock (house pattern, `zhc_shadow_bridge.cpp`) or use the
+  visitor; plus `zigbee_pool_snapshot(ieee, out)` /
+  `zigbee_pool_snapshot_by_nwk(nwk, out)` — locked find+copy convenience
+  wrapping the snapshot pattern for pure-copy callers. (F6/F35)
+- **zigbee_mgr**: `zcl_attr_task` no longer dereferences the
+  `pool_find_by_nwk` pointer across the liveness write and the
+  multi-second `zhac_adapter_try_decode` — find + liveness stamp +
+  522 B snapshot now happen under one lock and the decode runs on the
+  detached copy (`zigbee_mgr.cpp:742` pre-fix). `on_zdo_leave_ind`
+  soft-removes via the locked visitor and marks NVS-dirty from a
+  detached snapshot outside the mutex (`:801` pre-fix). (F6/F35)
+- **zigbee_mgr**: `do_interview` no longer writes through a stale pool
+  pointer across multi-second blocking ZNP I/O (the documented F6/F35
+  residual at `zigbee_interview.cpp:269`). The ZDO/Basic pipeline now
+  runs on a detached `work` copy snapshotted in the existing
+  find-or-create critical section; results are committed field-by-field
+  under a re-acquired lock at the end — preserving concurrent mid-interview
+  mutations (rejoin `nwk_addr` refresh, rename, leave/rejoin flags,
+  liveness) and yielding to the late-identity promotion path
+  (`zigbee_identity.cpp`) when it won the race, exactly as the old code
+  did. If the device was hard-removed mid-interview the commit is
+  skipped — results dropped, no resurrection. Rejoin fast-path
+  (`:499` pre-fix) and the per-attempt nwk re-read (`:537` pre-fix) in
+  `task_interview`, plus `zigbee_interview_trigger`, now hold the lock
+  across find + read/mutate. (F6/F35)
+- **zigbee_pool**: `s_hash_dirty` was missing `static` — internal hash
+  state leaked into the global namespace.
+
+### Fixed — High (P1 findings review, event_bus)
+
+- **event_bus**: drain-vs-unsubscribe use-after-free — `event_bus_drain`
+  read the subscriber table, blocked in `xQueueReceive`, and invoked the
+  handler with no lock at all; a concurrent `event_bus_unsubscribe` could
+  `vQueueDelete` the very queue the drain was blocked on and null the
+  `std::function` it was about to call. Drains now resolve the slot under
+  the bus lock, pin the queue with a per-slot `inflight` count across the
+  unlocked receive, and re-validate the subscription generation after every
+  wake before dispatching (on a private handler copy, taken once per drain
+  call). Unsubscribe never deletes a queue with users in flight: it marks
+  the slot dying, wakes blocked drainers with a poison event, and the queue
+  is reaped by a later publish/subscribe/drain once `inflight` hits 0
+  (`s_dying` gates the scan, so the publish hot path pays one compare).
+- **event_bus**: publish held the single global mutex across the whole
+  fan-out including user filter callbacks — one slow filter stalled every
+  publisher, and filters re-entered the bus with the lock held (cross-task
+  ordering deadlock surface; device_shadow publishes while holding its own
+  mutex). Publish now snapshots queue handles + filter copies (copied only
+  when non-null — no in-tree subscriber sets one) under the lock and
+  evaluates filters / sends outside it, pinned by `inflight`.
+- **event_bus**: handles are now generation-stamped
+  (`[type|gen|pos]` packing, still `uint16_t`/opaque) and bumped on both
+  subscribe and unsubscribe — a stale double-unsubscribe after slot reuse
+  previously deleted the new subscriber's queue; now it is rejected and
+  logged. Residual: `uint8_t` gen wraps after 256 sub/unsub cycles on one
+  slot (documented; memory-safe either way, and nothing in-tree even calls
+  unsubscribe today).
+- **event_bus**: `xQueueCreate` failure in subscribe was `configASSERT`-only
+  — with asserts compiled out the null queue was stored and the handler ran
+  synchronously under the global lock. Now unlocks and returns
+  `EVENT_SUB_INVALID` (the queue-less direct-handler publish path is gone
+  with it).
+- **event_bus**: new `event_bus_drain_handle(handle, timeout_ms)` drains
+  exactly one subscription; `event_bus_drain(type, …)` is kept (deprecated
+  by comment — `[[deprecated]]` would `-Werror` the in-tree single-
+  dispatcher main loop, which intentionally drains all types in one task)
+  and rebuilt on the same gen+inflight core, preserving its
+  timeout-on-first-queue semantics.
+- **event_bus**: unsubscribe also clears the slot's `filter` (its captures
+  leaked before); `event_bus_init` is re-init-guarded (warn + no-op — a
+  second call used to wipe the table, leaking every live queue and
+  orphaning all subscriptions; house style per hap_session Q19);
+  `EVENT_TYPE_COUNT` now derives from a new `EventType::_COUNT` enum
+  sentinel instead of a hand-maintained `11` (source-only; the 96-byte
+  payload ABI asserts are untouched). Host test harness added at
+  `components/event_bus/test/host/` reusing the simple_rules shims (which
+  gained a one-shot `stub_queue_fail_next_create()` knob); also removed a
+  stray `</content>` paste artifact that ended this file.
+
+### Fixed — High (P1 findings review, device_shadow)
+
+- **device_shadow**: no flash I/O or bus publish under `s_mutex` any more —
+  the shadow lock is now a leaf. Pre-fix, `device_shadow_process` (radio RX
+  path) committed attr blobs to NVS while holding the lock (:412), the
+  task_shadow sweep held it across the FULL 200-entry table doing sequential
+  `nvs_set_blob`+`commit` (:446), and `emit_zcl_attr` published to the event
+  bus under it (:334) — nesting the shadow lock over the bus lock (deadlock
+  surface for any bus filter touching shadow API) and stalling the radio
+  path, readers and the FreeRTOS timer task for tens-hundreds of ms per
+  flash commit. ALL attr persistence is now a dirty-mark consumed by the
+  task_shadow sweep, which cycles the locks per entry (lock → serialize into
+  a task-owned PSRAM scratch + clear flags → unlock → publish + flash write
+  outside). Failed writes re-mark dirty after the interval stamp, giving an
+  `NVS_MIN_INTERVAL_S` backoff instead of hammering a failing flash every
+  100 ms. Worst-case added persistence latency is one sweep period (~100 ms,
+  was: immediate when interval-eligible). Config setters split the F26
+  dedupe into decide-under-lock / write-outside-lock halves (`CfgPersist`),
+  and `clear_attrs` erases its NVS key after unlock. Documented residual of
+  that move: a sweep flash write already in flight when `clear_attrs` erases
+  the key can land after the erase and resurrect the pre-clear blob until the
+  next clear/sweep persist cycle — RAM state stays correct, and only a reboot
+  inside that window would load the stale blob.
+- **device_shadow**: ZCL_ATTR events are staged under the lock and published
+  after `xSemaphoreGive` via a new `s_emit_mutex` (always taken BEFORE
+  `s_mutex`, owns the shared PSRAM staging buffer, held across the publish)
+  — preserves the old publish-order totality while the bus (hardened in
+  `22217df`) runs filters in the publisher's task with no shadow lock held.
+  Read-only API (`get_attrs`/`get_config`) takes `s_mutex` alone and is no
+  longer stalled by publishes or flash writes.
+- **device_shadow**: `device_shadow_restore_from_pool` mutated
+  `s_shadow`/`s_count` and loaded through the shared `s_attr_blob` scratch
+  with NO lock (:500), racing the already-spawned task_shadow iterating the
+  table every 100 ms. NVS reads now land in a boot-only PSRAM scratch
+  outside the lock, the table install runs under `s_mutex`, and
+  `DEVICE_JOIN`/`zap_store_mark_dirty` fire after release. (Spawning
+  task_shadow after restore instead was rejected — restore is called by
+  firmware after `init()` returns, so reordering needs a split init/start
+  API across both cores.)
+- **device_shadow**: the occupancy-timeout callback blocked the SHARED
+  FreeRTOS timer service task on `s_mutex` with `portMAX_DELAY` (:248) —
+  while an NVS sweep held the lock, every software timer in the firmware
+  froze. The callback is now lock-free: zero-timeout enqueue of
+  `{ieee, kind}` onto the (renamed, unified) task_shadow queue, with a
+  per-entry fallback flag + log-once when full; the synthetic occupancy=0
+  runs on task_shadow under proper locking, and an `xTimerIsTimerActive`
+  guard drops timeouts made obsolete by a fresh occupancy=1 re-arm (a race
+  the old run-in-callback code also had, narrower).
+- **device_shadow**: debounce `xTimerCreate` failure fell through to
+  `xTimerReset(NULL)` and tripped `configASSERT` (:396); now guarded like
+  the occupancy timer, with `debounce_pending_flush` set as fallback so the
+  merged attrs flush via the sweep instead of sitting in `pending` forever.
+
+**NEEDS HARDWARE TEST** — full 200-device sweep under live radio traffic,
+occupancy timers firing during a sweep, and ZCL_ATTR emit-order parity
+need on-device verification.
+
+### Fixed — High (P1 findings review, flush writeback)
+
+- **zap_store / rule_store**: flush protocol cleared a slot's dirty state
+  BEFORE its NVS write completed (`zap_store_flush_slot` :81,
+  `rule_store_flush_slot` :70 pre-fix), so a concurrent
+  `flush_now`/`flush_device` saw "nothing dirty" and returned while the
+  write was still in flight — breaking the shutdown/OTA durability
+  contract (the P4/S3 flush-before-restart calls could reboot mid-write),
+  and letting rule_store overlay readers fall through to stale NVS during
+  the commit window. Both dirty tables now run a
+  DIRTY → FLUSHING → CLEAN/FREE state machine (replacing the occupancy
+  bool): the slot stays visible and owned for the whole NVS write
+  (transitions under the existing mutex, I/O outside it), a `remarked`
+  flag records marks that land mid-write (settle then leaves the slot
+  dirty so the newer data flushes next cycle), and a failed write reverts
+  the slot in place for next-tick retry — eliminating the old
+  re-queue-into-a-free-slot path, which in rule_store could insert a
+  stale snapshot alongside a newer mark for the same `rule_id`
+  (duplicate entries; index-ordered flushing could persist the stale
+  copy last, :88 pre-fix) and which needed the F37 full-table
+  synchronous-save fallback (now superseded on the retry path; the
+  `mark_dirty` table-full fallback is unchanged).
+- **zap_store / rule_store**: `flush_now()` (and zap's
+  `flush_device()`) are now true durability barriers: they wait
+  (bounded poll, 10 ms × ≤5 s) for FLUSHING slots owned by the tick task
+  to settle, with a second pass for slots re-marked during those writes
+  — on return, state pending at call time is on flash. Both are
+  task-context-only (vTaskDelay); all existing callers qualify
+  (P4 `esp_register_shutdown_handler` handlers run in the task calling
+  `esp_restart`; S3 OTA handler task).
+- **zap_store**: `flush_device(ieee)` resolved the slot index under the
+  mutex, released it, then flushed the index (:169 pre-fix) — the slot
+  could settle and be reused for a different IEEE in that window,
+  force-flushing the wrong device. The flush attempt now revalidates the
+  expected IEEE under the flush lock, and slot reuse during a write is
+  structurally impossible (the free-list skips non-FREE slots, and a
+  FLUSHING slot is not FREE).
+
+### Fixed — High (P1 findings review, NVS error propagation)
+
+- **zap_common**: new header-only `nvs_checked.h` — `nvs_seq(&acc, op,
+  TAG, "what")` logs every failing NVS op and accumulates the first
+  error of a multi-op sequence, making the honest check-every-return
+  pattern a one-liner. Host ctest suite added at `zap_common/test/host/`
+  (local esp_err/esp_log shims with an ESP_LOGE counter).
+- **zap_common**: polish fold — `nvs_seq` accepts `acc == nullptr` for
+  best-effort sites that only want per-op logging (host test added);
+  rule_store / device_shadow best-effort cleanups drop their dead
+  accumulators. `device_shadow_clear_attrs` gates its summary line: the
+  unconditional "Cleared" INFO becomes a WARN ("RAM cleared; NVS erase
+  failed — cached attrs may resurface on reboot") when the erase/commit
+  failed. Log tense honesty: "retried / re-wiped next boot" → "will
+  retry / will re-wipe next boot" (zap_store, device_shadow, rule_store).
+- **zap_store**: the schema-mismatch wipe ignored
+  `nvs_erase_all`/`nvs_set_u16`/`nvs_commit` (:107 pre-fix) — a failed
+  erase followed by the version overwrite would present stale-layout
+  blobs as current. The version marker is now written only after a clean
+  erase and every op is checked (first-boot marker write checked too).
+  "Device saved" was logged even when the commit failed (:195 pre-fix);
+  the log is gated on the commit now and the commit error is logged (the
+  return value was already honest). The delete-path erase-all/rewrite
+  loop ignored per-key erase/set errors and committed anyway
+  (:259-:265 pre-fix) — it now aborts WITHOUT the commit on the first
+  failure, so a half-compacted slot table can never become durable.
+- **rule_store**: the boot-time schema check ignored its
+  `set_u16`/`commit` returns (:91 pre-fix) — a failed marker write
+  silently re-wiped the rule store on every boot. Each op now logs its
+  failure (marker written only after a clean wipe). Corrupt-entry
+  cleanup erases (load + load_all) stay best-effort but log failures.
+- **rule_store**: tombstone tri-state (T9 follow-up).
+  `rule_store_delete` collapsed "not found" and "erase/commit failed"
+  into one `false`, and the flush settle forced tombstones ok — a
+  genuine erase failure cleaned the tombstone and the deleted rule
+  resurrected from NVS on reboot. New internal
+  `rule_store_delete_err()` distinguishes `ESP_OK` /
+  `ESP_ERR_NVS_NOT_FOUND` / failure; the flush settles not-found
+  (nothing was stored) and keeps the slot pending for next-tick retry on
+  real failures, per the T9 FLUSHING protocol. Public bool API and
+  semantics unchanged (no external callers; not-found no longer spams
+  ESP_LOGE from the tombstone path).
+- **device_shadow**: the v7 version bump ignored
+  `erase_all`/`set_u8`/`commit` (:469 pre-fix) — a failed erase plus the
+  marker overwrite would hide stale v6 blobs behind the v7 marker. The
+  marker is now written only after a clean erase; the attr-cache clear's
+  `erase_key`+`commit` are checked too (not-found stays silent — the
+  device may never have persisted).
+- **zap_store / rule_store flush**: `xTaskCreate` returns were ignored
+  and `s_task_started` stayed true on failure (zap :206 pre-fix) — dirty
+  marks would defer into a table no task ever drains (silent persistence
+  loss). On create failure the flag rolls back so marks fall through to
+  the direct-save/delete path, and the failure is logged.
+- **simple_rules**: the TIMER action's block-time-0
+  `xTimerChangePeriod`/`xTimerReset`/`xTimerStart` (and `xTimerCreate`)
+  returns were ignored (:364 pre-fix) — on a full timer command queue
+  the timer action was silently lost. Arm failures now warn once per
+  boot.

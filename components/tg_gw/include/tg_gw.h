@@ -5,6 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 
+// F8-T19: single source of truth for the max accepted Telegram bot-token
+// length, shared by BOTH cores. Real tokens are `<bot_id>:<35-char-secret>`
+// ≈ 46 chars; 80 gives generous headroom while staying within the 96-byte
+// HapTgSettoken.token[97] HAP field (so a SET never silently truncates).
+// Previously S3 capped at 80 and P4 at 96 → an 81–96-char token was
+// accepted P4-side and silently dropped on S3.
+#define TG_TOKEN_MAX 80
+
 #ifdef __cplusplus
 extern "C" {
 #endif

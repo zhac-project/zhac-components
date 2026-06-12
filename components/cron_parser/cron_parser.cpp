@@ -50,7 +50,11 @@ static bool parse_field(const char* s, int min_val, int max_val,
     }
 
     // Comma-separated list of: N  |  N-M  |  N-M/step
+    // P2-T18 def 6 (FINDINGS §7): reject an over-length field instead of
+    // truncating it — a truncated field can still parse into a DIFFERENT
+    // (wrong) schedule (e.g. "1,2,...,59,6<cut>" loses the final token).
     char buf[128];
+    if (strlen(s) >= sizeof(buf)) return false;
     strncpy(buf, s, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -91,7 +95,13 @@ static bool parse_field(const char* s, int min_val, int max_val,
 bool cron_parse(const char* expr, CronExpr& out) {
     if (!expr || !*expr) return false;
 
+    // P2-T18 def 6 (FINDINGS §7): reject an over-length expression instead of
+    // truncating it. A silent strncpy clamp could lop off trailing fields (or
+    // mid-field) yet still split into 5–6 tokens that parse into a WRONG
+    // schedule. Bail with a parse failure so the rule is rejected, not
+    // misinterpreted.
     char buf[128];
+    if (strlen(expr) >= sizeof(buf)) return false;
     strncpy(buf, expr, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -257,7 +267,13 @@ time_t cron_next(const CronExpr& expr, time_t from_t) {
         // Check minute; if wrong, advance to top of next minute
         int minute = tm_val.tm_min;
         if (!(expr.minute_bits & (1ULL << minute))) {
-            t += (60 - tm_val.tm_sec);  // jump to :00 of next minute
+            // P2-T18 def 6 (FINDINGS §7): clamp tm_sec to 59 before the jump.
+            // On a leap-second tick glibc can report tm_sec==60, making
+            // (60 - tm_sec) == 0 — the loop would never advance t and spin
+            // forever. cron_matches already clamps the same way (:166).
+            int sec = tm_val.tm_sec;
+            if (sec > 59) sec = 59;
+            t += (60 - sec);  // jump to :00 of next minute
             continue;
         }
 

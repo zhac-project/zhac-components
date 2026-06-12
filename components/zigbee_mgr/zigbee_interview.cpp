@@ -254,17 +254,19 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     if (!is_rejoin) {
         dev->support_state  = static_cast<uint8_t>(SupportState::UNKNOWN);
     }
+    // F6/F35 (FINDINGS.md) — RESOLVED: the multi-second ZDO/Basic pipeline
+    // below used to dereference `dev` across blocking ZNP I/O after this
+    // unlock; a concurrent swap-with-last pool_remove could relocate the
+    // slot and a late write would land on the wrong record. The pipeline
+    // now runs entirely on `work`, a detached stack copy taken under the
+    // lock (`work` + the commit-block `snap` ≈ 1044 B of the 8 KiB
+    // zb_interview stack), and the results are
+    // committed field-by-field under a re-acquired lock at the end (see
+    // the commit block) — skipped if the device vanished mid-interview.
+    ZapDevice work = *dev;
+    dev = nullptr;  // poison: nothing below may touch the live slot unlocked
     zigbee_pool_unlock();
     zigbee_pool_mark_dirty();  // nwk may have changed on rejoin — rebuild hash index
-    // F6/F35 (FINDINGS.md) — KNOWN RESIDUAL: `dev` is dereferenced below
-    // across multi-second blocking ZNP I/O after this unlock. A concurrent
-    // swap-with-last pool_remove (rare — user delete / ZDO_LEAVE_IND during
-    // another device's interview) can relocate this slot, so a late write
-    // could land on the wrong record. The correct fix accumulates results
-    // into a local and commits under a re-acquired lock, but is entangled
-    // with interview_read_basic(dev) and zap_store_mark_dirty(dev), which
-    // both require the real pool slot — deferred to a coordinated refactor
-    // + on-hardware test (the bridges and rule engine are already fixed).
 
     if (is_rejoin)
         ESP_LOGI(TAG, "Device rejoin ieee=0x%016llx nwk=0x%04x", (unsigned long long)ieee, nwk);
@@ -283,7 +285,7 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
             return false;
         }
         if (wait_rsp(0x82, nwk, 3000) && s_rsp_frame.payload_len >= 6) {
-            dev->device_type = s_rsp_frame.payload[4] & 0x07;
+            work.device_type = s_rsp_frame.payload[4] & 0x07;
         }
     }
 
@@ -320,12 +322,12 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
         }
     }
 
-    dev->endpoint_count = ep_count;
-    memcpy(dev->endpoints, ep_list, ep_count < 8 ? ep_count : 8);
+    work.endpoint_count = ep_count;
+    memcpy(work.endpoints, ep_list, ep_count < 8 ? ep_count : 8);
 
     // Topology is known. Stay here until Basic read succeeds or times out —
     // later steps will promote to IDENTITY_READY or demote to IDENTITY_PENDING.
-    dev->interview_state = static_cast<uint8_t>(
+    work.interview_state = static_cast<uint8_t>(
         ep_count > 0 ? InterviewState::TOPOLOGY_READY : InterviewState::FAILED);
 
     // 3. ZDO_SIMPLE_DESC_REQ for each endpoint
@@ -363,13 +365,13 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
         // Zero the slot first so stale positions from a previous device
         // (pool slot recycled on rejoin) don't leak into the fallback.
         for (uint8_t c = 0; c < ZAP_CLUSTERS_PER_EP; c++) {
-            dev->clusters[e][c]     = 0;
-            dev->clusters_out[e][c] = 0;
+            work.clusters[e][c]     = 0;
+            work.clusters_out[e][c] = 0;
         }
         uint8_t parsed_in = 0;
         for (uint8_t c = 0; c < in_cnt && c < ZAP_CLUSTERS_PER_EP; c++) {
             if (kInListOff + c * 2 + 1 >= s_rsp_frame.payload_len) break;
-            dev->clusters[e][c] = le16(p + kInListOff + c * 2);
+            work.clusters[e][c] = le16(p + kInListOff + c * 2);
             parsed_in = c + 1;
         }
         const uint8_t out_off = (uint8_t)(kInListOff + in_cnt * 2);
@@ -379,7 +381,7 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
             for (uint8_t c = 0; c < out_cnt && c < ZAP_CLUSTERS_PER_EP; c++) {
                 uint8_t byte_off = out_off + 1 + c * 2;
                 if (byte_off + 1 >= s_rsp_frame.payload_len) break;
-                dev->clusters_out[e][c] = le16(p + byte_off);
+                work.clusters_out[e][c] = le16(p + byte_off);
                 parsed_out = c + 1;
             }
         }
@@ -390,9 +392,9 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
         // ZapDevice struct (-Werror=address-of-packed-member).
         uint16_t in_copy[ZAP_CLUSTERS_PER_EP];
         uint16_t out_copy[ZAP_CLUSTERS_PER_EP];
-        for (uint8_t c = 0; c < parsed_in;  ++c) in_copy[c]  = dev->clusters[e][c];
-        for (uint8_t c = 0; c < parsed_out; ++c) out_copy[c] = dev->clusters_out[e][c];
-        zhac_adapter_register_endpoint(dev->ieee_addr,
+        for (uint8_t c = 0; c < parsed_in;  ++c) in_copy[c]  = work.clusters[e][c];
+        for (uint8_t c = 0; c < parsed_out; ++c) out_copy[c] = work.clusters_out[e][c];
+        zhac_adapter_register_endpoint(ieee,
                                         ep_list[e],
                                         profile_id, device_id,
                                         in_copy,  parsed_in,
@@ -403,14 +405,14 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     // Failure here is NOT terminal: device is still marked IDENTITY_PENDING
     // so a later inbound Basic report can promote it to IDENTITY_READY and
     // trigger re-match (Step 2 of the backend-agnostic lifecycle plan).
-    dev->model_id[0] = '\0';
-    dev->manufacturer_name[0] = '\0';
+    work.model_id[0] = '\0';
+    work.manufacturer_name[0] = '\0';
     bool basic_ok = false;
     if (ep_count > 0) {
-        basic_ok = interview_read_basic(dev, nwk);
+        basic_ok = interview_read_basic(&work, nwk);
     }
-    if (dev->interview_state == static_cast<uint8_t>(InterviewState::TOPOLOGY_READY)) {
-        dev->interview_state = static_cast<uint8_t>(
+    if (work.interview_state == static_cast<uint8_t>(InterviewState::TOPOLOGY_READY)) {
+        work.interview_state = static_cast<uint8_t>(
             basic_ok ? InterviewState::IDENTITY_READY : InterviewState::IDENTITY_PENDING);
     }
     // Coalesced: intermediate save removed. A single zap_store_save_device
@@ -426,40 +428,91 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     // Match device and run configure steps. support_state is updated so the
     // matcher outcome is persisted alongside the device record and we do not
     // spam "no match" warnings on every rejoin.
-    const uint8_t prev_support = dev->support_state;
-    const bool supported = zhac_adapter_has_def(dev->ieee_addr,
-                                                 dev->model_id,
-                                                 dev->manufacturer_name);
+    const uint8_t prev_support = work.support_state;
+    const bool supported = zhac_adapter_has_def(ieee,
+                                                 work.model_id,
+                                                 work.manufacturer_name);
     if (supported) {
-        dev->support_state = static_cast<uint8_t>(SupportState::MATCHED);
-        if (prev_support != dev->support_state)
+        work.support_state = static_cast<uint8_t>(SupportState::MATCHED);
+        if (prev_support != work.support_state)
             ESP_LOGI(TAG, "definition matched: model='%s' mfg='%s'",
-                     dev->model_id, dev->manufacturer_name);
+                     work.model_id, work.manufacturer_name);
         // Configure runs off-task via the configure queue: keeps the
         // interview task free and gets exponential-backoff retries + dedup.
-        dev->configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
-        dev->configure_attempts = 0;
+        work.configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
+        work.configure_attempts = 0;
     } else {
-        dev->support_state = static_cast<uint8_t>(SupportState::UNMATCHED);
+        work.support_state = static_cast<uint8_t>(SupportState::UNMATCHED);
         // Demote to DEBUG when identity is still pending — re-match is
         // expected once Basic traffic arrives. Otherwise log once per state
         // transition, not per rejoin.
-        const bool identity_pending = (dev->interview_state ==
+        const bool identity_pending = (work.interview_state ==
             static_cast<uint8_t>(InterviewState::IDENTITY_PENDING));
         if (identity_pending) {
-            ESP_LOGD(TAG, "no match yet nwk=0x%04x — awaiting identity", dev->nwk_addr);
-        } else if (prev_support != dev->support_state) {
+            ESP_LOGD(TAG, "no match yet nwk=0x%04x — awaiting identity", work.nwk_addr);
+        } else if (prev_support != work.support_state) {
             ESP_LOGW(TAG, "no definition for nwk=0x%04x — device partially supported",
-                     dev->nwk_addr);
+                     work.nwk_addr);
         }
     }
-    zap_store_mark_dirty(dev, ZAP_PERSIST_HIGH);  // persist lifecycle state (user-visible)
+
+    // ── Commit (F6/F35) ───────────────────────────────────────────────
+    // Re-acquire the lock, re-find by IEEE, and write the pipeline
+    // results into the live slot FIELD-BY-FIELD — not `*live = work` —
+    // so concurrent mutations that landed mid-interview survive:
+    // nwk_addr (rejoin refresh via on_tc_dev_ind), friendly_name (user
+    // rename), flags (leave/rejoin), last_seen/link_quality (zcl
+    // liveness). If the device was hard-removed mid-interview, skip the
+    // commit entirely — do not resurrect it.
+    bool committed = false;
+    ZapDevice snap;   // post-commit copy for the NVS mark outside the lock
+    zigbee_pool_lock();
+    if (ZapDevice* live = pool_find_by_ieee(ieee)) {
+        live->device_type    = work.device_type;
+        live->endpoint_count = work.endpoint_count;
+        memcpy(live->endpoints,    work.endpoints,    sizeof(live->endpoints));
+        memcpy(live->clusters,     work.clusters,     sizeof(live->clusters));
+        memcpy(live->clusters_out, work.clusters_out, sizeof(live->clusters_out));
+        live->manufacturer_code = work.manufacturer_code;
+        // Late-identity guard: when our Basic read failed
+        // (IDENTITY_PENDING) but the late-identity path
+        // (zigbee_identity.cpp) already promoted the live slot to
+        // IDENTITY_READY mid-interview, keep its identity + lifecycle
+        // fields — matches the pre-refactor outcome where the late path
+        // won this race (it re-matches + enqueues configure itself).
+        const bool late_promoted =
+            work.interview_state ==
+                static_cast<uint8_t>(InterviewState::IDENTITY_PENDING) &&
+            live->interview_state ==
+                static_cast<uint8_t>(InterviewState::IDENTITY_READY);
+        if (!late_promoted) {
+            live->interview_state = work.interview_state;
+            memcpy(live->model_id, work.model_id, sizeof(live->model_id));
+            memcpy(live->manufacturer_name, work.manufacturer_name,
+                   sizeof(live->manufacturer_name));
+            live->support_state      = work.support_state;
+            live->configure_state    = work.configure_state;
+            live->configure_attempts = work.configure_attempts;
+        }
+        snap = *live;
+        committed = true;
+    }
+    zigbee_pool_unlock();
+
+    if (!committed) {
+        ESP_LOGW(TAG, "interview finished but device vanished mid-interview "
+                      "(removed) — results dropped ieee=0x%016llx",
+                 (unsigned long long)ieee);
+        return true;   // done; nothing left to persist, configure or announce
+    }
+
+    zap_store_mark_dirty(&snap, ZAP_PERSIST_HIGH);  // persist lifecycle state (user-visible)
 
     // Kick the deferred configure worker after persistence so the queued
     // work sees the committed support/configure state.
-    if (dev->support_state == static_cast<uint8_t>(SupportState::MATCHED) &&
-        dev->configure_state != static_cast<uint8_t>(ConfigureState::DONE)) {
-        zigbee_configure_enqueue(dev->ieee_addr);
+    if (snap.support_state == static_cast<uint8_t>(SupportState::MATCHED) &&
+        snap.configure_state != static_cast<uint8_t>(ConfigureState::DONE)) {
+        zigbee_configure_enqueue(ieee);
     }
 
     // Single-line lifecycle summary so the operator can tell at a glance
@@ -468,8 +521,8 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
     // silently waiting on late identity promotion.
     ESP_LOGI(TAG, "interview done nwk=0x%04x ieee=0x%016llx "
                   "interview=%u support=%u configure=%u",
-             dev->nwk_addr, (unsigned long long)dev->ieee_addr,
-             dev->interview_state, dev->support_state, dev->configure_state);
+             snap.nwk_addr, (unsigned long long)ieee,
+             snap.interview_state, snap.support_state, snap.configure_state);
 
     Event ev{};
     ev.type = EventType::DEVICE_JOIN;
@@ -496,33 +549,45 @@ static void task_interview(void*) {
         // JoinEvent (Xiaomi devices typically fire two TC_DEV_IND bursts
         // on wake) would reset interview_state=NONE and block dispatch
         // for the whole retry window while the device ignores ZDO.
+        // F6/F35: lock spans the find + nwk fix-up so a concurrent
+        // swap-with-last remove can't retarget `d` between the lookup
+        // and the write. The enqueue/log/event run on copied values
+        // after unlock.
+        bool fast_path = false;
+        uint16_t fp_nwk = 0;
+        zigbee_pool_lock();
         if (ZapDevice* d = pool_find_by_ieee(ev.ieee)) {
             if (d->interview_state ==
                     static_cast<uint8_t>(InterviewState::IDENTITY_READY)) {
                 if (d->nwk_addr != ev.nwk && ev.nwk != 0 &&
                     ev.nwk != 0xFFFE) {
                     d->nwk_addr = ev.nwk;
-                    zigbee_pool_mark_dirty();
+                    zigbee_pool_mark_dirty();   // recursive mutex — safe here
                 }
-                ESP_LOGI(TAG,
-                         "Rejoin fast-path: interview already complete "
-                         "ieee=0x%016llx nwk=0x%04x",
-                         (unsigned long long)ev.ieee, d->nwk_addr);
-                // Re-enqueue configure on rejoin. Device-side Tuya
-                // magic-packet unlock + setZones / on-join bindings are
-                // volatile: when the remote power-cycles and rejoins it
-                // returns to locked state and emits nothing until we
-                // walk the configure steps again. Skipping them (as we
-                // did before this fix) explained the "joined but no
-                // actions" reports on MiBoxer / Tuya remotes.
-                zigbee_configure_enqueue(d->ieee_addr);
-                Event out{};
-                out.type = EventType::DEVICE_JOIN;
-                uint64_t ieee = ev.ieee;
-                memcpy(out.data, &ieee, sizeof(ieee));
-                event_bus_publish(out);
-                continue;   // next queued JoinEvent
+                fp_nwk    = d->nwk_addr;
+                fast_path = true;
             }
+        }
+        zigbee_pool_unlock();
+        if (fast_path) {
+            ESP_LOGI(TAG,
+                     "Rejoin fast-path: interview already complete "
+                     "ieee=0x%016llx nwk=0x%04x",
+                     (unsigned long long)ev.ieee, fp_nwk);
+            // Re-enqueue configure on rejoin. Device-side Tuya
+            // magic-packet unlock + setZones / on-join bindings are
+            // volatile: when the remote power-cycles and rejoins it
+            // returns to locked state and emits nothing until we
+            // walk the configure steps again. Skipping them (as we
+            // did before this fix) explained the "joined but no
+            // actions" reports on MiBoxer / Tuya remotes.
+            zigbee_configure_enqueue(ev.ieee);
+            Event out{};
+            out.type = EventType::DEVICE_JOIN;
+            uint64_t ieee = ev.ieee;
+            memcpy(out.data, &ieee, sizeof(ieee));
+            event_bus_publish(out);
+            continue;   // next queued JoinEvent
         }
 
         s_active_interview_ieee = ev.ieee;
@@ -534,11 +599,13 @@ static void task_interview(void*) {
             // would target the device's old nwk and the ZDO response
             // would be dropped in `store_rsp` (src_nwk mismatch).
             uint16_t nwk = ev.nwk;
-            if (ZapDevice* d = pool_find_by_ieee(ev.ieee)) {
+            zigbee_pool_lock();   // F6/F35: short locked read, copy out nwk
+            if (const ZapDevice* d = pool_find_by_ieee(ev.ieee)) {
                 if (d->nwk_addr != 0 && d->nwk_addr != 0xFFFE) {
                     nwk = d->nwk_addr;
                 }
             }
+            zigbee_pool_unlock();
             s_active_interview_nwk = nwk;
             if (do_interview(ev.ieee, nwk)) break;
             if (attempt < INTERVIEW_MAX_ATTEMPTS) {
@@ -684,18 +751,27 @@ void zigbee_interview_flush_join_queue() {
 }
 
 bool zigbee_interview_trigger(uint64_t ieee) {
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35: short locked read — copy nwk out, never hold the raw
+    // pool pointer past the unlock.
+    uint16_t nwk = 0;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) {
+        nwk = dev->nwk_addr;
+        found = true;
+    }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGW(TAG, "interview_trigger: 0x%016llx not in pool", (unsigned long long)ieee);
         return false;
     }
-    JoinEvent ev{}; ev.ieee = ieee; ev.nwk = dev->nwk_addr;
+    JoinEvent ev{}; ev.ieee = ieee; ev.nwk = nwk;
     if (xQueueSend(s_join_queue, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "interview_trigger: queue full for 0x%016llx", (unsigned long long)ieee);
         return false;
     }
     ESP_LOGI(TAG, "interview_trigger: queued 0x%016llx nwk=0x%04x",
-             (unsigned long long)ieee, dev->nwk_addr);
+             (unsigned long long)ieee, nwk);
     return true;
 }
 

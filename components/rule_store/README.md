@@ -40,6 +40,8 @@ defined in `zap_common.h` so this header is small (~50 lines).
 | `bool rule_store_load(uint16_t rule_id, RuleSlot* out)` | Single-rule load. Validates blob length and CRC32; mismatch erases the key and returns false. |
 | `bool rule_store_delete(uint16_t rule_id)` | `nvs_erase_key` + commit. |
 | `uint16_t rule_store_load_all(RuleSlot* out, uint16_t max)` | Iterate the namespace; per-row size + CRC validation; corrupt rows are queued for erase and skipped. Returns count loaded into `out[0..max-1]`. |
+| `uint16_t rule_store_count()` | Cheap key-count of persisted rule slots in NVS; does not merge the writeback overlay or validate CRCs. Returns 0 on an uninitialised store. |
+| `uint16_t rule_store_max_id()` | Highest `rule_id` across the ENTIRE persisted store — all NVS slots plus uncommitted writeback edits. Parsed straight from the `r_%04X` key (no blob loads). Returns 0 when empty; callers allocating a fresh id derive it as `max_id + 1`. |
 | `bool rule_store_set_enabled(uint16_t, bool)` | Read-modify-write the enabled flag without touching the rest of the slot. |
 
 ### Writeback cache (preferred from REST path)

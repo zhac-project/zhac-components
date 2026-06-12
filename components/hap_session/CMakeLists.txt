@@ -4,5 +4,5 @@ idf_component_register(
     SRCS "hap_session.cpp"
     INCLUDE_DIRS "include"
     REQUIRES hap_protocol freertos
-    PRIV_REQUIRES metrics
+    PRIV_REQUIRES metrics esp_timer
 )

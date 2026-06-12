@@ -155,6 +155,7 @@ idf_component_register(
         freertos
     PRIV_REQUIRES
         metrics
+        zap_common   # ZAP_MAX_DEVICES — slot-table / runtime-store capacity
 )
 
 # Inherit the IDF defaults; add -Wall -Wextra for a bit more signal

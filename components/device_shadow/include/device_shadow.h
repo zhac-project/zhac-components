@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <stdbool.h>
 
+// Concurrency: event-bus FILTERS must not call shadow APIs that emit ZCL_ATTR
+// (process / config setters) — filters run in the publisher's task and
+// self-deadlock on the shadow's outer emit lock; drain-side HANDLERS are fine.
+
 // ── ShadowAttr — one cached attribute slot (84 bytes, string-keyed) ──────
 // Schema v6: ATTR_KEY_MAX widened 20→28 + ATTR_STR_MAX widened 32→48 so
 // long z2m action labels (`brightness_step_up_color_temperature_step_up`,
@@ -68,7 +72,9 @@ struct DeviceShadowEntry {
     uint32_t      throttle_last_ms; // runtime-only, milliseconds
     uint32_t      nvs_last_write_s; // runtime-only, seconds since boot
     volatile bool debounce_pending_flush; // set by timer cb if queue full (fallback)
+    volatile bool occupancy_timeout_pending; // set by timer cb if queue full (fallback)
     bool          nvs_dirty;        // runtime-only — skipped NVS write pending flush
+    bool          nvs_force;        // runtime-only — next sweep writes regardless of interval
     uint32_t      cfg_crc;          // F26: crc32 of last-persisted config (dedupe writes)
     bool          cfg_crc_valid;    // F26: true once cfg_crc reflects a persisted config
 };
@@ -84,9 +90,12 @@ void device_shadow_init();
 
 // Restore shadow entries (config + attrs + last_seen) for each device
 // in the supplied pool slice. Caller must hold the pool lock for the
-// duration of the call (the pool array is iterated in place). Fires a
-// DEVICE_JOIN event per restored device so downstream subscribers can
-// rebuild their state. Returns the number of entries restored.
+// duration of the call (the pool array is iterated in place). Table
+// mutation is serialised internally against the (already-running)
+// task_shadow housekeeping loop; NVS reads and the DEVICE_JOIN event
+// fired per restored device both happen outside the shadow lock.
+// Boot-path only: must not run concurrently with itself. Returns the
+// number of entries restored.
 uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count);
 
 // Called by zigbee_mgr / zhc_adapter_shadow_bridge to register a decoded
@@ -101,6 +110,16 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
 // Read current state. Returns number of attrs copied into out[0..max_count-1].
 uint8_t device_shadow_get_attrs(uint64_t ieee,
                                 ShadowAttr* out, uint8_t max_count);
+
+// Read ONE attribute by key. Returns true and copies the matching slot into
+// *out when the device exists and holds an attr whose key equals `key`;
+// false otherwise. Lets callers avoid pulling the whole 32-slot array (~2.7
+// KB) onto the stack just to read a single attr.
+//
+// Lock contract (T10): takes ONLY the leaf s_mutex — no NVS, no
+// event_bus_publish, no other lock acquired inside. Safe to call from the
+// event-drain task. `out` must be non-null.
+bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out);
 
 // Per-device config CRUD.
 bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg);

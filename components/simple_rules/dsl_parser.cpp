@@ -7,6 +7,9 @@
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
+#include <cerrno>
+#include <cstdint>   // INT32_MAX / INT32_MIN bounds for strtod clamp
+#include <cmath>     // std::isfinite — reject NaN/inf literals before cast
 
 static const char* TAG = "dsl_parser";
 
@@ -22,6 +25,16 @@ static void dsl_set_err(const char* fmt, ...) {
     va_end(ap);
 }
 const char* dsl_last_error() { return s_last_error; }
+
+// Lets simple_rules surface a non-parse failure (cache full, oversize DSL)
+// through the SAME channel the HAP RULE_* handlers already read for parse
+// errors, so the SPA/cloud sees a specific reason instead of the generic
+// "parse or store failed" placeholder. Shares s_last_error (set under the
+// simple_rules_add/update mutex, like dsl_parse itself).
+void dsl_set_last_error(const char* msg) {
+    if (!msg) { s_last_error[0] = '\0'; return; }
+    snprintf(s_last_error, sizeof(s_last_error), "%s", msg);
+}
 
 // ── String helpers ────────────────────────────────────────────────────────
 
@@ -196,14 +209,35 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
             t->match_val_type = VAL_STR;
             t->int_val = 0;
         } else {
+            // P2-T18 def 5 (FINDINGS §7): a raw strtod→int32_t cast is UB for
+            // out-of-range literals (e.g. `#temp>1e20` from a REST/cloud rule).
+            // Check errno==ERANGE and the INT32 bounds BEFORE rounding/casting.
             char* endp = nullptr;
+            errno = 0;
             double d = strtod(v, &endp);
-            if (endp == v) {
-                ESP_LOGW(TAG, "invalid numeric literal in DSL: %s", v);
+            // Bound the ROUNDED magnitude: round-half-away-from-zero can push
+            // a value up to 0.5 past d, so check (|d| + 0.5) against the
+            // int32 limits. This both keeps the subsequent (int32_t) cast in
+            // defined range and rejects out-of-range literals like 1e20.
+            //
+            // NaN must be rejected EXPLICITLY: `nan >= X` and `nan <= Y` are
+            // both false, so a `nan` literal (strtod parses it) would slip the
+            // magnitude guard and reach `(int32_t)nan` = UB. !std::isfinite(d)
+            // catches NaN AND inf in one check; the magnitude bounds below are
+            // then redundant for inf but KEPT (defensive + clear). isfinite is
+            // ordered first so non-finite values short-circuit before compare.
+            if (endp == v || errno == ERANGE || !std::isfinite(d) ||
+                d >= (double)INT32_MAX + 0.5 || d <= (double)INT32_MIN - 0.5) {
+                ESP_LOGW(TAG, "invalid/out-of-range numeric literal in DSL: %s", v);
                 dsl_set_err("invalid numeric literal '%s'", v);
                 return ParseResult::ERR_BAD_TRIGGER;
             }
-            t->int_val = (int32_t)(d < 0 ? d - 0.5 : d + 0.5);
+            double r = (d < 0 ? d - 0.5 : d + 0.5);
+            // Clamp the rounded result to the representable range before the
+            // cast — guards the exact-boundary case (e.g. INT32_MAX + 0.5).
+            if (r > (double)INT32_MAX) r = (double)INT32_MAX;
+            else if (r < (double)INT32_MIN) r = (double)INT32_MIN;
+            t->int_val = (int32_t)r;
             t->match_val_type = VAL_INT;
             t->str_val[0] = '\0';
         }
@@ -333,7 +367,15 @@ ParseResult dsl_parse(const char* dsl, uint16_t rule_id, ParsedRule* out) {
     // Split actions by ';'
     char actions_str[500]{};
     size_t alen = (size_t)(endon - action_start);
-    if (alen >= sizeof(actions_str)) alen = sizeof(actions_str) - 1;
+    // P2-T18 def 4 (FINDINGS §7): reject instead of silently clamping to 499.
+    // A clamp parsed a truncated (different) action set than the rule the
+    // caller submitted / the slot persists, so the live and stored rules
+    // diverged. Surface a real error.
+    if (alen >= sizeof(actions_str)) {
+        dsl_set_err("action section too long (max %u)",
+                    (unsigned)(sizeof(actions_str) - 1));
+        return ParseResult::ERR_ACTION_TOO_LONG;
+    }
     memcpy(actions_str, action_start, alen);
 
     char* tok = actions_str;

@@ -4,6 +4,8 @@
 #include "zap_store.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "nvs_checked.h"
+#include "nvs_namespaces.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
@@ -14,7 +16,9 @@
 #include <cstdlib>
 
 static const char* TAG     = "zap_store";
-static const char* NVS_NS  = "zap_v0";
+// P2 (FINDINGS §8.5): use the central namespace registry rather than an
+// inlined "zap_v0" literal — one place audits every NVS namespace string.
+static const char* NVS_NS  = zap_nvs::DEVICE_POOL;
 static bool        s_ready = false;
 
 // F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
@@ -68,13 +72,23 @@ static int16_t index_find_locked(uint64_t ieee) {
 
 // ── CRC32 integrity ──────────────────────────────────────────────────────
 
-// Compute CRC32 over the entire ZapDevice with the crc32 field zeroed.
-// Mirrors the pattern used in rule_store for RuleSlot integrity.
+// Compute CRC32 over a ZapDevice whose crc32 field is ALREADY zeroed by the
+// caller. No defensive stack copy — the save path holds a crc-zeroed copy
+// and the verify path zeroes the field around the check. Keeping the copy
+// out of here avoids a redundant 522 B stack frame + memcpy per call
+// (FINDINGS §8.4).
+static inline uint32_t zap_device_crc_zeroed(const ZapDevice* d) {
+    return esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(d), sizeof(*d));
+}
+
+// Compute CRC32 over an arbitrary ZapDevice (crc32 field excluded). Used by
+// the load path, where the in-RAM record carries the STORED crc32 that must
+// be preserved for the equality check — so this variant zeroes a copy.
 static uint32_t zap_device_crc(const ZapDevice* d) {
     ZapDevice tmp;
     memcpy(&tmp, d, sizeof(tmp));
     tmp.crc32 = 0;
-    return esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(&tmp), sizeof(tmp));
+    return zap_device_crc_zeroed(&tmp);
 }
 
 // Schema version stored in NVS alongside data.
@@ -104,14 +118,26 @@ void zap_store_init() {
                 ESP_LOGW(TAG, "NVS schema version mismatch: stored=%u current=%u — "
                          "erasing device store",
                          stored_ver, ZAP_STORE_SCHEMA_VERSION);
-                nvs_erase_all(h);
-                nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION);
-                nvs_commit(h);
+                esp_err_t acc = ESP_OK;
+                nvs_seq(&acc, nvs_erase_all(h), TAG, "erase_all devpool");
+                if (acc == ESP_OK) {
+                    // Version marker only after a clean wipe — writing the
+                    // new version over a failed erase would let stale-layout
+                    // blobs sit behind the current marker.
+                    nvs_seq(&acc, nvs_set_u16(h, "schema_ver",
+                                              ZAP_STORE_SCHEMA_VERSION),
+                            TAG, "set_u16 schema_ver");
+                    nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
+                }
+                if (acc != ESP_OK)
+                    ESP_LOGE(TAG, "schema wipe incomplete — will retry next boot");
             }
         } else {
             // First boot with versioning — write current version
-            nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION);
-            nvs_commit(h);
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION),
+                    TAG, "set_u16 schema_ver");
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
         }
         nvs_close(h);
     }
@@ -147,13 +173,32 @@ bool zap_store_save_device(const ZapDevice* dev) {
     if (!s_idx_built) index_build_locked(h);
     int16_t found_idx = index_find_locked(dev->ieee_addr);
 
+    // Capacity guard (FINDINGS §8.1): a NEW device (found_idx < 0) at a full
+    // store would take idx = count = ZAP_MAX_DEVICES, write blob "d00c8",
+    // and bump cnt to 201 — but the index array and every load/delete loop
+    // cap at ZAP_MAX_DEVICES, so that slot is unreferenced. Each later save
+    // of the same IEEE re-misses the index, re-appends another 522 B blob at
+    // an ever-higher idx, and re-bumps cnt: unbounded NVS growth until the
+    // partition is exhausted. Reject BEFORE any write or count bump. An
+    // existing device (found_idx >= 0) is always an in-place rewrite and is
+    // never rejected, even at capacity.
+    if (found_idx < 0 && count >= ZAP_MAX_DEVICES) {
+        ESP_LOGE(TAG, "device store FULL (%u/%u) — rejecting save ieee=0x%016llx",
+                 count, (unsigned)ZAP_MAX_DEVICES,
+                 (unsigned long long)dev->ieee_addr);
+        nvs_close(h);
+        store_unlock();
+        return false;
+    }
+
     uint16_t idx = (found_idx >= 0) ? static_cast<uint16_t>(found_idx) : count;
 
-    // Compute CRC32 before saving (zero the field so it's excluded from checksum).
+    // Compute CRC32 before saving (zero the field so it's excluded from the
+    // checksum, then CRC the zeroed copy in place — no second stack copy).
     ZapDevice saved_dev;
     memcpy(&saved_dev, dev, sizeof(saved_dev));
     saved_dev.crc32 = 0;
-    saved_dev.crc32 = zap_device_crc(&saved_dev);
+    saved_dev.crc32 = zap_device_crc_zeroed(&saved_dev);
 
     // For a new device, bump "cnt" BEFORE writing the blob so that a power
     // loss between the two writes leaves a referenced-but-unwritten slot
@@ -181,19 +226,23 @@ bool zap_store_save_device(const ZapDevice* dev) {
         return false;
     }
 
-    err = nvs_commit(h);
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool save");
     nvs_close(h);
 
     // F16: keep the index in sync on success. NVS commits atomically, so on
     // failure NVS is unchanged and the index must stay as-is.
-    if (err == ESP_OK && idx < ZAP_MAX_DEVICES) {
+    if (acc == ESP_OK && idx < ZAP_MAX_DEVICES) {
         s_idx_ieee[idx] = dev->ieee_addr;
         if (idx >= s_idx_count) s_idx_count = static_cast<uint16_t>(idx + 1);
     }
     store_unlock();
 
-    ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
-    return err == ESP_OK;
+    // Success log gated on the commit — a failed save must not read as
+    // "Device saved" in the log while the function returns false.
+    if (acc == ESP_OK)
+        ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
+    return acc == ESP_OK;
 }
 
 // ── Delete device — atomic read-all / erase-all / rewrite / commit ───────
@@ -202,29 +251,37 @@ bool zap_store_save_device(const ZapDevice* dev) {
 // erase all keys, write back compacted set, single commit.
 
 bool zap_store_delete_device(uint64_t ieee) {
-    // ZapDevice is ~450 B; ZAP_MAX_DEVICES=200 would push 90 KB onto the
-    // ~4 KB hap_slave stack. Prefer PSRAM (P4 has it), fall back to
-    // internal heap.
-    ZapDevice* devs = static_cast<ZapDevice*>(heap_caps_calloc(
-        ZAP_MAX_DEVICES, sizeof(ZapDevice),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!devs) devs = static_cast<ZapDevice*>(
-        std::calloc(ZAP_MAX_DEVICES, sizeof(ZapDevice)));
-    if (!devs) {
-        ESP_LOGE(TAG, "delete: alloc %u×%u failed",
-                 (unsigned)ZAP_MAX_DEVICES, (unsigned)sizeof(ZapDevice));
-        return false;
-    }
-
-    bool ok = false;
-    uint16_t count = 0;
+    bool      ok    = false;
+    uint16_t  count = 0;
+    ZapDevice* devs = nullptr;
     store_lock();   // F16: serialise with save + protect the IEEE index
     do {
-        // 1. Read all devices into the scratch buffer.
+        // 1. Read the stored count first, then size the scratch buffer to
+        //    the ACTUAL device count — not ZAP_MAX_DEVICES (FINDINGS §8.2).
+        //    The old fixed 200 × 522 B (~102 KB) alloc could fail on a
+        //    fragmented heap with PSRAM unavailable, making delete
+        //    impossible. cnt is read under the store lock to stay
+        //    consistent with the rewrite below.
         nvs_handle_t h = open_ns(NVS_READONLY);
         if (!h) break;
         nvs_get_u16(h, "cnt", &count);
         if (count > ZAP_MAX_DEVICES) count = ZAP_MAX_DEVICES;
+        if (count == 0) { nvs_close(h); break; }  // empty store — nothing to delete
+
+        // ZapDevice is ~522 B. Prefer PSRAM (P4 has it), fall back to
+        // internal heap. Sized to `count`, so a near-empty store costs
+        // a few hundred bytes rather than ~102 KB.
+        devs = static_cast<ZapDevice*>(heap_caps_calloc(
+            count, sizeof(ZapDevice), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!devs) devs = static_cast<ZapDevice*>(
+            std::calloc(count, sizeof(ZapDevice)));
+        if (!devs) {
+            ESP_LOGE(TAG, "delete: alloc %u×%u failed",
+                     (unsigned)count, (unsigned)sizeof(ZapDevice));
+            nvs_close(h);
+            break;
+        }
+
         bool read_ok = true;
         for (uint16_t i = 0; i < count; i++) {
             char key[8]; dev_key(key, i);
@@ -253,31 +310,33 @@ bool zap_store_delete_device(uint64_t ieee) {
         h = open_ns(NVS_READWRITE);
         if (!h) break;
 
+        // Any erase/rewrite failure aborts WITHOUT the commit: a partial
+        // rewrite must not become durable (committing after a failed
+        // erase/set could persist a half-compacted slot table).
+        esp_err_t acc = ESP_OK;
         uint16_t old_count = count + 1;  // +1 for the removed device
-        for (uint16_t i = 0; i < old_count; i++) {
+        for (uint16_t i = 0; i < old_count && acc == ESP_OK; i++) {
             char key[8]; dev_key(key, i);
-            nvs_erase_key(h, key);
+            nvs_seq(&acc, nvs_erase_key(h, key), TAG, "erase_key devpool");
         }
-        for (uint16_t i = 0; i < count; i++) {
+        for (uint16_t i = 0; i < count && acc == ESP_OK; i++) {
             char key[8]; dev_key(key, i);
-            nvs_set_blob(h, key, &devs[i], sizeof(ZapDevice));
+            nvs_seq(&acc, nvs_set_blob(h, key, &devs[i], sizeof(ZapDevice)),
+                    TAG, "set_blob devpool");
         }
-        nvs_set_u16(h, "cnt", count);
-
-        esp_err_t err = nvs_commit(h);
+        if (acc == ESP_OK)
+            nvs_seq(&acc, nvs_set_u16(h, "cnt", count), TAG, "set_u16 cnt");
+        if (acc == ESP_OK)
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool delete");
         nvs_close(h);
 
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "nvs_commit failed during delete: %s",
-                     esp_err_to_name(err));
-            break;
-        }
+        if (acc != ESP_OK) break;
         ok = true;
     } while (0);
 
     s_idx_built = false;   // F16: slot order changed — index rebuilt on next save
     store_unlock();
-    free(devs);
+    heap_caps_free(devs);
     if (ok) {
         ESP_LOGI(TAG, "Device deleted ieee=0x%016llx remaining=%u",
                  (unsigned long long)ieee, count);
@@ -290,8 +349,21 @@ bool zap_store_delete_device(uint64_t ieee) {
 // skipped and logged — the system continues with the remaining valid devices.
 
 uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
+    // FINDINGS §8.3: validate the destination, and take the store lock so the
+    // multi-blob scan is consistent vs a concurrent save/delete once the flush
+    // task is running (load is normally a cold boot path, but the flush task
+    // can write before the boot relist completes). Lock order: store_lock is
+    // the INNERMOST lock — the flush layer (zap_store_flush.cpp) always
+    // releases its own s_mtx before calling into save/delete, so taking
+    // s_store_mutex here cannot invert against it.
+    if (!pool || max_count == 0) {
+        ESP_LOGE(TAG, "load_devices: null pool or zero capacity");
+        return 0;
+    }
+
+    store_lock();
     nvs_handle_t h = open_ns(NVS_READONLY);
-    if (!h) return 0;
+    if (!h) { store_unlock(); return 0; }
 
     uint16_t count = 0;
     nvs_get_u16(h, "cnt", &count);
@@ -317,6 +389,7 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
     }
 
     nvs_close(h);
+    store_unlock();
     ESP_LOGI(TAG, "Loaded %u devices from NVS", loaded);
     return loaded;
 }

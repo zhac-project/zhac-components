@@ -3,12 +3,14 @@
 // components/hap_session/hap_session.cpp
 #include "hap_session.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "metrics/metrics_macros.h"
 #include <cstring>
+#include <cstdint>
 
 static const char* TAG = "hap_session";
 
@@ -34,13 +36,28 @@ static constexpr uint8_t  MAX_RETRIES    = 5;
 // path); PSRAM bandwidth is more than enough.
 static constexpr size_t   SLOT_BUF_SIZE  = HAP_MAX_PAYLOAD;
 
+// Defect 5 (FINDINGS §1.5): `hap_session_next_seq()` returns this when called
+// before init. A frame carrying it must NEVER be sent — the send path rejects
+// it with a hard error so a pre-init roundtrip fails fast instead of going on
+// the wire with seq=0 (treated as "no correlation") and silently timing out.
+// 0 is the natural choice: it is already the skip-0 / no-correlation value, so
+// no legitimate outbound frame ever carries it.
+static constexpr uint16_t SEQ_SENTINEL_UNINIT = 0;
+
 struct WinSlot {
     bool     active;
     uint16_t seq;
     HapFrame frame;
     uint8_t* payload_copy;   // allocated from PSRAM in hap_session_init
     uint8_t  retries;
-    uint32_t sent_ms;   // ms since boot when frame was last sent
+    // Defect 4 (FINDINGS §1.4): int64 monotonic µs→ms since boot. The old
+    // uint32 ms (xTaskGetTickCount*portTICK_PERIOD_MS) wrapped at ~49.7 days
+    // and could collide its sent_ms==0 sentinel with a real post-wrap tick of
+    // 0 → one spurious retransmit per slot per wrap. int64 esp_timer never
+    // wraps in any realistic uptime and is read ONLY for `active` slots
+    // (the tick loop short-circuits inactive slots first), so no magic
+    // sentinel is needed — `active` is the armed flag.
+    int64_t  sent_ms;   // ms since boot when frame was last sent
 };
 
 static WinSlot            s_win[WIN_SIZE];
@@ -48,10 +65,47 @@ static uint16_t           s_next_seq = 1;
 static HapSessionCfg      s_cfg;
 static SemaphoreHandle_t  s_mutex;
 
+// Defect 3 (FINDINGS §1.3): dedup against re-dispatch of NEEDS_ACK frames on
+// peer retransmit. See README §"Receive-side dedup & sequence space" for the
+// authoritative description. Two complementary mechanisms:
+//
+//  (a) Exact-match ring of recent (seq,type) pairs — catches the common case
+//      (a frame we just handled is re-sent because our ACK was lost). The ring
+//      was 16 entries; a burst of >16 distinct NEEDS_ACK frames between the
+//      original dispatch and the retransmit evicted the entry, so the stale
+//      frame slipped through and the handler ran twice (double DEVICE_DELETE /
+//      double rule-create). Enlarged 16→64 (entries are 4 B each ⇒ 256 B) so
+//      the window comfortably exceeds the peer's WIN_SIZE retransmit window.
+//
+//  (b) Monotonic high-water fast-path — tracks the highest seq seen per peer
+//      and drops any frame that is more than WIN_SIZE behind it as a definite
+//      stale duplicate, regardless of ring eviction. This is wrap-aware: seqs
+//      are uint16 and roll 0xFFFF→0x0001, so we compare via the signed
+//      difference trick (see seq_diff) rather than a raw `<`. The peer never
+//      has more than WIN_SIZE (=peer-side) frames outstanding, so a seq that
+//      far behind the high-water mark cannot be a fresh in-window frame.
 struct SeenEntry { uint16_t seq; uint8_t type; };
-static constexpr size_t SEEN_RING_SIZE = 16;
+static constexpr size_t SEEN_RING_SIZE = 64;
 static SeenEntry s_seen_ring[SEEN_RING_SIZE] = {};
 static uint8_t   s_seen_head = 0;
+
+// Per-peer monotonic high-water of received NEEDS_ACK seqs. `valid` guards the
+// cold-start case (no frame seen yet) so seq 0-vs-uninitialised is unambiguous.
+static uint16_t s_rx_high_water = 0;
+static bool     s_rx_high_water_valid = false;
+// A frame this far (or more) behind the high-water mark is a definite stale
+// dup. The peer's outstanding window is WIN_SIZE; allow a generous margin so a
+// merely-reordered in-window frame is never mistaken for stale.
+static constexpr int16_t STALE_BEHIND_THRESHOLD = WIN_SIZE;
+
+// uint16 wrap-aware ordering. Returns a>b as a small signed delta: positive ⇒
+// a is "ahead" of b, negative ⇒ "behind". Correct across the 0xFFFF→0x0001
+// boundary because the subtraction wraps mod 2^16 and the int16_t cast
+// re-centres it into [-32768, 32767]. e.g. seq_diff(0x0001, 0xFFFF) = +2,
+// seq_diff(0xFFFF, 0x0001) = -2.
+static inline int16_t seq_diff(uint16_t a, uint16_t b) {
+    return static_cast<int16_t>(static_cast<uint16_t>(a - b));
+}
 
 static bool seen_recently(uint16_t seq, uint8_t type) {
     for (size_t i = 0; i < SEEN_RING_SIZE; i++) {
@@ -60,13 +114,26 @@ static bool seen_recently(uint16_t seq, uint8_t type) {
     return false;
 }
 
+// True ⇒ `seq` is far enough behind the monotonic high-water mark that it can
+// only be a stale retransmit (burst-evicted from the ring). Wrap-safe.
+static bool is_stale_behind_window(uint16_t seq) {
+    if (!s_rx_high_water_valid) return false;
+    return seq_diff(s_rx_high_water, seq) >= STALE_BEHIND_THRESHOLD;
+}
+
 static void mark_seen(uint16_t seq, uint8_t type) {
     s_seen_ring[s_seen_head] = {seq, type};
     s_seen_head = (s_seen_head + 1) % SEEN_RING_SIZE;
+    // Advance the high-water mark only forward (wrap-aware): a freshly accepted
+    // in-window frame may carry a seq slightly ahead of any seen so far.
+    if (!s_rx_high_water_valid || seq_diff(seq, s_rx_high_water) > 0) {
+        s_rx_high_water = seq;
+        s_rx_high_water_valid = true;
+    }
 }
 
-static uint32_t now_ms() {
-    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+static int64_t now_ms() {
+    return esp_timer_get_time() / 1000;
 }
 
 static int find_slot_by_seq(uint16_t seq) {
@@ -95,6 +162,15 @@ void hap_session_init(const HapSessionCfg& cfg) {
     }
     s_cfg      = cfg;
     s_next_seq = 1;
+    // Fresh session: reset the receive-side dedup high-water and ring so a
+    // stale mark from a prior session (which reset s_next_seq back to 1) can't
+    // wrongly classify the first post-init frames as "behind the window".
+    // (hap_session_reset_link deliberately PRESERVES these — seq continuity is
+    // kept there; only a full re-init starts the seq space over.)
+    s_rx_high_water       = 0;
+    s_rx_high_water_valid = false;
+    s_seen_head           = 0;
+    memset(s_seen_ring, 0, sizeof(s_seen_ring));
     for (int i = 0; i < WIN_SIZE; i++) {
         if (first) {
             // 16 × 4 KB parked in PSRAM (fallback to internal for non-PSRAM
@@ -142,12 +218,15 @@ void hap_session_reset_link() {
 
 uint16_t hap_session_next_seq() {
     if (!s_mutex) {
-        // Called before hap_session_init() — likely a Lua script or
-        // other caller that beat the init order. Returning 0 is
-        // acceptable since the seq space wraps and the peer will
-        // accept it. Log once-ish so the bug surfaces.
-        ESP_LOGE(TAG, "next_seq before init — returning 0");
-        return 0;
+        // Defect 5 (FINDINGS §1.5): called before hap_session_init() — a
+        // caller (e.g. a Lua script) that beat the init order. Previously we
+        // returned 0 and let the frame go out; with seq=0 the peer treats it
+        // as "no correlation", so a roundtrip waiting on that seq silently
+        // timed out (and ate a full timeout before surfacing). Return the
+        // explicit uninit sentinel instead — hap_session_send() rejects it
+        // with ESP_ERR-class failure so the bug fails fast at the call site.
+        ESP_LOGE(TAG, "next_seq before init — returning uninit sentinel");
+        return SEQ_SENTINEL_UNINIT;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint16_t s = s_next_seq++;
@@ -159,6 +238,19 @@ uint16_t hap_session_next_seq() {
 bool hap_session_send(const HapFrame& frame) {
     if (!s_cfg.send) {
         ESP_LOGE(TAG, "send() before hap_session_init — drop");
+        return false;
+    }
+    // Defect 5 (FINDINGS §1.5): a seq of SEQ_SENTINEL_UNINIT can only come from
+    // hap_session_next_seq() being called before init. Refuse to put it on the
+    // wire — fail fast here (the caller's send returns false / its roundtrip
+    // returns an immediate error) rather than letting a seq=0 "no correlation"
+    // frame go out and silently time out. This is the shared send path used by
+    // BOTH peers (P4 hap_slave_send + S3 hap_master_send transports), so the
+    // guard covers every producer on either chip — including the NO_ACK data
+    // requests S3's hap_roundtrip_v2 correlates on.
+    if (frame.seq == SEQ_SENTINEL_UNINIT) {
+        ESP_LOGE(TAG, "send() with uninit seq=0 — rejecting (next_seq before init?) type=0x%02x",
+                 static_cast<uint8_t>(frame.type));
         return false;
     }
     // SYNC and NO_ACK frames bypass the window — no locking needed for send callback
@@ -248,9 +340,18 @@ void hap_session_on_receive(const HapFrame& frame) {
         return;
     }
 
-    // Data frame — send ACK if required
+    // Data frame — send ACK if required.
+    //
+    // Defect 3 (FINDINGS §1.3): drop-without-dispatch a duplicate NEEDS_ACK
+    // frame so the handler never runs twice on a peer retransmit. A frame is a
+    // duplicate if EITHER the recent (seq,type) ring still holds it (exact
+    // recent dup) OR it is far behind the monotonic high-water mark (a dup that
+    // was burst-evicted from the ring). We still re-send the ACK — the peer is
+    // retransmitting precisely because our prior ACK was lost — but we do NOT
+    // re-dispatch to on_frame.
     if ((frame.flags & HAP_FLAG_NEEDS_ACK) &&
-        seen_recently(frame.seq, static_cast<uint8_t>(frame.type))) {
+        (seen_recently(frame.seq, static_cast<uint8_t>(frame.type)) ||
+         is_stale_behind_window(frame.seq))) {
         HapFrame ack = hap_make_reply(frame, HapMsgType::ACK, HAP_FLAG_NO_ACK);
         ack.seq = hap_session_next_seq();
         s_cfg.send(ack);
@@ -293,7 +394,11 @@ void hap_session_on_receive(const HapFrame& frame) {
 // dedicated TX worker task fed by a queue; we haven't needed it.
 void hap_session_tick() {
     if (!s_mutex) return;  // tick scheduled before init — no-op until ready
-    uint32_t ms = now_ms();
+    // int64 to match WinSlot.sent_ms (Defect 4): the timeout delta `ms -
+    // ws.sent_ms` stays a small positive int64 (both are monotonic ms-since-
+    // boot from esp_timer), so `< ACK_TIMEOUT_MS` (uint32, promoted to int64)
+    // is exact — no truncation, no 49.7-day wrap.
+    int64_t ms = now_ms();
     bool link_dead_fired = false;
 
     // Collect frames to retransmit outside the lock to avoid calling send() under mutex

@@ -51,6 +51,7 @@ frames and reads via REST/WS — it never imports this header.
 | Symbol | Notes |
 |---|---|
 | `uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count)` | Copies up to `max_count` cached attrs into `out`. Returns count copied; 0 means device unknown or empty cache. Thread-safe. |
+| `bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out)` | Single-attr lookup by `key`; copies the matching slot into `*out` and returns true, else returns false (`out` untouched) if device/key absent. Avoids stacking the whole 32-slot array. Leaf-lock only (s_mutex; no NVS / event_bus / other lock); safe from the event-drain task. |
 
 ### Per-device config
 
@@ -86,7 +87,7 @@ frames and reads via REST/WS — it never imports this header.
 | `DeviceShadowEntry.attrs[]` | 32 | hard cap per device |
 | `PendingState.pending[]` | 32 | debounce coalesce buffer |
 | `ZAP_MAX_DEVICES` | 200 | upper bound on entries |
-| `NVS_SHADOW_VERSION` | **6** | bumped on every layout change; mismatch wipes the namespace |
+| `NVS_SHADOW_VERSION` | **7** (v7 = F26 blob ver+count+CRC header) | bumped on every layout change; mismatch wipes the namespace |
 | Worst-case PSRAM | 32 attrs × 200 devs × 84 B ≈ **537 KB** | grew from 384 KB at v5 |
 
 ## Wire format / on-disk layout
@@ -109,30 +110,60 @@ entries cleanly.
 
 ## Threading & concurrency
 
-- One internal task `task_shadow` (priority 4, 4 KB stack) owns the
-  NVS write side and runs the debounce / occupancy timer callbacks.
-- All public entry points take an internal recursive mutex.
-- `device_shadow_process` uses two file-scope `static ZclAttribute
-  filtered[32]` / `merge[32]` scratch buffers — safe because the mutex
-  serializes callers and the alternative (5 KB on the stack) overflows
-  the `zcl_attr` task on Xiaomi cube interview bursts.
-- NVS persistence is throttled (`nvs_dirty` + `nvs_last_write_s`);
-  the pipeline writes at most every few seconds per device to spare
-  flash.
-- `debounce_pending_flush` is the documented race fallback for
-  SHA-F2: if the debounce timer fires while the rule queue is full,
-  the flag re-arms a single deferred flush instead of dropping the
-  buffer.
+The authoritative contract is the lock-discipline block comment above
+`s_mutex` / `s_emit_mutex` in `device_shadow.cpp` — re-sync this section
+from there when it changes. Summary:
+
+- `s_mutex` — **leaf** lock over the shadow table. Nothing else is ever
+  acquired inside it: no `nvs_*` (flash commits take tens–hundreds of
+  ms and used to stall the radio RX path and the 200-entry sweep), no
+  `event_bus_publish` (the bus snapshots under *its* lock and runs
+  filters in the publisher's task — shadow→bus nesting let any filter
+  touching the shadow API deadlock), no blocking timer ops
+  (0-block-time posts are fine).
+- `s_emit_mutex` — serialises every ZCL_ATTR-emitting path and is
+  ALWAYS taken BEFORE `s_mutex` (outer lock). It owns the shared
+  `s_staged` buffer and is held across `publish_staged()`, so events
+  publish after `s_mutex` is released yet still in exactly the order
+  their state mutations committed — parity with the old
+  publish-under-`s_mutex` total order. Read-only API (`get_attrs` /
+  `get_config`) takes `s_mutex` alone and is never stalled by publishes
+  or flash writes.
+- Debounce / occupancy timer callbacks run on the SHARED FreeRTOS timer
+  service task and never lock or emit: they do a zero-timeout enqueue
+  onto `s_task_queue` (`TASK_QUEUE_DEPTH` = 16) and on a full queue
+  fall back to a per-entry pending flag (log-once); `task_shadow`
+  (priority 4) drains the queue and does the locked work.
+- Event-bus **filters** must not call shadow APIs that emit — they run
+  in the publisher's task and self-deadlock on `s_emit_mutex`.
+  Read-only calls from filters are fine, as is anything from drain-side
+  handlers.
+- `task_shadow` sweeps every `SWEEP_PERIOD_MS` (100 ms): per entry it
+  takes both locks, does RAM-only work (pending flush, occupancy apply,
+  blob serialize + flag clear), unlocks, then publishes and writes
+  flash OUTSIDE the locks.
+- NVS persistence is deferred: hot paths only mark `nvs_dirty`; the
+  sweep writes at most once per `NVS_MIN_INTERVAL_S` (300 s) per device
+  unless forced. The interval stamp is set before the unlocked write,
+  so a FAILED write re-marks dirty and naturally backs off ~300 s
+  instead of hammering failing flash every sweep.
+- `device_shadow_process` uses file-scope `static ZclAttribute`
+  scratch buffers (`filtered[32]` / `bypass[32]` / `merge[32]`) — safe
+  because callers hold `s_mutex` for the whole call and the alternative
+  (~8 KB on the stack) overflowed the `zcl_attr` task on Xiaomi cube
+  interview bursts.
 
 ## Failure modes
 
 | Condition | Behaviour |
 |---|---|
 | NVS open fails at init | Logs `"cache will run without persistence"`; cache stays in PSRAM only |
-| `NVS_SHADOW_VERSION` mismatch on boot | Namespace wiped; v5 → v6 cleared automatically on first boot of new firmware |
-| Per-attr blob size mismatch (older layout) | Single key erased, cache for that device empties on next report |
+| `NVS_SHADOW_VERSION` mismatch on boot | Namespace wiped; v6 → v7 cleared automatically on first boot of new firmware |
+| Per-attr blob short / wrong-size / bad-CRC on load | Blob rejected with `ESP_LOGW` and discarded; entry starts empty and re-fills from live traffic |
 | `ZAP_MAX_DEVICES` reached | New IEEE rejected with `ESP_LOGW` |
-| Debounce timer create fails | Update flushes immediately; no silent drop |
+| Debounce timer create fails | Entry flagged `debounce_pending_flush`; the `SWEEP_PERIOD_MS` (100 ms) sweep flushes the pending buffer — debounce degrades to ~sweep latency, nothing dropped |
+| NVS attr write fails in sweep | Entry re-marked dirty after the interval stamp → retried with a natural `NVS_MIN_INTERVAL_S` (300 s) backoff |
+| >`SHADOW_ATTR_MAX` (32) attrs staged before publish | Excess dropped from the ZCL_ATTR event stream only (cache upsert already applied); logged once + `s_staged_drop_count` |
 | Occupancy timer pool exhausted | Single `xTimerCreate` per device (lazy); failure logged once |
 
 ## Integration example
@@ -164,6 +195,13 @@ uint8_t n = device_shadow_get_attrs(ieee, buf, 32);
 
 ## Recent changes
 
+- **2026-06-11 concurrency-doc re-sync + staging observability
+  (BUILD-GATE-PENDING).** Threading section rewritten from the
+  authoritative lock-order comment in `device_shadow.cpp`; named
+  `SWEEP_PERIOD_MS` / `TASK_QUEUE_DEPTH`; per-device staging
+  `configASSERT`; staged-overflow drop counter + log-once; debounce
+  queue-full log-once. IDF matrix not yet rebuilt for this commit;
+  host harness deferred to the P1-T8 re-evaluation.
 - **2026-04-25 schema v6.** `ATTR_KEY_MAX` widened 20 → 28,
   `ATTR_STR_MAX` widened 32 → 48; `ShadowAttr` grew 60 → 84 B
   (SHA-F1 in `docs/FINDINGS.md`). NVS namespace bumped 5 → 6 — old

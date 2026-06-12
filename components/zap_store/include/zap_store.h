@@ -93,8 +93,15 @@ void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri);
 
 // Synchronously flush every dirty entry to NVS. Call from shutdown
 // handlers (esp_register_shutdown_handler), OTA handoff, etc.
+// Durability barrier: also waits (bounded) for writes already in flight
+// on the background flush task, so on return pending state is on flash
+// — not merely dequeued; entries whose write fails twice remain pending
+// and are logged at error level.
+// Blocks; task context only (uses vTaskDelay).
 void zap_store_flush_now();
 
-// Force-flush one device by IEEE (blocking). Returns true if the entry
-// was flushed or not present.
+// Force-flush one device by IEEE (blocking, task context only). Returns
+// true once the device's pending state is durable on flash (or nothing
+// was pending); false if the NVS write failed or an in-flight write did
+// not settle within the bounded wait.
 bool zap_store_flush_device(uint64_t ieee);

@@ -22,8 +22,15 @@
 
 static const char* TAG = "simple_rules";
 
-static constexpr uint8_t MAX_DISPATCH_DEPTH = 8;
-static uint8_t           s_dispatch_depth   = 0;
+// TTL for rule→rule event chains. Replaces the old MAX_DISPATCH_DEPTH
+// counter, which was dead code: rule-event delivery is queue-based, so a
+// self-feeding rule (`ON Event#x DO event x ENDON`) re-enqueues into the
+// queue event_bus_drain is draining and every hop arrives as a fresh
+// dispatch_event call at depth 0 — the drain never returned and the P4
+// main loop wedged until the watchdog rebooted (with the rule persisted,
+// it re-wedged every boot). Instead each RULE_EVENT payload carries a hop
+// counter; the EVENT action drops the republish once the chain is this long.
+static constexpr uint8_t MAX_EVENT_HOPS = 8;
 
 // ── In-memory rule cache ──────────────────────────────────────────────────
 
@@ -75,18 +82,28 @@ static void timer_cb(TimerHandle_t xTimer) {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 static uint16_t next_rule_id() {
-    uint16_t max_id = 0;
+    // P2-T18 def 1 (FINDINGS §7): derive the id from the ENTIRE persisted
+    // store, not just the 64-entry in-memory cache. The cache holds at most
+    // MAX_CACHED_RULES of up to ZAP_MAX_RULES (256) persisted rules; a
+    // persisted-but-uncached rule is invisible to a cache-only scan, so its
+    // id could be reissued here and the deferred NVS write would then
+    // silently overwrite it (permanent data loss). rule_store_max_id()
+    // walks all NVS keys + the writeback overlay.
+    uint16_t max_id = rule_store_max_id();
     for (uint16_t i = 0; i < s_rule_count; i++)
         if (s_rules[i].rule_id > max_id) max_id = s_rules[i].rule_id;
     // F25 (FINDINGS.md): max_id+1 wraps to 0 at 0xFFFF and could collide with
     // an existing rule. Fast path while ids are small; otherwise scan for the
-    // lowest free id (always exists — s_rule_count is capped far below 65535).
+    // lowest free id (always exists — rule count is capped far below 65535).
     if (max_id < 0xFFFF) return static_cast<uint16_t>(max_id + 1);
     for (uint16_t cand = 1; cand != 0; cand++) {
         bool used = false;
         for (uint16_t i = 0; i < s_rule_count; i++)
             if (s_rules[i].rule_id == cand) { used = true; break; }
-        if (!used) return cand;
+        if (used) continue;
+        // A free cache slot doesn't prove the id is free in the store.
+        RuleSlot probe{};
+        if (!rule_store_load(cand, &probe)) return cand;
     }
     return 0;
 }
@@ -119,6 +136,23 @@ static void reload_locked() {
     simple_rules_resolve_names(s_rules, s_rule_count);
     cron_cache_invalidate();   // F27: rules reloaded — drop stale cron cache
     free(slots);
+
+    // P2-T18 def 3 (FINDINGS §7): rule_store_load_all caps at
+    // MAX_CACHED_RULES, so when more rules are persisted than the active
+    // cache holds, an arbitrary subset is silently dropped (never evaluated).
+    // We deliberately keep the 64-active cap (raising to 256 = +~130 KB P4
+    // DRAM) but must not be silent about it — warn with the skipped count so
+    // operators know rules above the cap are inert. See README "Active-rule
+    // limit".
+    uint16_t persisted = rule_store_count();
+    if (persisted > s_rule_count) {
+        ESP_LOGW(TAG,
+                 "%u persisted rules but only %u active (cap=%u): %u rule(s) "
+                 "are stored yet NOT evaluated — reduce rule count or raise "
+                 "MAX_CACHED_RULES",
+                 persisted, s_rule_count, MAX_CACHED_RULES,
+                 (unsigned)(persisted - s_rule_count));
+    }
 }
 
 // Expand %value% in src into dst using the supplied substitution string.
@@ -294,20 +328,18 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                 ESP_LOGW(TAG, "zigbee.toggle: device '%s' not found", a.arg0);
                 break;
             }
-            ShadowAttr sa[32];
-            uint8_t n = device_shadow_get_attrs(snap.ieee_addr, sa, 32);
+            // P2-T18 def 7 (FINDINGS §7): read just the one attr by key
+            // instead of copying the whole 32-slot ShadowAttr array (~2.7 KB)
+            // onto this shared event-drain task stack.
+            ShadowAttr cur{};
             int32_t cur_int = -1;
             bool found = false;
             bool is_bool = false;
-            for (uint8_t j = 0; j < n; j++) {
-                if (strcmp(sa[j].key, a.arg1) == 0) {
-                    if (sa[j].val_type == VAL_BOOL || sa[j].val_type == VAL_INT) {
-                        cur_int = sa[j].int_val;
-                        is_bool = (sa[j].val_type == VAL_BOOL);
-                        found = true;
-                    }
-                    break;
-                }
+            if (device_shadow_get_attr(snap.ieee_addr, a.arg1, &cur) &&
+                (cur.val_type == VAL_BOOL || cur.val_type == VAL_INT)) {
+                cur_int = cur.int_val;
+                is_bool = (cur.val_type == VAL_BOOL);
+                found = true;
             }
             if (!found) {
                 ESP_LOGW(TAG, "zigbee.toggle: attr '%s' on '%s' missing or non-numeric — skip",
@@ -342,12 +374,26 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
         }
 
         case ActionType::EVENT: {
-            Event ev{};
-            ev.type = EventType::RULE_EVENT;
-            auto& p = *reinterpret_cast<RuleEventPayload*>(ev.data);
+            // Hop TTL: if this rule was itself triggered by a RULE_EVENT,
+            // carry the chain length forward; any other trigger (attr/
+            // boot/timer/MQTT) starts a fresh chain at hop 0. Refusing to
+            // republish past MAX_EVENT_HOPS cuts self-feeding loops that
+            // would otherwise wedge the drain loop forever.
+            uint8_t src_hop = 0;
+            if (ev && ev->type == EventType::RULE_EVENT)
+                src_hop = reinterpret_cast<const RuleEventPayload*>(ev->data)->hop;
+            if (src_hop >= MAX_EVENT_HOPS) {
+                ESP_LOGW(TAG, "event '%s': rule event loop cut at hop %u (rule %u)",
+                         a.arg0, src_hop, rule.rule_id);
+                break;
+            }
+            Event out{};
+            out.type = EventType::RULE_EVENT;
+            auto& p = *reinterpret_cast<RuleEventPayload*>(out.data);
             strncpy(p.name, a.arg0, sizeof(p.name) - 1);
             p.name[sizeof(p.name) - 1] = '\0';
-            event_bus_publish(ev);
+            p.hop = static_cast<uint8_t>(src_hop + 1);
+            event_bus_publish(out);
             break;
         }
 
@@ -360,13 +406,30 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
             uint32_t ms = (uint32_t)strtoul(a.arg1, nullptr, 10);
             if (ms == 0) ms = 1;
             TimerHandle_t& tmr = s_timers[idx - 1];
+            // P1-T8: block-time-0 timer commands return pdFAIL on a full
+            // timer command queue — previously ignored, so the rule's
+            // timer action was silently lost. Warn (once per boot, this
+            // can fire per event under a storm) so it's visible.
+            bool armed = true;
             if (tmr) {
-                xTimerChangePeriod(tmr, pdMS_TO_TICKS(ms), 0);
-                xTimerReset(tmr, 0);
+                if (xTimerChangePeriod(tmr, pdMS_TO_TICKS(ms), 0) != pdPASS)
+                    armed = false;
+                if (xTimerReset(tmr, 0) != pdPASS)
+                    armed = false;
             } else {
                 tmr = xTimerCreate("rule_tmr", pdMS_TO_TICKS(ms),
                                    pdFALSE, (void*)(uintptr_t)(uint8_t)idx, timer_cb);
-                if (tmr) xTimerStart(tmr, 0);
+                if (!tmr || xTimerStart(tmr, 0) != pdPASS)
+                    armed = false;
+            }
+            if (!armed) {
+                static bool s_timer_warned = false;
+                if (!s_timer_warned) {
+                    s_timer_warned = true;
+                    ESP_LOGW(TAG, "timer %d: arm failed (command queue full "
+                                  "or create failed) — action lost; further "
+                                  "drops suppressed", idx);
+                }
             }
             break;
         }
@@ -408,11 +471,9 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
 // ── Event dispatch ────────────────────────────────────────────────────────
 
 static void dispatch_event(const Event& ev) {
-    if (s_dispatch_depth >= MAX_DISPATCH_DEPTH) {
-        ESP_LOGE(TAG, "rule dispatch depth limit (%u) reached — possible event loop, dropping event type=%d",
-                 MAX_DISPATCH_DEPTH, static_cast<int>(ev.type));
-        return;
-    }
+    // Event-loop protection lives in the EVENT action (MAX_EVENT_HOPS TTL
+    // carried in RuleEventPayload), not here — see the comment at the
+    // constant for why a dispatch-depth counter could never trip.
 
     // LUA-F8 + CC-F5: do not hold s_mutex across action dispatch.
     // Snapshot the matching rule indices + their stringified event
@@ -429,7 +490,6 @@ static void dispatch_event(const Event& ev) {
     char     matched_val[MAX_MATCHED_PER_EVENT][32];
     uint16_t matched_id [MAX_MATCHED_PER_EVENT];
     uint8_t  matched_count = 0;
-    s_dispatch_depth++;
     for (uint16_t i = 0; i < s_rule_count && matched_count < MAX_MATCHED_PER_EVENT; i++) {
         if (!s_rules[i].enabled) continue;
         char event_val[32] = {};
@@ -441,7 +501,6 @@ static void dispatch_event(const Event& ev) {
             matched_count++;
         }
     }
-    s_dispatch_depth--;
     xSemaphoreGiveRecursive(s_mutex);
 
     for (uint8_t i = 0; i < matched_count; i++) {
@@ -554,6 +613,25 @@ void simple_rules_reload() {
 bool simple_rules_add(const char* name, const char* dsl,
                        uint16_t* out_rule_id) {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
+    // P2-T18 def 4 (FINDINGS §7): a DSL that doesn't fit slot.src would parse
+    // in full for the live rule yet persist truncated, so the rule silently
+    // mutates / fails to parse after reboot. Reject up-front — no
+    // truncate-persist path. (REST/cloud contract is ≤499 B anyway.)
+    size_t dsl_len = dsl ? strlen(dsl) : 0;
+    if (dsl_len >= sizeof(((RuleSlot*)nullptr)->src)) {
+        dsl_set_last_error("rule DSL too long (max 499 bytes)");
+        xSemaphoreGiveRecursive(s_mutex);
+        return false;
+    }
+    // P2-T18 def 2 (FINDINGS §7): the active-rule cache is full. The old code
+    // still persisted to NVS and returned true, so the rule was accepted but
+    // never evaluated — a silent no-op. Fail explicitly instead; the message
+    // reaches the SPA/cloud via the HAP RULE_EXEC_RESULT err field.
+    if (s_rule_count >= MAX_CACHED_RULES) {
+        dsl_set_last_error("rule cache full (max 64 active rules)");
+        xSemaphoreGiveRecursive(s_mutex);
+        return false;
+    }
     uint16_t id = next_rule_id();
     ParsedRule r{};
     if (dsl_parse(dsl, id, &r) != ParseResult::OK) {
@@ -570,19 +648,16 @@ bool simple_rules_add(const char* name, const char* dsl,
         strncpy(slot.name, name, sizeof(slot.name) - 1);
         slot.name[sizeof(slot.name) - 1] = '\0';
     }
-    size_t dsl_len    = strlen(dsl);
-    slot.src_len      = (uint16_t)(dsl_len < sizeof(slot.src) ? dsl_len : sizeof(slot.src) - 1);
-    memcpy(slot.src, dsl, slot.src_len);
+    slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
+    memcpy(slot.src, dsl, dsl_len);
     // Deferred NVS commit — in-memory s_rules is authoritative at runtime;
     // PSRAM writeback task flushes to flash ≤5 s later. Saves ~10–50 ms
     // per REST round-trip and cuts flash wear on rapid edits.
     rule_store_mark_dirty(&slot);
-    if (s_rule_count < MAX_CACHED_RULES) {
-        r.enabled = true;
-        s_rules[s_rule_count++] = r;
-        simple_rules_resolve_names(&s_rules[s_rule_count - 1], 1);
-        cron_cache_invalidate();   // F27
-    }
+    r.enabled = true;
+    s_rules[s_rule_count++] = r;
+    simple_rules_resolve_names(&s_rules[s_rule_count - 1], 1);
+    cron_cache_invalidate();   // F27
     if (out_rule_id) *out_rule_id = id;
     xSemaphoreGiveRecursive(s_mutex);
     return true;
@@ -591,6 +666,14 @@ bool simple_rules_add(const char* name, const char* dsl,
 bool simple_rules_update(uint16_t rule_id,
                           const char* name, const char* dsl) {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
+    // P2-T18 def 4 (FINDINGS §7): reject oversize DSL up-front — no
+    // truncate-persist (see simple_rules_add).
+    size_t dsl_len = dsl ? strlen(dsl) : 0;
+    if (dsl_len >= sizeof(((RuleSlot*)nullptr)->src)) {
+        dsl_set_last_error("rule DSL too long (max 499 bytes)");
+        xSemaphoreGiveRecursive(s_mutex);
+        return false;
+    }
     ParsedRule r{};
     if (dsl_parse(dsl, rule_id, &r) != ParseResult::OK) {
         xSemaphoreGiveRecursive(s_mutex);
@@ -606,9 +689,8 @@ bool simple_rules_update(uint16_t rule_id,
         strncpy(slot.name, name, sizeof(slot.name) - 1);
         slot.name[sizeof(slot.name) - 1] = '\0';
     }
-    size_t dsl_len    = strlen(dsl);
-    slot.src_len      = (uint16_t)(dsl_len < sizeof(slot.src) ? dsl_len : sizeof(slot.src) - 1);
-    memcpy(slot.src, dsl, slot.src_len);
+    slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
+    memcpy(slot.src, dsl, dsl_len);
     rule_store_mark_dirty(&slot);  // deferred NVS commit (see simple_rules_add)
     for (uint16_t i = 0; i < s_rule_count; i++) {
         if (s_rules[i].rule_id == rule_id) {

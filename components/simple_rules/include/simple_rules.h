@@ -89,6 +89,11 @@ enum class ParseResult : uint8_t {
     ERR_BAD_TRIGGER,
     ERR_BAD_ACTION,
     ERR_TOO_MANY_ACTIONS,
+    // P2-T18 def 4 (FINDINGS §7): action section overrun the parse buffer.
+    // Previously the buffer was silently clamped to 499 bytes, so a long
+    // rule parsed a different (truncated) action set than the one stored —
+    // now an explicit error instead of a clamp.
+    ERR_ACTION_TOO_LONG,
 };
 
 // ── Matcher (also used in tests) ─────────────────────────────────────────
@@ -106,6 +111,12 @@ ParseResult dsl_parse(const char* dsl, uint16_t rule_id, ParsedRule* out);
 // string when the last call succeeded or no call has been made yet.
 // Used by HAP RULE_* handlers to propagate specific errors to the UI.
 const char* dsl_last_error();
+
+// Overwrite the last-error string from outside the parser, so non-parse
+// add/update failures (rule cache full, oversize DSL) reach the UI via the
+// same RULE_EXEC_RESULT err field the HAP handlers already read. Pass
+// nullptr to clear. Caller must serialise (simple_rules holds its mutex).
+void dsl_set_last_error(const char* msg);
 
 // Resolve friendly names → IEEE for all DEVICE_ATTR triggers.
 // Call after device pool is populated. Sets trigger.ieee; leaves 0 if not found.

@@ -6,12 +6,19 @@
 #include <cstdio>
 #include <cstring>
 
+#include "esp_attr.h"   // EXT_RAM_BSS_ATTR — park the synth pool in PSRAM
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "zhc/runtime/definition.hpp"
 #include "zhc/types.hpp"
 
 #include "definitions/_generic/_shared.hpp"
+
+#include "zhc_adapter_internal.hpp"
 
 namespace {
 
@@ -44,14 +51,11 @@ struct EndpointInfo {
 // `color_mode` is the only enum expose in the current fallback set.
 constexpr const char* kColorModeEnum[] = { "hs", "xy", "color_temp" };
 
-struct FallbackSlot {
-    std::uint64_t ieee;
-    std::uint32_t last_used_ms;
-    EndpointInfo  eps[kMaxEndpoints];
-    bool          built;
-    // PreparedDefinition and its backing arrays. All member arrays live
-    // inside the slot so `def` pointers stay valid for the slot's
-    // lifetime. Reset on re-register.
+// One fully-stitched synthetic definition: the PreparedDefinition plus
+// every array it points into. Self-contained — `def`'s pointers only
+// ever reference this struct's own members, so a published `&def`
+// stays valid for exactly as long as these bytes are not rewritten.
+struct BuiltDef {
     zhc::PreparedDefinition def;
     zhc::Expose             exposes[kMaxExposes];
     std::size_t             n_exposes;
@@ -71,7 +75,85 @@ struct FallbackSlot {
     char                    manufacturer[40];
 };
 
-FallbackSlot g_pool[kPoolSize] = {};
+struct FallbackSlot {
+    std::uint64_t ieee;
+    std::uint32_t last_used_ms;
+    EndpointInfo  eps[kMaxEndpoints];
+    bool          built;
+    // Base definition the active half was built against (registry defs
+    // are pointer-stable, so pointer equality is a valid "same base"
+    // test). Together with `built` this gates the rebuild fast path.
+    const zhc::PreparedDefinition* last_base;
+    // A/B double buffer. `bufs[active]` is the published half — its
+    // address may be held by readers (IeeeSlot.cached_def, an in-flight
+    // dispatch on the radio task, an httpd exposes walk). A rebuild
+    // writes ONLY the inactive half, then publishes by flipping
+    // `active` under the pool mutex; the previously-published half's
+    // bytes stay untouched until the NEXT rebuild of this same slot.
+    // Readers therefore never observe a half-written definition — the
+    // residual rule is the one-generation lifetime documented on
+    // `synth_definition()` in the header.
+    std::uint8_t  active;
+    BuiltDef      bufs[2];
+};
+
+// Parked in PSRAM (EXT_RAM_BSS_ATTR): 16 slots × A/B-buffered BuiltDef
+// is ~48 KB — far too much for internal DRAM .bss (the pool sat there
+// even before the double buffer, at ~23 KB). Accessed only from task
+// context under g_pool_mtx, never from an ISR, so external RAM is
+// fine. No-op (stays internal) on targets without PSRAM-BSS enabled —
+// same pattern as device_shadow's s_attr_blob.
+EXT_RAM_BSS_ATTR FallbackSlot g_pool[kPoolSize];
+
+// Pool mutex — serializes every accessor of g_pool (alloc / evict /
+// rebuild / lookup). Created from a global constructor so it exists
+// before any task can call into this TU (lazy create would itself be a
+// race). Same pattern as `g_cfg_addr_mtx` in zhc_adapter.cpp. The
+// radio-task per-frame hot path never enters this TU (it dispatches
+// through IeeeSlot.cached_def), so this lock is off the per-frame
+// critical path by construction.
+SemaphoreHandle_t g_pool_mtx = nullptr;
+struct PoolMtxInit { PoolMtxInit() { g_pool_mtx = xSemaphoreCreateMutex(); } };
+PoolMtxInit g_pool_mtx_init;
+
+struct PoolLock {
+    PoolLock()  { if (g_pool_mtx) xSemaphoreTake(g_pool_mtx, portMAX_DELAY); }
+    ~PoolLock() { if (g_pool_mtx) xSemaphoreGive(g_pool_mtx); }
+    PoolLock(const PoolLock&)            = delete;
+    PoolLock& operator=(const PoolLock&) = delete;
+};
+
+std::uint32_t fallback_now_ms() {
+    return static_cast<std::uint32_t>(esp_timer_get_time() / 1000ULL);
+}
+
+// Tell zhc_adapter to forget any IeeeSlot.cached_def /
+// .cached_supplement pointing into this slot's built-def storage
+// (both A/B halves) — must run BEFORE the slot is repurposed so the
+// old device's frames can't decode through the new device's def.
+void invalidate_adapter_cache_for(FallbackSlot& s) {
+    zhc_adapter_internal::invalidate_cached_defs_in(
+        &s.bufs[0], &s.bufs[0] + 2);
+}
+
+// Drop a slot's identity + interview data but PRESERVE bufs[] and
+// `active`: a stale reader may still hold a pointer into the
+// previously-published half, and the next rebuild (for whatever ieee
+// owns the slot next) writes the OTHER half first — so published bytes
+// survive one more generation even across a slot repurpose.
+//
+// Single invalidation choke point: EVERY path that frees or repurposes
+// a slot (clear, LRU evict, empty-slot realloc) funnels through here,
+// so the adapter-cache invalidation cannot be forgotten at a call
+// site. Re-invalidating an already-clean slot is a cheap no-op walk.
+void reset_slot(FallbackSlot& s) {
+    invalidate_adapter_cache_for(s);
+    s.ieee         = 0;
+    s.last_used_ms = 0;
+    std::memset(s.eps, 0, sizeof(s.eps));
+    s.built     = false;
+    s.last_base = nullptr;
+}
 
 // Linear scans are fine at pool size 16.
 FallbackSlot* find_slot(std::uint64_t ieee) {
@@ -80,18 +162,33 @@ FallbackSlot* find_slot(std::uint64_t ieee) {
     return nullptr;
 }
 
-FallbackSlot* alloc_slot(std::uint64_t ieee, std::uint32_t now_ms) {
+// `evicted_ieee` reports an LRU eviction (0 = none) so the caller can
+// log it AFTER releasing the pool mutex — no ESP_LOG under the lock.
+FallbackSlot* alloc_slot(std::uint64_t ieee, std::uint64_t& evicted_ieee) {
     if (auto* s = find_slot(ieee)) return s;
-    // Prefer an empty slot.
-    for (auto& s : g_pool) if (s.ieee == 0) { s = {}; s.ieee = ieee; s.last_used_ms = now_ms; return &s; }
-    // LRU eviction.
+    const std::uint32_t now = fallback_now_ms();
+    // Prefer an empty slot. reset_slot() runs even here: an empty slot
+    // may have been freed by clear()/eviction, and a racing decode can
+    // have re-cached a pointer into its bufs since — invalidate again
+    // before repurposing (the choke point makes this automatic).
+    for (auto& s : g_pool) {
+        if (s.ieee == 0) {
+            reset_slot(s);
+            s.ieee = ieee;
+            s.last_used_ms = now;
+            return &s;
+        }
+    }
+    // LRU eviction — `last_used_ms` is stamped on every
+    // register_endpoint / synth_definition touch, so the victim really
+    // is the least-recently-used device, not just slot 0. reset_slot()
+    // invalidates the adapter's cached pointers into the victim.
     FallbackSlot* victim = &g_pool[0];
     for (auto& s : g_pool) if (s.last_used_ms < victim->last_used_ms) victim = &s;
-    ESP_LOGW(TAG, "pool full — evicting ieee=0x%016llx",
-              static_cast<unsigned long long>(victim->ieee));
-    *victim = {};
+    evicted_ieee = victim->ieee;
+    reset_slot(*victim);
     victim->ieee = ieee;
-    victim->last_used_ms = now_ms;
+    victim->last_used_ms = now;
     return victim;
 }
 
@@ -118,58 +215,58 @@ bool base_handles_cluster(const zhc::PreparedDefinition* base,
     return false;
 }
 
-bool fz_already_in(FallbackSlot& s, const zhc::FzConverter* fz) {
-    for (std::size_t i = 0; i < s.n_fz; ++i) if (s.fz[i] == fz) return true;
+bool fz_already_in(BuiltDef& b, const zhc::FzConverter* fz) {
+    for (std::size_t i = 0; i < b.n_fz; ++i) if (b.fz[i] == fz) return true;
     return false;
 }
 
-void push_fz(FallbackSlot& s, const zhc::FzConverter* fz) {
-    if (!fz || fz_already_in(s, fz) || s.n_fz >= kMaxFz) return;
-    s.fz[s.n_fz++] = fz;
+void push_fz(BuiltDef& b, const zhc::FzConverter* fz) {
+    if (!fz || fz_already_in(b, fz) || b.n_fz >= kMaxFz) return;
+    b.fz[b.n_fz++] = fz;
 }
 
-void push_tz(FallbackSlot& s, const zhc::TzConverter* tz) {
-    if (!tz || s.n_tz >= kMaxTz) return;
-    for (std::size_t i = 0; i < s.n_tz; ++i) if (s.tz[i] == tz) return;
-    s.tz[s.n_tz++] = tz;
+void push_tz(BuiltDef& b, const zhc::TzConverter* tz) {
+    if (!tz || b.n_tz >= kMaxTz) return;
+    for (std::size_t i = 0; i < b.n_tz; ++i) if (b.tz[i] == tz) return;
+    b.tz[b.n_tz++] = tz;
 }
 
-void push_expose(FallbackSlot& s, const zhc::Expose& e) {
-    if (s.n_exposes >= kMaxExposes) return;
-    s.exposes[s.n_exposes++] = e;
+void push_expose(BuiltDef& b, const zhc::Expose& e) {
+    if (b.n_exposes >= kMaxExposes) return;
+    b.exposes[b.n_exposes++] = e;
 }
 
-void push_binding(FallbackSlot& s, std::uint8_t ep, std::uint16_t cluster) {
-    if (s.n_bindings >= kMaxBindings) return;
-    s.bindings[s.n_bindings++] = { ep, cluster };
+void push_binding(BuiltDef& b, std::uint8_t ep, std::uint16_t cluster) {
+    if (b.n_bindings >= kMaxBindings) return;
+    b.bindings[b.n_bindings++] = { ep, cluster };
 }
 
-void push_report(FallbackSlot& s, std::uint8_t ep, std::uint16_t cluster,
+void push_report(BuiltDef& b, std::uint8_t ep, std::uint16_t cluster,
                   std::uint16_t attr, std::uint8_t type,
                   std::uint16_t mn, std::uint16_t mx, std::uint32_t change) {
-    if (s.n_reports >= kMaxReports) return;
-    s.reports[s.n_reports++] = { ep, cluster, attr, type, mn, mx, change, 0 };
+    if (b.n_reports >= kMaxReports) return;
+    b.reports[b.n_reports++] = { ep, cluster, attr, type, mn, mx, change, 0 };
 }
 
-const std::uint8_t* push_read_attrs(FallbackSlot& s,
+const std::uint8_t* push_read_attrs(BuiltDef& b,
                                      const std::uint16_t* attrs,
                                      std::size_t count) {
     // Encode `count` attr ids LE into scratch; return pointer into scratch.
     const std::size_t need = count * 2;
-    if (s.n_scratch + need > kScratchCap) return nullptr;
-    std::uint8_t* p = s.scratch + s.n_scratch;
+    if (b.n_scratch + need > kScratchCap) return nullptr;
+    std::uint8_t* p = b.scratch + b.n_scratch;
     for (std::size_t i = 0; i < count; ++i) {
         p[2 * i + 0] = static_cast<std::uint8_t>(attrs[i] & 0xFF);
         p[2 * i + 1] = static_cast<std::uint8_t>((attrs[i] >> 8) & 0xFF);
     }
-    s.n_scratch += need;
+    b.n_scratch += need;
     return p;
 }
 
-void push_read_step(FallbackSlot& s, std::uint8_t ep, std::uint16_t cluster,
+void push_read_step(BuiltDef& b, std::uint8_t ep, std::uint16_t cluster,
                      const std::uint16_t* attrs, std::size_t count) {
-    if (s.n_steps >= kMaxSteps) return;
-    const std::uint8_t* payload = push_read_attrs(s, attrs, count);
+    if (b.n_steps >= kMaxSteps) return;
+    const std::uint8_t* payload = push_read_attrs(b, attrs, count);
     if (!payload) return;
     zhc::ConfigStep step{};
     step.op           = zhc::ConfigStepOp::Read;
@@ -180,211 +277,211 @@ void push_read_step(FallbackSlot& s, std::uint8_t ep, std::uint16_t cluster,
     step.payload      = payload;
     step.payload_len  = static_cast<std::uint8_t>(count * 2);
     step.wait_ms      = 1500;
-    s.steps[s.n_steps++] = step;
+    b.steps[b.n_steps++] = step;
 }
 
 // ─── Cluster emitters ──────────────────────────────────────────────
 //
 // Each emitter fires only if the device actually has the cluster.
 // Reuses the library's generic converters (no new FZ/TZ code needed).
+// `s` supplies the interview data (endpoints / clusters); `b` is the
+// build target — always the slot's INACTIVE half, never published.
 
-void emit_on_off(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_on_off(const FallbackSlot& s, BuiltDef& b,
+                  const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0006)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0006);
     if (!ep) return;
-    push_expose(s, { "state", zhc::ExposeType::Binary, zhc::Access::StateSet,
+    push_expose(b, { "state", zhc::ExposeType::Binary, zhc::Access::StateSet,
                        nullptr, nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzOnOff);
-    push_tz(s, &zhc::generic::kTzOnOff);
-    push_binding(s, ep, 0x0006);
-    push_report(s, ep, 0x0006, 0x0000, /*bool*/ 0x10, 0, 3600, 1);
+    push_fz(b, &zhc::generic::kFzOnOff);
+    push_tz(b, &zhc::generic::kTzOnOff);
+    push_binding(b, ep, 0x0006);
+    push_report(b, ep, 0x0006, 0x0000, /*bool*/ 0x10, 0, 3600, 1);
     static constexpr std::uint16_t kReadOnOff[] = { 0x0000 };
-    push_read_step(s, ep, 0x0006, kReadOnOff, 1);
+    push_read_step(b, ep, 0x0006, kReadOnOff, 1);
 }
 
-void emit_level_ctrl(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_level_ctrl(const FallbackSlot& s, BuiltDef& b,
+                      const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0008)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0008);
     if (!ep) return;
-    push_expose(s, { "brightness", zhc::ExposeType::Numeric,
+    push_expose(b, { "brightness", zhc::ExposeType::Numeric,
                        zhc::Access::StateSet, nullptr, nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzBrightness);
-    push_tz(s, &zhc::generic::kTzBrightness);
-    push_binding(s, ep, 0x0008);
-    push_report(s, ep, 0x0008, 0x0000, /*u8*/ 0x20, 5, 3600, 1);
+    push_fz(b, &zhc::generic::kFzBrightness);
+    push_tz(b, &zhc::generic::kTzBrightness);
+    push_binding(b, ep, 0x0008);
+    push_report(b, ep, 0x0008, 0x0000, /*u8*/ 0x20, 5, 3600, 1);
     static constexpr std::uint16_t kReadLevel[] = { 0x0000 };
-    push_read_step(s, ep, 0x0008, kReadLevel, 1);
+    push_read_step(b, ep, 0x0008, kReadLevel, 1);
 }
 
-void emit_color_ctrl(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_color_ctrl(const FallbackSlot& s, BuiltDef& b,
+                      const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0300)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0300);
     if (!ep) return;
-    push_expose(s, { "color_temp", zhc::ExposeType::Numeric,
+    push_expose(b, { "color_temp", zhc::ExposeType::Numeric,
                        zhc::Access::StateSet, "mired", nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_expose(s, { "color_x",    zhc::ExposeType::Numeric,
+    push_expose(b, { "color_x",    zhc::ExposeType::Numeric,
                        zhc::Access::State, nullptr, nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_expose(s, { "color_y",    zhc::ExposeType::Numeric,
+    push_expose(b, { "color_y",    zhc::ExposeType::Numeric,
                        zhc::Access::State, nullptr, nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_expose(s, { "color_mode", zhc::ExposeType::Enum,
+    push_expose(b, { "color_mode", zhc::ExposeType::Enum,
                        zhc::Access::State, nullptr, nullptr,
                        kColorModeEnum,
                        sizeof(kColorModeEnum) / sizeof(kColorModeEnum[0]),
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzColorTemperature);
-    push_fz(s, &zhc::generic::kFzColor);
-    push_tz(s, &zhc::generic::kTzColorTemp);
-    push_binding(s, ep, 0x0300);
-    push_report(s, ep, 0x0300, 0x0007, /*u16*/ 0x21, 5, 3600, 1);
+    push_fz(b, &zhc::generic::kFzColorTemperature);
+    push_fz(b, &zhc::generic::kFzColor);
+    push_tz(b, &zhc::generic::kTzColorTemp);
+    push_binding(b, ep, 0x0300);
+    push_report(b, ep, 0x0300, 0x0007, /*u16*/ 0x21, 5, 3600, 1);
     static constexpr std::uint16_t kReadColor[] = { 0x0003, 0x0004, 0x0007, 0x0008 };
-    push_read_step(s, ep, 0x0300, kReadColor, 4);
+    push_read_step(b, ep, 0x0300, kReadColor, 4);
 }
 
-void emit_power_cfg(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_power_cfg(const FallbackSlot& s, BuiltDef& b,
+                     const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0001)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0001);
     if (!ep) return;
-    push_expose(s, { "voltage", zhc::ExposeType::Numeric,
+    push_expose(b, { "voltage", zhc::ExposeType::Numeric,
                        zhc::Access::State, "mV", nullptr, nullptr, 0,
                        zhc::ExposeCategory::Diagnostic });
-    push_expose(s, { "battery", zhc::ExposeType::Numeric,
+    push_expose(b, { "battery", zhc::ExposeType::Numeric,
                        zhc::Access::State, "%", nullptr, nullptr, 0,
                        zhc::ExposeCategory::Diagnostic });
-    push_fz(s, &zhc::generic::kFzBattery);
-    push_binding(s, ep, 0x0001);
-    push_report(s, ep, 0x0001, 0x0020, /*u8*/ 0x20, 3600, 65535, 1);
-    push_report(s, ep, 0x0001, 0x0021, /*u8*/ 0x20, 3600, 65535, 1);
+    push_fz(b, &zhc::generic::kFzBattery);
+    push_binding(b, ep, 0x0001);
+    push_report(b, ep, 0x0001, 0x0020, /*u8*/ 0x20, 3600, 65535, 1);
+    push_report(b, ep, 0x0001, 0x0021, /*u8*/ 0x20, 3600, 65535, 1);
     static constexpr std::uint16_t kReadBatt[] = { 0x0020, 0x0021 };
-    push_read_step(s, ep, 0x0001, kReadBatt, 2);
+    push_read_step(b, ep, 0x0001, kReadBatt, 2);
 }
 
-void emit_temp_meas(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_temp_meas(const FallbackSlot& s, BuiltDef& b,
+                     const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0402)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0402);
     if (!ep) return;
-    push_expose(s, { "temperature", zhc::ExposeType::Numeric,
+    push_expose(b, { "temperature", zhc::ExposeType::Numeric,
                        zhc::Access::State, "°C", nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzTemperature);
-    push_binding(s, ep, 0x0402);
-    push_report(s, ep, 0x0402, 0x0000, /*i16*/ 0x29, 30, 3600, 100);
+    push_fz(b, &zhc::generic::kFzTemperature);
+    push_binding(b, ep, 0x0402);
+    push_report(b, ep, 0x0402, 0x0000, /*i16*/ 0x29, 30, 3600, 100);
     static constexpr std::uint16_t kReadT[] = { 0x0000 };
-    push_read_step(s, ep, 0x0402, kReadT, 1);
+    push_read_step(b, ep, 0x0402, kReadT, 1);
 }
 
-void emit_hum_meas(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_hum_meas(const FallbackSlot& s, BuiltDef& b,
+                    const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0405)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0405);
     if (!ep) return;
-    push_expose(s, { "humidity", zhc::ExposeType::Numeric,
+    push_expose(b, { "humidity", zhc::ExposeType::Numeric,
                        zhc::Access::State, "%", nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzHumidity);
-    push_binding(s, ep, 0x0405);
-    push_report(s, ep, 0x0405, 0x0000, /*u16*/ 0x21, 30, 3600, 100);
+    push_fz(b, &zhc::generic::kFzHumidity);
+    push_binding(b, ep, 0x0405);
+    push_report(b, ep, 0x0405, 0x0000, /*u16*/ 0x21, 30, 3600, 100);
     static constexpr std::uint16_t kReadH[] = { 0x0000 };
-    push_read_step(s, ep, 0x0405, kReadH, 1);
+    push_read_step(b, ep, 0x0405, kReadH, 1);
 }
 
-void emit_pressure_meas(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_pressure_meas(const FallbackSlot& s, BuiltDef& b,
+                         const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0403)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0403);
     if (!ep) return;
-    push_expose(s, { "pressure", zhc::ExposeType::Numeric,
+    push_expose(b, { "pressure", zhc::ExposeType::Numeric,
                        zhc::Access::State, "hPa", nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzPressure);
-    push_binding(s, ep, 0x0403);
-    push_report(s, ep, 0x0403, 0x0000, /*i16*/ 0x29, 30, 3600, 100);
+    push_fz(b, &zhc::generic::kFzPressure);
+    push_binding(b, ep, 0x0403);
+    push_report(b, ep, 0x0403, 0x0000, /*i16*/ 0x29, 30, 3600, 100);
     static constexpr std::uint16_t kReadP[] = { 0x0000 };
-    push_read_step(s, ep, 0x0403, kReadP, 1);
+    push_read_step(b, ep, 0x0403, kReadP, 1);
 }
 
-void emit_illuminance(FallbackSlot& s, const zhc::PreparedDefinition* base) {
+void emit_illuminance(const FallbackSlot& s, BuiltDef& b,
+                       const zhc::PreparedDefinition* base) {
     if (base_handles_cluster(base, 0x0400)) return;
     const std::uint8_t ep = first_endpoint_with_cluster(s, 0x0400);
     if (!ep) return;
-    push_expose(s, { "illuminance", zhc::ExposeType::Numeric,
+    push_expose(b, { "illuminance", zhc::ExposeType::Numeric,
                        zhc::Access::State, "lux", nullptr, nullptr, 0,
                        zhc::ExposeCategory::State });
-    push_fz(s, &zhc::generic::kFzIlluminance);
-    push_binding(s, ep, 0x0400);
-    push_report(s, ep, 0x0400, 0x0000, /*u16*/ 0x21, 30, 3600, 100);
+    push_fz(b, &zhc::generic::kFzIlluminance);
+    push_binding(b, ep, 0x0400);
+    push_report(b, ep, 0x0400, 0x0000, /*u16*/ 0x21, 30, 3600, 100);
     static constexpr std::uint16_t kReadL[] = { 0x0000 };
-    push_read_step(s, ep, 0x0400, kReadL, 1);
+    push_read_step(b, ep, 0x0400, kReadL, 1);
 }
 
-void rebuild(FallbackSlot& s, const char* model, const char* manufacturer,
+// Build a complete synthetic definition into `b` — which MUST be the
+// slot's inactive half. Never writes the slot itself; the caller
+// publishes by flipping `s.active` afterwards.
+void rebuild(const FallbackSlot& s, BuiltDef& b,
+              const char* model, const char* manufacturer,
               const zhc::PreparedDefinition* base) {
-    // Reset arrays, keep endpoint data.
-    s.n_exposes = 0;
-    s.n_fz = 0;
-    s.n_tz = 0;
-    s.n_bindings = 0;
-    s.n_reports = 0;
-    s.n_steps = 0;
-    s.n_scratch = 0;
+    b.n_exposes = 0;
+    b.n_fz = 0;
+    b.n_tz = 0;
+    b.n_bindings = 0;
+    b.n_reports = 0;
+    b.n_steps = 0;
+    b.n_scratch = 0;
 
-    emit_on_off(s, base);
-    emit_level_ctrl(s, base);
-    emit_color_ctrl(s, base);
-    emit_power_cfg(s, base);
-    emit_temp_meas(s, base);
-    emit_hum_meas(s, base);
-    emit_pressure_meas(s, base);
-    emit_illuminance(s, base);
+    emit_on_off(s, b, base);
+    emit_level_ctrl(s, b, base);
+    emit_color_ctrl(s, b, base);
+    emit_power_cfg(s, b, base);
+    emit_temp_meas(s, b, base);
+    emit_hum_meas(s, b, base);
+    emit_pressure_meas(s, b, base);
+    emit_illuminance(s, b, base);
 
     // Stash the model / manufacturer so registry-style log messages
     // don't show "-/-" for generic devices.
-    std::snprintf(s.model,        sizeof(s.model),
+    std::snprintf(b.model,        sizeof(b.model),
                    "%s", model        ? model        : "generic");
-    std::snprintf(s.manufacturer, sizeof(s.manufacturer),
+    std::snprintf(b.manufacturer, sizeof(b.manufacturer),
                    "%s", manufacturer ? manufacturer : "generic");
 
     // Stitch the PreparedDefinition. Most fields stay null — we don't
     // touch meta, white_labels, on_event, etc. from a fallback.
-    s.def = zhc::PreparedDefinition{};
-    s.def.zigbee_models        = nullptr;
-    s.def.zigbee_models_count  = 0;
-    s.def.manufacturer_names   = nullptr;
-    s.def.manufacturer_names_count = 0;
-    s.def.manufacturer_name_prefix = nullptr;
-    s.def.model                = s.model;
-    s.def.vendor               = s.manufacturer;
-    s.def.exposes              = s.exposes;
-    s.def.exposes_count        = static_cast<std::uint8_t>(s.n_exposes);
-    s.def.from_zigbee          = s.fz;
-    s.def.from_zigbee_count    = static_cast<std::uint8_t>(s.n_fz);
-    s.def.to_zigbee            = s.tz;
-    s.def.to_zigbee_count      = static_cast<std::uint8_t>(s.n_tz);
-    s.def.bindings             = s.bindings;
-    s.def.bindings_count       = static_cast<std::uint8_t>(s.n_bindings);
-    s.def.reports              = s.reports;
-    s.def.reports_count        = static_cast<std::uint8_t>(s.n_reports);
-    s.def.config_steps         = s.steps;
-    s.def.config_steps_count   = static_cast<std::uint8_t>(s.n_steps);
+    b.def = zhc::PreparedDefinition{};
+    b.def.zigbee_models        = nullptr;
+    b.def.zigbee_models_count  = 0;
+    b.def.manufacturer_names   = nullptr;
+    b.def.manufacturer_names_count = 0;
+    b.def.manufacturer_name_prefix = nullptr;
+    b.def.model                = b.model;
+    b.def.vendor               = b.manufacturer;
+    b.def.exposes              = b.exposes;
+    b.def.exposes_count        = static_cast<std::uint8_t>(b.n_exposes);
+    b.def.from_zigbee          = b.fz;
+    b.def.from_zigbee_count    = static_cast<std::uint8_t>(b.n_fz);
+    b.def.to_zigbee            = b.tz;
+    b.def.to_zigbee_count      = static_cast<std::uint8_t>(b.n_tz);
+    b.def.bindings             = b.bindings;
+    b.def.bindings_count       = static_cast<std::uint8_t>(b.n_bindings);
+    b.def.reports              = b.reports;
+    b.def.reports_count        = static_cast<std::uint8_t>(b.n_reports);
+    b.def.config_steps         = b.steps;
+    b.def.config_steps_count   = static_cast<std::uint8_t>(b.n_steps);
 
-    s.built = true;
-    const bool any = s.n_exposes || s.n_fz || s.n_tz ||
-                     s.n_bindings || s.n_reports || s.n_steps;
-    if (any) {
-        ESP_LOGI(TAG,
-                  "[fallback] synth def ieee=0x%016llx exposes=%zu fz=%zu tz=%zu "
-                  "bindings=%zu reports=%zu steps=%zu",
-                  static_cast<unsigned long long>(s.ieee),
-                  s.n_exposes, s.n_fz, s.n_tz,
-                  s.n_bindings, s.n_reports, s.n_steps);
-    } else {
-        ESP_LOGD(TAG,
-                  "[fallback] synth def ieee=0x%016llx exposes=0 fz=0 tz=0 "
-                  "bindings=0 reports=0 steps=0 (empty)",
-                  static_cast<unsigned long long>(s.ieee));
-    }
+    // Summary logging happens in synth_definition() AFTER the pool
+    // mutex is released — rebuild() always runs under the lock and
+    // ESP_LOG must not stretch the hold time.
 }
 
 }  // namespace
@@ -403,63 +500,160 @@ void register_endpoint(std::uint64_t ieee,
     // clusters we map.
     if (endpoint == 0xF2) return;
 
-    FallbackSlot* s = alloc_slot(ieee, /*now_ms*/ 0);
-    if (!s) return;
+    std::uint64_t evicted_ieee = 0;
+    {
+        PoolLock lock;
+        FallbackSlot* s = alloc_slot(ieee, evicted_ieee);
+        if (s) {
+            s->last_used_ms = fallback_now_ms();
 
-    // Find existing endpoint slot or a free one.
-    EndpointInfo* target = nullptr;
-    for (auto& ep : s->eps) {
-        if (ep.endpoint == endpoint) { target = &ep; break; }
-    }
-    if (!target) {
-        for (auto& ep : s->eps) {
-            if (ep.endpoint == 0) { target = &ep; break; }
+            // Find existing endpoint slot or a free one.
+            EndpointInfo* target = nullptr;
+            for (auto& ep : s->eps) {
+                if (ep.endpoint == endpoint) { target = &ep; break; }
+            }
+            if (!target) {
+                for (auto& ep : s->eps) {
+                    if (ep.endpoint == 0) { target = &ep; break; }
+                }
+            }
+            if (target) {   // else: too many endpoints — drop extras
+                target->endpoint   = endpoint;
+                target->profile_id = profile_id;
+                target->device_id  = device_id;
+                target->n_in       = 0;
+                target->n_out      = 0;
+                const std::size_t cap_in  = std::min(n_in,  kMaxClusters);
+                const std::size_t cap_out = std::min(n_out, kMaxClusters);
+                for (std::size_t i = 0; i < cap_in;  ++i) target->in[target->n_in++]   = in_clusters[i];
+                for (std::size_t i = 0; i < cap_out; ++i) target->out[target->n_out++] = out_clusters[i];
+
+                // Force rebuild on next synth_definition() call. The
+                // published half stays byte-intact — readers that
+                // already resolved it keep decoding against the
+                // pre-update view until the rebuild swaps.
+                s->built = false;
+            }
         }
     }
-    if (!target) return;   // too many endpoints — drop extras
-
-    target->endpoint   = endpoint;
-    target->profile_id = profile_id;
-    target->device_id  = device_id;
-    target->n_in       = 0;
-    target->n_out      = 0;
-    const std::size_t cap_in  = std::min(n_in,  kMaxClusters);
-    const std::size_t cap_out = std::min(n_out, kMaxClusters);
-    for (std::size_t i = 0; i < cap_in;  ++i) target->in[target->n_in++]   = in_clusters[i];
-    for (std::size_t i = 0; i < cap_out; ++i) target->out[target->n_out++] = out_clusters[i];
-
-    // Force rebuild on next synth_definition() call.
-    s->built = false;
+    // Deferred from alloc_slot: log outside the pool mutex (ESP_LOG can
+    // block on the console and must not stretch the lock hold time).
+    if (evicted_ieee != 0) {
+        ESP_LOGW(TAG, "pool full — evicting ieee=0x%016llx",
+                  static_cast<unsigned long long>(evicted_ieee));
+    }
 }
 
 void clear(std::uint64_t ieee) {
-    if (FallbackSlot* s = find_slot(ieee)) *s = {};
+    PoolLock lock;
+    if (FallbackSlot* s = find_slot(ieee)) {
+        // Same stale-pointer discipline as eviction: reset_slot()
+        // first drops any adapter cache entries into this slot (single
+        // choke point), then resets identity/interview data while
+        // leaving the published bytes intact for one more generation
+        // (an in-flight dispatch may still be reading them).
+        reset_slot(*s);
+    }
 }
 
 bool has_data(std::uint64_t ieee) {
+    PoolLock lock;
     const FallbackSlot* s = find_slot(ieee);
     if (!s) return false;
     for (const auto& ep : s->eps) if (ep.endpoint != 0) return true;
     return false;
 }
 
+bool owns(std::uint64_t ieee, const void* def_ptr) {
+    if (!def_ptr) return true;   // nothing cached — nothing to disown
+    PoolLock lock;
+    const auto p = reinterpret_cast<std::uintptr_t>(def_ptr);
+    for (const auto& s : g_pool) {
+        const auto lo = reinterpret_cast<std::uintptr_t>(&s.bufs[0]);
+        const auto hi = reinterpret_cast<std::uintptr_t>(&s.bufs[0] + 2);
+        if (p >= lo && p < hi) return s.ieee == ieee;
+    }
+    return true;   // not pool storage (registry def) — ownership n/a
+}
+
 const zhc::PreparedDefinition* synth_definition(std::uint64_t ieee,
                                                  const char* model,
                                                  const char* manufacturer,
                                                  const zhc::PreparedDefinition* base) {
-    FallbackSlot* s = find_slot(ieee);
-    if (!s) return nullptr;
-    // `base` affects what gets emitted, so rebuild unconditionally when
-    // a base is supplied — the previous rebuild may have been for a
-    // different base (or no base at all). Cheap: the slot data is tiny.
-    rebuild(*s, model, manufacturer, base);
-    if (s->n_exposes == 0) {
-        // No mapped clusters left after subtracting `base`'s coverage
-        // — either a pure router, unsupported device type, or the
-        // registry def already handles everything.
-        return nullptr;
+    // Rebuild-summary log data is captured under the lock and emitted
+    // after release — ESP_LOG can block on the console and must not
+    // stretch the pool-mutex hold time.
+    bool        rebuilt = false;
+    std::size_t n_exposes = 0, n_fz = 0, n_tz = 0,
+                n_bindings = 0, n_reports = 0, n_steps = 0;
+    const zhc::PreparedDefinition* result = nullptr;
+    {
+        PoolLock lock;
+        FallbackSlot* s = find_slot(ieee);
+        if (!s) return nullptr;
+        s->last_used_ms = fallback_now_ms();
+
+        // Fast path: already built for this base AND the identity labels
+        // baked into the def still match — return the published half
+        // untouched. Rebuilds happen only on new interview data
+        // (register_endpoint → built=false), a base flip (unmatched →
+        // registry-matched supplement), or a late identity fill changing
+        // the model/manufacturer strings.
+        const char* eff_model = model        ? model        : "generic";
+        const char* eff_manu  = manufacturer ? manufacturer : "generic";
+        const BuiltDef* cur = &s->bufs[s->active];
+        const bool fresh =
+            s->built && s->last_base == base &&
+            std::strncmp(cur->model,        eff_model, sizeof(cur->model) - 1)        == 0 &&
+            std::strncmp(cur->manufacturer, eff_manu,  sizeof(cur->manufacturer) - 1) == 0;
+        if (!fresh) {
+            // Build into the INACTIVE half, publish by flipping `active`.
+            // Never rebuild a published def in place: readers holding the
+            // old pointer (cached_def fast path, in-flight dispatch) keep
+            // seeing a fully-consistent definition.
+            BuiltDef& spare = s->bufs[s->active ^ 1];
+            rebuild(*s, spare, model, manufacturer, base);
+            s->active   = static_cast<std::uint8_t>(s->active ^ 1);
+            s->last_base = base;
+            s->built     = true;
+            cur = &s->bufs[s->active];
+
+            rebuilt    = true;
+            n_exposes  = cur->n_exposes;
+            n_fz       = cur->n_fz;
+            n_tz       = cur->n_tz;
+            n_bindings = cur->n_bindings;
+            n_reports  = cur->n_reports;
+            n_steps    = cur->n_steps;
+        }
+
+        if (cur->n_exposes != 0) {
+            result = &cur->def;
+        }
+        // else: no mapped clusters left after subtracting `base`'s
+        // coverage — either a pure router, unsupported device type, or
+        // the registry def already handles everything.
     }
-    return &s->def;
+
+    if (rebuilt) {
+        // Deferred from rebuild(): summary log, outside the pool mutex.
+        const bool any = n_exposes || n_fz || n_tz ||
+                         n_bindings || n_reports || n_steps;
+        if (any) {
+            ESP_LOGI(TAG,
+                      "[fallback] synth def ieee=0x%016llx exposes=%zu fz=%zu tz=%zu "
+                      "bindings=%zu reports=%zu steps=%zu",
+                      static_cast<unsigned long long>(ieee),
+                      n_exposes, n_fz, n_tz,
+                      n_bindings, n_reports, n_steps);
+        } else {
+            ESP_LOGD(TAG,
+                      "[fallback] synth def ieee=0x%016llx exposes=0 fz=0 tz=0 "
+                      "bindings=0 reports=0 steps=0 (empty)",
+                      static_cast<unsigned long long>(ieee));
+        }
+    }
+    return result;
 }
 
 }  // namespace zhc_fallback

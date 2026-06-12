@@ -59,7 +59,7 @@ Comparison ops: `ANY`, `==`, `!=`, `>`, `<`, `>=`, `<=`.
 
 | Symbol | Notes |
 |---|---|
-| `void simple_rules_init()` | Allocates `ParsedRule[MAX_CACHED_RULES=256]` in PSRAM, creates the recursive mutex, subscribes to the 5 driving event types, calls `reload_locked()`, spawns `task_cron`. |
+| `void simple_rules_init()` | Allocates `ParsedRule[MAX_CACHED_RULES=64]` in PSRAM, creates the recursive mutex, subscribes to the 5 driving event types, calls `reload_locked()`, spawns `task_cron`. |
 | `void simple_rules_reload()` | Re-reads all slots from `rule_store` and re-resolves friendly names → IEEE. Call after device pool changes. |
 
 ### Rule CRUD
@@ -92,12 +92,46 @@ Comparison ops: `ANY`, `==`, `!=`, `>`, `<`, `>=`, `<=`.
 
 | Symbol | Value | Source |
 |---|---|---|
-| `MAX_CACHED_RULES` | 256 | matches `ZAP_MAX_RULES` in `zap_common.h` |
-| `MAX_DISPATCH_DEPTH` | small, single-digit (configurable in `simple_rules.cpp`) — guards against `RULE_EVENT` infinite loops |
+| `MAX_CACHED_RULES` | 64 | **active-rule cap** — the in-memory `ParsedRule` array. See "Active-rule limit" below. |
+| `ZAP_MAX_RULES` | 256 | `zap_common.h` — `rule_store` NVS slot capacity (persistence, not evaluation) |
+| `MAX_EVENT_HOPS` | 8 | TTL for rule→rule `RULE_EVENT` chains, carried per-payload (`RuleEventPayload.hop`) — cuts self-feeding loops |
 | `MAX_CRON_FIRES` | 16 | cap on rules that can fire in one minute |
 | `RuleAction.arg{0,1,2}` | 32/20/20 | scratch space for device ref / payload / value |
 | `ParsedRule` | 4 actions per rule | `actions[4]` array |
 | Mutex acquire timeout | 2 s (cron snapshot) / 500 ms (per-fire), `portMAX_DELAY` only for init/reload |
+
+### Active-rule limit (cache 64 vs store 256)
+
+The engine keeps at most **`MAX_CACHED_RULES` (64)** rules *active* (parsed,
+in PSRAM, evaluated on every event), while `rule_store` persists up to
+**`ZAP_MAX_RULES` (256)** rules in NVS. The cap is deliberate: a 64-entry
+`ParsedRule` array is the budget the P4's internal DRAM allows; raising it to
+256 would cost roughly +130 KB and is not done here.
+
+Consequences callers must know:
+
+- **`simple_rules_add` rejects** (returns `false`, sets `dsl_last_error()` to
+  `"rule cache full (max 64 active rules)"`) once 64 rules are active —
+  it no longer persists-but-ignores a 65th rule. (P2-T18 def 2)
+- **On `reload`**, if NVS holds more rules than the cache can hold, the
+  excess are loaded in NVS-iteration order until the cache fills; the
+  remainder are persisted but **not evaluated**. `reload_locked` logs an
+  `ESP_LOGW` with the skipped count so this is never silent. (P2-T18 def 3)
+- **New rule ids** are derived from `rule_store_max_id()` (the highest id
+  across *all* 256 persisted slots + the writeback overlay), never from the
+  64-entry cache — a persisted-but-uncached rule's id can't be reissued and
+  silently overwritten. (P2-T18 def 1)
+
+### Input bounds
+
+- **DSL length:** `simple_rules_add` / `simple_rules_update` reject any DSL
+  `>= sizeof(RuleSlot::src)` (500 B; effective max 499). No truncate-persist —
+  the live and stored rule can never diverge. (P2-T18 def 4)
+- **Action section:** if the text between `DO` and `ENDON` exceeds the
+  500-byte parse buffer, `dsl_parse` returns `ERR_ACTION_TOO_LONG` instead of
+  clamping to a differently-parsed action set. (P2-T18 def 4)
+- **Numeric literals:** out-of-range / non-finite literals (`1e20`, garbage)
+  are rejected (`ERR_BAD_TRIGGER`) before the `int32_t` cast — no UB. (def 5)
 
 ## Wire format / on-disk layout
 
@@ -126,9 +160,13 @@ rule_type(1) + name(24) + src[500] + crc32(4)`. See
   MQTT broker no longer freezes the whole engine. The 2 s cron
   acquire timeout logs `"task_cron: s_mutex contended >2s — minute
   skipped"` rather than hanging the cron task.
-- `s_dispatch_depth` guards against runaway `RULE_EVENT` loops; once
-  it crosses `MAX_DISPATCH_DEPTH` the offending event is dropped with
-  an `ESP_LOGE`.
+- **Rule-event loop TTL.** `RULE_EVENT` delivery is queue-based, so a
+  self-feeding rule (`ON Event#x DO event x ENDON`) re-enqueues into
+  the queue `event_bus_drain` is draining — a dispatch-depth counter
+  never trips because each hop is a fresh dispatch at depth 0. Instead
+  every `RuleEventPayload` carries a `hop` counter (0 = external
+  origin); the `event` action refuses to republish once the chain
+  reaches `MAX_EVENT_HOPS` and logs a warning.
 
 ## Failure modes
 
@@ -136,11 +174,13 @@ rule_type(1) + name(24) + src[500] + crc32(4)`. See
 |---|---|
 | DSL parse error in `add` / `update` | Returns false; error string available via `dsl_last_error()` |
 | Stored rule fails to reparse on reload | `rules_error_cb_t` fired (UI logs / clears the rule); slot stays in NVS |
-| `MAX_CACHED_RULES` reached | New `add` rejected with log |
+| `MAX_CACHED_RULES` (64 active) reached | `add` returns false; `dsl_last_error()` = "rule cache full (max 64 active rules)" |
+| Persisted rule count > 64 on reload | Excess persisted-but-not-evaluated; `reload_locked` logs `ESP_LOGW` with skipped count |
+| DSL ≥ 500 B in `add`/`update` | Rejected; `dsl_last_error()` = "rule DSL too long (max 499 bytes)" (no truncate-persist) |
 | Action target device not found | `zigbee_mgr_zcl_set` returns error; logged; other actions continue |
 | Cron rule with broken expression | `cron_parse` failure during `task_cron` is a per-iteration skip — never aborts the task |
 | Mutex contended >2 s in cron | Minute skipped; logs warning |
-| `s_dispatch_depth` overflow | Event dropped; logs critical |
+| `RULE_EVENT` chain reaches `MAX_EVENT_HOPS` | Republish dropped (loop cut); logs warning with rule id |
 
 ## Integration example
 
@@ -163,6 +203,10 @@ if (!simple_rules_add("Hallway motion lights",
     rest_reply_error(dsl_last_error());
 }
 ```
+
+## Testing
+
+Host harness in `test/host/` (plain cmake + ctest, FreeRTOS/ESP shims) covers the rule-event TTL loop cut.
 
 ## Recent changes
 

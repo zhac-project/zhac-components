@@ -42,12 +42,56 @@ void zigbee_pool_init();
 uint16_t zigbee_pool_restore_persisted();
 
 // Advisory lock — held across multiple pool calls that must be atomic.
+// This takes the SAME internal recursive mutex used by every public pool
+// function (find/add/remove/restore), so holding it excludes
+// swap-with-last relocation by pool_remove().
 void zigbee_pool_lock();
 void zigbee_pool_unlock();
 
 // O(1) hash-indexed lookups (open addressing, linear probing).
+//
+// HAZARD: the returned pointer aims into the live pool array and is only
+// valid while zigbee_pool_lock() is held. These functions release the
+// internal mutex before returning, so an unguarded caller can have its
+// slot retargeted at any time by a concurrent pool_remove() (swap-with-
+// last moves the LAST device into the removed slot). Valid patterns:
+//   (a) snapshot under the advisory lock —
+//         zigbee_pool_lock();
+//         ZapDevice copy; bool found = false;
+//         if (const ZapDevice* d = pool_find_by_ieee(i)) { copy = *d; found = true; }
+//         zigbee_pool_unlock();
+//       (house pattern — see zhc_shadow_bridge.cpp), or
+//   (b) zigbee_pool_with_device() below for short in-place mutations.
+// Never dereference the result after the lock is released.
 ZapDevice* pool_find_by_ieee(uint64_t ieee);
 ZapDevice* pool_find_by_nwk(uint16_t nwk);
+
+// ── Locked visitor API ──────────────────────────────────────────────
+// Runs fn(dev, ctx) under the pool mutex iff the device exists; returns
+// false when the device is absent (fn not called) — and also when fn is
+// null, so false strictly means "fn did not run". The mutex held is the
+// same internal recursive mutex taken by zigbee_pool_lock() and by every
+// pool mutator, so pool_remove()'s swap-with-last cannot retarget the
+// slot while fn runs — the pointer handed to fn is valid for exactly
+// fn's duration. Do NOT stash the pointer; copy what you need into ctx.
+//
+// fn MUST be short and non-blocking: no radio I/O, no NVS access
+// (zap_store_mark_dirty's dirty-table-full fallback writes flash — call
+// it AFTER the visitor returns, on a snapshot copied out via ctx; see
+// on_zdo_leave_ind), and avoid UART logging where possible.
+bool zigbee_pool_with_device(uint64_t ieee,
+                             void (*fn)(ZapDevice* dev, void* ctx),
+                             void* ctx);
+bool zigbee_pool_with_device_by_nwk(uint16_t nwk,
+                                    void (*fn)(ZapDevice* dev, void* ctx),
+                                    void* ctx);
+
+// Locked find+copy convenience: snapshot the device into *out under the
+// pool mutex — pattern (a) above without the boilerplate. Returns false
+// if absent (also when out/fn args invalid — callers only need
+// exists/ran; failures inside visitors flow via ctx).
+bool zigbee_pool_snapshot(uint64_t ieee, ZapDevice* out);
+bool zigbee_pool_snapshot_by_nwk(uint16_t nwk, ZapDevice* out);
 
 // Force hash rebuild on the next lookup. Must be called after in-place
 // mutation of any field consulted by pool_find_by_nwk (currently
