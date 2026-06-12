@@ -152,50 +152,120 @@ bool hap_json_decode_heartbeat(const uint8_t* payload, uint16_t len, HapHeartbea
 }
 
 // ── DEVICE_LIST ───────────────────────────────────────────────────────────
+// Append one device object to the `devices` array. Factored out so the
+// legacy single-frame path and the paged path share exactly one field map —
+// the array element shape MUST stay byte-identical (the SPA/S3 consume it).
+static void devlist_add_one(JsonArray& arr, const ZapDevice& d,
+                            HapJsonLabelResolverFn resolve) {
+    JsonObject o = arr.add<JsonObject>();
+    char ieee_s[20]; fmt_ieee(ieee_s, d.ieee_addr);
+    o["ieee"]         = ieee_s;
+    o["proto"]        = ncp_protocol_name(d.protocol);
+    o["nwk"]          = d.nwk_addr;
+    o["name"]         = d.friendly_name;
+    o["type"]         = d.device_type;
+    o["mfr"]          = d.manufacturer_code;            // numeric Zigbee manu id
+    o["manufacturer"] = d.manufacturer_name;            // Basic attr 0x0004 raw (e.g. `_TZ3000_xwh1e22x`)
+    // Friendly vendor / model come from the matched ZHC def if any; fall
+    // back to raw device-reported strings when either the resolver is
+    // absent or the def misses. Buffers sized to cover every vendor/model
+    // string we ship today (biggest raw is `_TZ3000_xwh1e22x` at 16 + NUL).
+    char vendor_buf[32] = {};
+    char model_buf[32]  = {};
+    if (resolve) resolve(&d, vendor_buf, sizeof(vendor_buf),
+                             model_buf,  sizeof(model_buf));
+    // Assigning a runtime `const char*` (not a string literal) makes
+    // ArduinoJson 7 COPY the bytes into the document pool (RamString with
+    // isStatic=false → saveString), so it is safe to hand it these
+    // stack-local buffers — the copy survives after they leave scope on the
+    // next measure/serialise. (A `JsonString(p, true)` would LINK by pointer
+    // and dangle — do not "optimise" to that.)
+    o["vendor"] = vendor_buf[0]
+                   ? (const char*)vendor_buf
+                   : (const char*)d.manufacturer_name;
+    o["model"]  = model_buf[0]
+                   ? (const char*)model_buf
+                   : (const char*)d.model_id;
+    o["lqi"]          = d.link_quality;
+    o["last_seen"]    = d.last_seen;
+    o["ps"]           = d.power_source;
+    o["bat_pct"]      = d.battery_pct;
+    o["ep_count"]     = d.endpoint_count;
+}
+
 bool hap_json_encode_device_list(uint8_t* buf, size_t cap, uint16_t* out_len,
                                   const ZapDevice* devs, uint16_t count,
-                                  HapJsonLabelResolverFn resolve) {
-    JsonDocument doc;
-    JsonArray arr = doc["devices"].to<JsonArray>();
-    for (uint16_t i = 0; i < count; i++) {
-        // Hide soft-removed entries. The pool slot is kept so a rejoin
-        // can restore configure state without rediscovery, but the UI
-        // should treat them as gone until we see them again.
-        if (zap_dev_is_removed(&devs[i])) continue;
-        JsonObject o = arr.add<JsonObject>();
-        char ieee_s[20]; fmt_ieee(ieee_s, devs[i].ieee_addr);
-        o["ieee"]         = ieee_s;
-        o["proto"]        = ncp_protocol_name(devs[i].protocol);
-        o["nwk"]          = devs[i].nwk_addr;
-        o["name"]         = devs[i].friendly_name;
-        o["type"]         = devs[i].device_type;
-        o["mfr"]          = devs[i].manufacturer_code;       // numeric Zigbee manu id
-        o["manufacturer"] = devs[i].manufacturer_name;       // Basic attr 0x0004 raw (e.g. `_TZ3000_xwh1e22x`)
-        // Friendly vendor / model come from the matched ZHC def if
-        // any; fall back to raw device-reported strings when either
-        // the resolver is absent or the def misses. Buffers sized to
-        // cover every vendor/model string we ship today (biggest is
-        // `_TZ3000_xwh1e22x` at 16 + terminator).
-        char vendor_buf[32] = {};
-        char model_buf[32]  = {};
-        if (resolve) resolve(&devs[i], vendor_buf, sizeof(vendor_buf),
-                                          model_buf,  sizeof(model_buf));
-        o["vendor"] = vendor_buf[0]
-                       ? (const char*)vendor_buf
-                       : (const char*)devs[i].manufacturer_name;
-        o["model"]  = model_buf[0]
-                       ? (const char*)model_buf
-                       : (const char*)devs[i].model_id;
-        o["lqi"]          = devs[i].link_quality;
-        o["last_seen"]    = devs[i].last_seen;
-        o["ps"]           = devs[i].power_source;
-        o["bat_pct"]      = devs[i].battery_pct;
-        o["ep_count"]     = devs[i].endpoint_count;
+                                  HapJsonLabelResolverFn resolve,
+                                  uint16_t start_index, uint16_t* next_index) {
+    // ── Legacy single-frame mode (next_index == nullptr) ──────────────────
+    // Encode every visible device; fail on overflow. Kept for callers that
+    // still want the old all-or-nothing contract.
+    if (next_index == nullptr) {
+        JsonDocument doc;
+        JsonArray arr = doc["devices"].to<JsonArray>();
+        for (uint16_t i = 0; i < count; i++) {
+            if (zap_dev_is_removed(&devs[i])) continue;   // hide soft-removed
+            devlist_add_one(arr, devs[i], resolve);
+        }
+        size_t n = serializeJson(doc, reinterpret_cast<char*>(buf), cap);
+        if (doc.overflowed()) { ESP_LOGE(TAG, "encode_device_list json overflow"); return false; }
+        if (n == 0 || n >= cap) { ESP_LOGE(TAG, "encode_device_list buf overflow"); return false; }
+        *out_len = static_cast<uint16_t>(n);
+        return true;
     }
+
+    // ── Paged mode ────────────────────────────────────────────────────────
+    // Envelope: {"next":N,"devices":[...]}. `next` is written LAST but we
+    // reserve its widest form (uint16 → up to 5 digits, "65535") in the
+    // budget so the final overwrite can never tip the frame past `cap`.
+    // Budget at ~90% of cap leaves slack for the closing `}`, the `next`
+    // field, and any measure/serialise rounding.
+    JsonDocument doc;
+    doc["next"] = static_cast<uint16_t>(65535);     // placeholder, widest value
+    JsonArray arr = doc["devices"].to<JsonArray>();
+
+    const size_t budget = (cap * 9) / 10;           // ~90% of HAP_MAX_PAYLOAD
+    uint16_t i = start_index;
+    uint16_t encoded = 0;
+    for (; i < count; i++) {
+        if (zap_dev_is_removed(&devs[i])) continue;  // skip but still advance i
+
+        devlist_add_one(arr, devs[i], resolve);
+        // measureJson includes the reserved-width "next" placeholder, so a
+        // fit here guarantees the post-overwrite frame fits too.
+        if (measureJson(doc) > budget) {
+            if (encoded == 0) {
+                // Forward-progress guarantee: a single device too big for an
+                // empty frame would otherwise wedge the pager. Keep it (the
+                // frame may exceed `budget` but the hard cap check below
+                // still protects the SPI layer) and advance past it so the
+                // caller never re-requests the same start_index.
+                ESP_LOGW(TAG, "device_list: dev idx %u alone exceeds page budget; emitting truncated",
+                         (unsigned)i);
+                encoded++;
+                i++;            // consume it
+                break;
+            }
+            // Back off the device that did not fit; it leads the next page.
+            arr.remove(arr.size() - 1);
+            break;
+        }
+        encoded++;
+    }
+
+    // next cursor: first un-encoded raw index, or `count` when we reached the
+    // end (done sentinel). The loop leaves `i` pointing at exactly that.
+    uint16_t next = (i >= count) ? count : i;
+    doc["next"] = next;
+
     size_t n = serializeJson(doc, reinterpret_cast<char*>(buf), cap);
-    if (doc.overflowed()) { ESP_LOGE(TAG, "encode_device_list json overflow"); return false; }
-    if (n == 0 || n >= cap) { ESP_LOGE(TAG, "encode_device_list buf overflow"); return false; }
-    *out_len = static_cast<uint16_t>(n);
+    if (doc.overflowed() || n == 0 || n >= cap) {
+        ESP_LOGE(TAG, "encode_device_list paged overflow (start=%u enc=%u)",
+                 (unsigned)start_index, (unsigned)encoded);
+        return false;
+    }
+    *out_len    = static_cast<uint16_t>(n);
+    *next_index = next;
     return true;
 }
 

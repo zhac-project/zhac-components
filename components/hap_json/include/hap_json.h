@@ -78,9 +78,37 @@ typedef void (*HapJsonLabelResolverFn)(const ZapDevice* dev,
 typedef size_t (*HapJsonAttrsEmitter)(const ZapDevice* dev, char* buf, size_t cap);
 typedef size_t (*HapJsonExposesEmitter)(const ZapDevice* dev, char* buf, size_t cap);
 
+// Encode the device list as `{"devices":[ {...}, ... ]}`.
+//
+// PAGING (HOTFIX): a full fleet's JSON does not fit one SPI frame — a single
+// HAP frame can never exceed HAP_MAX_PAYLOAD(4096), and ~16 realistic devices
+// already blow that budget, which made the old all-or-nothing encoder return
+// false → P4 logged "encode failed", sent nothing, and S3's roundtrip timed
+// out. The encoder therefore pages: it fills `buf` device-by-device starting
+// at `start_index`, stops BEFORE the frame would overflow, and reports the
+// index of the first un-encoded device.
+//
+//   start_index : first device (post-skip indexing is by raw array index)
+//                 to encode. 0 for the first page.
+//   next_index  : OUT. Set to the raw array index of the first device that
+//                 did NOT fit (the cursor to pass as the next start_index).
+//                 Set to `count` when the page reached the end (done
+//                 sentinel). When non-null the encoder runs in PAGED mode.
+//                 When nullptr the encoder runs in legacy single-frame mode
+//                 (encode all `count`, fail on overflow) for callers that
+//                 still want the old all-or-nothing behaviour.
+//
+// Forward-progress guarantee: if even one device at `start_index` does not
+// fit (pathological huge single record), it is still emitted alone and
+// `next_index` is advanced past it (logged) — the function never returns
+// `*next_index == start_index` with zero devices encoded, so a paging caller
+// can never spin. Soft-removed devices are skipped but still consume an index
+// so the cursor is monotonic over the raw array.
 bool hap_json_encode_device_list(uint8_t* buf, size_t cap, uint16_t* out_len,
                                   const ZapDevice* devs, uint16_t count,
-                                  HapJsonLabelResolverFn resolve = nullptr);
+                                  HapJsonLabelResolverFn resolve = nullptr,
+                                  uint16_t start_index = 0,
+                                  uint16_t* next_index = nullptr);
 
 // ── GET_DEVICE_BY_ID (0x12) / DEVICE_INFO (0x13) ─────────────────────────
 // Request:  {"ieee":"0xXXXXXXXXXXXXXXXX"}
