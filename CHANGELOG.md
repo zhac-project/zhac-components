@@ -7,7 +7,25 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
-### Fixed — High/Medium (P2 findings review, T19 mqtt_gw / tg_gw lifecycle & injection)
+### Fixed
+
+- **hap_json (HOTFIX)** — `hap_json_encode_device_list` now PAGES the device
+  list. A full fleet's JSON cannot fit one SPI frame (`HAP_MAX_PAYLOAD` =
+  4096), and a host test pins the overflow at **16 realistic devices** (15 fit
+  at 4003 B, ~266 B/device). The old all-or-nothing encoder returned `false`
+  there, so the P4 logged "encode failed", sent nothing, and the S3 device
+  list timed out for anyone with ~15+ devices. The encoder gained an optional
+  `start_index` / `next_index` paging pair: it fills the frame device-by-device
+  from `start_index`, stops before overflow at ~90 % of cap, and reports the
+  next cursor in a `{"next":N,"devices":[...]}` envelope (`next` == device
+  count = done sentinel). The `devices[]` element shape is byte-identical to
+  before. Forward progress is guaranteed (a single over-budget device is still
+  emitted alone and the cursor advances — never `next == start` with zero
+  encoded, so a paging caller can't spin). Passing `next_index = nullptr`
+  keeps the legacy single-frame behaviour. New host test
+  `test/host/test_devlist_paging.cpp` confirms the threshold and proves
+  split + reassembly (30 devices → 4 chunks → full list), single-chunk and
+  empty-list edges.
 
 - **mqtt_gw (S3)** (HIGH, FINDINGS §7, `mqtt_gw_s3.cpp:53`): the `s_client`
   stop/destroy/recreate ran UNSYNCHRONIZED from REST handlers, the esp_timer
