@@ -258,11 +258,22 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
         }
     }
     if (bad_n) nvs_seq(nullptr, nvs_commit(s_nvs), TAG, "commit corrupt-rule erase");
-    xSemaphoreGive(s_mutex);
 
     // Merge writeback-overlay entries so readers see uncommitted edits.
+    // Hold s_mutex ACROSS the merge (do not give it before foreach_dirty):
+    // the reader reads NVS-then-overlay in the same order the flusher writes
+    // NVS-then-clears-overlay, so a slot flushed mid-snapshot could otherwise
+    // be absent from BOTH reads and transiently vanish. While we hold s_mutex,
+    // the flusher's rule_store_save/delete_err blocks on s_mutex and cannot
+    // commit-then-clear, so the slot is still WRITE in the overlay and the
+    // merge picks it up. No AB-BA deadlock: load_all nests s_mutex ⊃ s_mtx
+    // (foreach_dirty takes s_mtx), and the flusher never holds s_mtx while
+    // taking s_mutex (it releases s_mtx before the NVS write), so there is no
+    // opposite-order nesting. merge_cb dedups by rule_id, so any transient
+    // NVS+overlay duplicate collapses safely.
     MergeCtx mctx{ out, &count, max_count };
     rule_store_foreach_dirty(merge_cb, &mctx);
+    xSemaphoreGive(s_mutex);
     return count;
 }
 
@@ -333,17 +344,4 @@ uint16_t rule_store_count() {
     if (it) nvs_release_iterator(it);
     xSemaphoreGive(s_mutex);
     return n;
-}
-
-bool rule_store_set_enabled(uint16_t rule_id, bool enabled) {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    RuleSlot slot{};
-    if (!rule_store_load_unlocked(rule_id, &slot)) {
-        xSemaphoreGive(s_mutex);
-        return false;
-    }
-    slot.enabled = enabled ? 1 : 0;
-    bool ok = rule_store_save_unlocked(&slot);
-    xSemaphoreGive(s_mutex);
-    return ok;
 }

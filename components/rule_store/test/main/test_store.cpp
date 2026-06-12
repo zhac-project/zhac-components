@@ -44,13 +44,18 @@ TEST_CASE("rule_store: enabled flag persists", "[rule_store]") {
     RuleSlot slot = make_slot(0x0002, "ON System#Boot DO log boot ENDON");
     rule_store_save(&slot);
 
-    TEST_ASSERT_TRUE(rule_store_set_enabled(0x0002, false));
+    // Round-trip the enabled flag through the overlay-aware load/save path
+    // (rule_store_set_enabled was removed — callerless, bypassed the overlay).
     RuleSlot out{};
-    rule_store_load(0x0002, &out);
+    TEST_ASSERT_TRUE(rule_store_load(0x0002, &out));
+    out.enabled = 0;
+    TEST_ASSERT_TRUE(rule_store_save(&out));
+    TEST_ASSERT_TRUE(rule_store_load(0x0002, &out));
     TEST_ASSERT_EQUAL(0, out.enabled);
 
-    TEST_ASSERT_TRUE(rule_store_set_enabled(0x0002, true));
-    rule_store_load(0x0002, &out);
+    out.enabled = 1;
+    TEST_ASSERT_TRUE(rule_store_save(&out));
+    TEST_ASSERT_TRUE(rule_store_load(0x0002, &out));
     TEST_ASSERT_EQUAL(1, out.enabled);
 }
 

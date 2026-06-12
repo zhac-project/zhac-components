@@ -27,6 +27,37 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   split + reassembly (30 devices → 4 chunks → full list), single-chunk and
   empty-list edges.
 
+### Fixed — Medium (P4 findings batch, T30 rule_store)
+
+- **rule_store** (MED, FINDINGS §7, `rule_store.cpp` `rule_store_set_enabled`):
+  removed the callerless `rule_store_set_enabled()` from the public API. It
+  loaded via `rule_store_load_unlocked` (NVS-only — missed any uncommitted
+  writeback-overlay edit), flipped `enabled`, and wrote via
+  `rule_store_save_unlocked` (direct NVS, bypassing the overlay), so the next
+  flush of a still-pending overlay WRITE for the same id would **overwrite the
+  enable/disable with the stale copy** (silent lost edit); it also lacked the
+  `if (!s_nvs)` init guard every other public fn has, so a pre-init call could
+  `xSemaphoreTake(nullptr)` and crash. Confirmed callerless in production (only
+  the IDF test referenced it). Routing it through the overlay would add a racy
+  read-modify-write API nobody calls, so the function was deleted (trimming the
+  public surface ahead of open-sourcing); callers flip `enabled` via the
+  existing overlay-aware `rule_store_load` + `rule_store_save`. Test
+  `enabled flag persists` re-expressed through that supported path.
+- **rule_store** (LOW, FINDINGS §7, `rule_store.cpp` `rule_store_load_all`):
+  closed an overlay-merge vanish window. `load_all` released `s_mutex` after
+  the NVS walk and only THEN merged the writeback overlay (which takes the
+  separate `s_mtx`); because the reader reads NVS-then-overlay in the same
+  order the flusher writes NVS-then-clears-overlay, a slot flushed between the
+  two reads could be absent from BOTH and transiently vanish from that one
+  snapshot. The `s_mutex` release now happens AFTER `rule_store_foreach_dirty`,
+  so the merge runs while `s_mutex` is held: the flusher's `rule_store_save` /
+  `rule_store_delete_err` then blocks on `s_mutex` and cannot commit-then-clear
+  mid-merge (the slot stays WRITE in the overlay and is picked up). Deadlock-free
+  — `load_all` nests `s_mutex ⊃ s_mtx` and the flusher never holds `s_mtx`
+  while taking `s_mutex` (it releases `s_mtx` before the NVS write), so there is
+  no opposite-order nesting; `merge_cb` dedups by `rule_id`, collapsing any
+  transient NVS+overlay duplicate.
+
 ### Fixed — Medium (P4 findings batch, T27 device_shadow)
 
 - **device_shadow** (MED, FINDINGS §9, `device_shadow.cpp` config-blob path):
