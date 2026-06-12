@@ -7,6 +7,50 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — Medium (P4 findings batch, T27 device_shadow)
+
+- **device_shadow** (MED, FINDINGS §9, `device_shadow.cpp` config-blob path):
+  `set_config` stored a caller-supplied `DeviceConfig` and `nvs_load_config`
+  loaded the raw NVS blob with **no integrity check and no bounds clamp** — a
+  `filtered_count` / `debounce_ignore_count` > `DEVICE_CONFIG_FILTER_MAX` (8)
+  made `shadow_pipeline_filter` and the debounce-bypass scan read past the
+  8-slot `filtered[]` / `debounce_ignore[]` arrays. Both counts are now
+  **clamped to `DEVICE_CONFIG_FILTER_MAX` on every ingest path** (caller
+  `set_config` + `nvs_load_config`), and the config 'c' blob is now persisted
+  as `[CfgBlobHdr][DeviceConfig]` with a version + CRC32 header — mirroring the
+  F26 attr-blob defence — so a torn/corrupt/hand-poked config is **rejected on
+  load** (entry falls back to defaults + re-seeds from the SPA) instead of
+  being trusted. `NVS_SHADOW_VERSION` bumped 7→8 (headerless v7 'c' blobs are
+  wiped on first boot, not rejected per-device).
+- **device_shadow** (MED, FINDINGS §9 / SHA-F3, `device_shadow.cpp` table +
+  NVS leak): shadow entries were **never freed** — there was no remove API and
+  REST/HAP setters `find_or_create` arbitrary ieee, so departed / mistyped
+  devices permanently consumed one of the `ZAP_MAX_DEVICES` (200) table slots
+  **and** left their per-device debounce/occupancy `xTimer`s scheduled (a
+  device-churn workload eventually exhausts the FreeRTOS timer pool and breaks
+  `xTimerCreate` for legitimate joins); `clear_attrs` additionally erased only
+  the 'a' attr-blob NVS key, leaking the 'c' config blob in flash forever. New
+  **`device_shadow_remove(ieee)`** reclaims the slot (swap-with-last + timer-ID
+  fix-up on the relocated entry), deletes both timers, and erases **both** the
+  'a' and 'c' NVS keys. Honours the T10 LEAF lock model: the slot/timer work is
+  under `s_mutex` (0-tick non-blocking timer deletes), the NVS erases run AFTER
+  the lock is released, and no `event_bus` publish is performed. Wired into the
+  P4 HAP **hard** DEVICE_DELETE ("forget forever") path in `hap_dispatch.cpp`
+  (replacing the leaky `clear_attrs`), NOT the soft DEVICE_LEAVE — soft-leave
+  intentionally keeps slot + NVS so a rejoin restores state without a fresh
+  interview.
+- **device_shadow** (MED, FINDINGS §9, `device_shadow.cpp` `upsert_cache`):
+  when a device exceeded `SHADOW_ATTR_MAX` (32) distinct attrs, new keys were
+  **silently dropped** (multi-gang switches / climate TRVs that expose many DPs
+  lose late-reporting attrs). Now logs **once per device** (gated by a new
+  `attr_overflow_logged` flag, re-armed by `clear_attrs` / `device_shadow_remove`)
+  so the condition is diagnosable without per-frame spam on the radio RX path.
+  Deliberately **no auto-eviction**: the only obvious eviction target
+  (`_`-prefixed diagnostics) includes internal bookkeeping like `_last_seen`
+  that the occupancy/last-seen logic depends on, so silent eviction would trade
+  a visible dropped-attr for a subtle correctness bug. The 32-slot cap is now a
+  documented limit (raising it is a schema bump, out of scope).
+
 ### Fixed — Medium (P4 findings batch, T25 zigbee_mgr / znp_driver radio stack)
 
 - **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:27`

@@ -61,6 +61,37 @@ struct __attribute__((packed)) ShadowBlobHdr {
 // No-op (stays internal) on targets without PSRAM-BSS enabled.
 EXT_RAM_BSS_ATTR static uint8_t s_attr_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX * sizeof(ShadowAttr)];
 
+// T27 (FINDINGS §9): the config blob ('c' key) was previously stored as the
+// raw DeviceConfig bytes and loaded WITHOUT any integrity check or bounds
+// clamp — a torn/short/corrupt NVS blob (or a hand-poked one) with
+// filtered_count / debounce_ignore_count > DEVICE_CONFIG_FILTER_MAX made the
+// pipeline filter / debounce loops walk past the 8-slot filtered[] /
+// debounce_ignore[] arrays. Mirror the attr-blob defence: prepend a
+// version+CRC header (CfgBlobHdr) so a corrupt config is rejected on load
+// (entry falls back to defaults + re-populates from the SPA / live traffic),
+// and clamp both counts on EVERY ingest path (load + set). NVS_SHADOW_VERSION
+// is bumped 7→8 below so the headerless v7 'c' blobs are wiped, not rejected
+// per-device. NOTE: the in-RAM cfg_crc / cfg_crc_valid fields are an unrelated
+// write-dedupe (skip flash on an unchanged re-push); this CRC is the on-disk
+// integrity guard.
+static constexpr uint8_t SHADOW_CFG_BLOB_VER = 1;
+struct __attribute__((packed)) CfgBlobHdr {
+    uint8_t  ver;     // SHADOW_CFG_BLOB_VER
+    uint8_t  _r0;
+    uint16_t _pad;
+    uint32_t crc;     // esp_rom_crc32_le(0, &DeviceConfig, sizeof(DeviceConfig))
+};
+
+// Clamp the two variable-length-array counts to their backing array bound on
+// any DeviceConfig that just crossed a trust boundary (NVS load, caller-
+// supplied set_config). Defensive: a value > DEVICE_CONFIG_FILTER_MAX would
+// over-read filtered[] / debounce_ignore[] in shadow_pipeline_filter and the
+// debounce-bypass scan. Pure RAM work — safe anywhere, incl. under s_mutex.
+static inline void cfg_clamp_counts(DeviceConfig* c) {
+    if (c->filtered_count        > DEVICE_CONFIG_FILTER_MAX) c->filtered_count        = DEVICE_CONFIG_FILTER_MAX;
+    if (c->debounce_ignore_count > DEVICE_CONFIG_FILTER_MAX) c->debounce_ignore_count = DEVICE_CONFIG_FILTER_MAX;
+}
+
 // Q76 (QWEN_FINDINGS triage): NVS keys cap at 15 chars, so the original
 // "a%014llX" packed only 56 of the 64 IEEE bits — two devices differing only in
 // the top MAC byte (e.g. different vendors) collided on a single shadow record.
@@ -165,7 +196,18 @@ static bool nvs_save_config(uint64_t ieee, const DeviceConfig* cfg) {
     if (!s_nvs) return false;
     char key[16];
     shadow_key(key, 'c', ieee);   // Q76: full 64-bit IEEE, base36
-    esp_err_t err = nvs_set_blob(s_nvs, key, cfg, sizeof(DeviceConfig));
+    // T27: persist as [CfgBlobHdr][DeviceConfig] so nvs_load_config can reject
+    // a torn / corrupt blob. The local scratch is small (≈sizeof DeviceConfig
+    // + 8) and this path runs OUTSIDE s_mutex (leaf-lock rule), so a stack
+    // buffer is fine — no need for a shared PSRAM scratch like the attr blob.
+    uint8_t buf[sizeof(CfgBlobHdr) + sizeof(DeviceConfig)];
+    auto* h = reinterpret_cast<CfgBlobHdr*>(buf);
+    h->ver  = SHADOW_CFG_BLOB_VER;
+    h->_r0  = 0;
+    h->_pad = 0;
+    h->crc  = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(cfg), sizeof(DeviceConfig));
+    memcpy(buf + sizeof(CfgBlobHdr), cfg, sizeof(DeviceConfig));
+    esp_err_t err = nvs_set_blob(s_nvs, key, buf, sizeof(buf));
     if (err != ESP_OK) { ESP_LOGE(TAG, "nvs_set_blob config: %s", esp_err_to_name(err)); return false; }
     err = nvs_commit(s_nvs);
     if (err != ESP_OK) ESP_LOGE(TAG, "nvs_commit config: %s", esp_err_to_name(err));
@@ -256,8 +298,33 @@ static bool nvs_load_config(uint64_t ieee, DeviceConfig* out) {
     if (!s_nvs) return false;
     char key[16];
     shadow_key(key, 'c', ieee);   // Q76: full 64-bit IEEE, base36
-    size_t len = sizeof(DeviceConfig);
-    return (nvs_get_blob(s_nvs, key, out, &len) == ESP_OK);
+
+    // T27: validate version, exact length, and CRC before trusting the blob —
+    // mirrors nvs_load_attrs (F26). On any mismatch return false so the entry
+    // keeps its defaults and re-populates from the SPA / live traffic, instead
+    // of loading garbage filter counts that over-read the pipeline arrays.
+    uint8_t buf[sizeof(CfgBlobHdr) + sizeof(DeviceConfig)];
+    size_t len = sizeof(buf);
+    esp_err_t e = nvs_get_blob(s_nvs, key, buf, &len);
+    if (e != ESP_OK) return false;
+    if (len != sizeof(buf)) {
+        ESP_LOGW(TAG, "config blob size mismatch (%zu != %zu) — discarding",
+                 len, sizeof(buf));
+        return false;
+    }
+    const auto* h = reinterpret_cast<const CfgBlobHdr*>(buf);
+    if (h->ver != SHADOW_CFG_BLOB_VER) {
+        ESP_LOGW(TAG, "config blob ver invalid (ver=%u) — discarding", h->ver);
+        return false;
+    }
+    const uint8_t* pay = buf + sizeof(CfgBlobHdr);
+    if (esp_rom_crc32_le(0, pay, sizeof(DeviceConfig)) != h->crc) {
+        ESP_LOGW(TAG, "config blob CRC mismatch — discarding");
+        return false;
+    }
+    memcpy(out, pay, sizeof(DeviceConfig));
+    cfg_clamp_counts(out);   // defence-in-depth even on a CRC-valid blob
+    return true;
 }
 
 // The ONLY persistence hook on the hot paths. Pre-fix, eligible entries were
@@ -460,7 +527,7 @@ static void upsert_cache(DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_
                 break;
             }
         }
-        if (!found && e->attr_count < 32) {
+        if (!found && e->attr_count < SHADOW_ATTR_MAX) {
             ShadowAttr& sa = e->attrs[e->attr_count++];
             memset(&sa, 0, sizeof(sa));
             strncpy(sa.key, attrs[i].key, ATTR_KEY_MAX - 1);
@@ -472,6 +539,31 @@ static void upsert_cache(DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_
                 sa.int_val = attrs[i].int_val;
             }
             sa.ts = now_s;
+        } else if (!found) {
+            // T27 (FINDINGS §9, SHA-F-overflow): the per-device cache holds at
+            // most SHADOW_ATTR_MAX (32) distinct keys. A new key past the cap
+            // is dropped — high-endpoint devices (multi-gang switches,
+            // climate/TRVs that expose many DPs) can lose late-reporting
+            // attrs. We log ONCE per device (gated by attr_overflow_logged,
+            // reset by clear/remove) so this is diagnosable without per-frame
+            // spam on the radio RX path. We deliberately do NOT auto-evict to
+            // make room: the obvious eviction target ("_"-prefixed diagnostics)
+            // includes internal bookkeeping like KEY_LAST_SEEN that the
+            // occupancy/last_seen logic depends on, so silent eviction would
+            // trade a visible dropped-attr for a subtle correctness bug. The
+            // 32-slot cap is a documented limit (ShadowAttr sizing — see
+            // SHADOW_ATTR_MAX); raising it is a schema bump, out of scope here.
+            // Runs under s_mutex; ESP_LOGW is non-blocking and the flag write
+            // is single-threaded under the leaf lock (no extra sync needed).
+            if (!e->attr_overflow_logged) {
+                e->attr_overflow_logged = true;
+                ESP_LOGW(TAG, "attr cache full (%u slots) ieee=0x%016llX — "
+                              "dropping new key '%.*s' (and any further new "
+                              "keys for this device)",
+                         (unsigned)SHADOW_ATTR_MAX,
+                         (unsigned long long)e->ieee,
+                         (int)ATTR_KEY_MAX, attrs[i].key);
+            }
         }
     }
 }
@@ -670,7 +762,10 @@ void device_shadow_init() {
     // (SHA-F1 + SHA-F8 in docs/FINDINGS.md). v7 = F26: attr blob gained a
     // version+count+CRC header (ShadowBlobHdr), so the raw v6 layout no longer
     // validates — wipe it on first boot rather than rejecting per-device on load.
-    static constexpr uint8_t NVS_SHADOW_VERSION = 7;
+    // v8 = T27 (FINDINGS §9): the config 'c' blob gained its own version+CRC
+    // header (CfgBlobHdr); the headerless v7 'c' blobs no longer match the
+    // expected length, so wipe on first boot (configs re-seed from the SPA).
+    static constexpr uint8_t NVS_SHADOW_VERSION = 8;
     if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
         if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
@@ -886,6 +981,10 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
     if (e->nvs_dirty) e->nvs_force = true;
 
     e->config = *cfg;
+    cfg_clamp_counts(&e->config);   // T27: caller-supplied counts may exceed
+                                    // DEVICE_CONFIG_FILTER_MAX (REST/SPA bug,
+                                    // fuzzing) — clamp before it reaches the
+                                    // pipeline arrays or gets persisted.
     persist_config_prepare_locked(e, &cp);
     xSemaphoreGive(s_mutex);
     publish_staged();
@@ -936,6 +1035,9 @@ void device_shadow_clear_attrs(uint64_t ieee) {
         e->occupancy_timeout_pending = false;
         e->nvs_dirty = false;
         e->nvs_force = false;
+        e->attr_overflow_logged = false;  // T27: cache emptied — re-arm the
+                                          // once-per-device overflow log so a
+                                          // refill that overflows again is seen
     }
     xSemaphoreGive(s_mutex);
 
@@ -968,6 +1070,72 @@ void device_shadow_clear_attrs(uint64_t ieee) {
                       "failed — cached attrs may resurface on reboot",
                  (unsigned long long)ieee);
     }
+}
+
+// T27 (FINDINGS §9, SHA-F3): reclaim a departed device's table slot + timers +
+// BOTH NVS keys. See the header for the contract; in short, this is the
+// "forget forever" teardown, distinct from clear_attrs (which keeps the slot
+// for a rejoin). Lock model (T10): all table/timer work under the leaf
+// s_mutex; the two NVS erases run AFTER the lock is released.
+void device_shadow_remove(uint64_t ieee) {
+    bool found = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_entry(ieee);
+    if (e) {
+        found = true;
+
+        // Delete this entry's timers FIRST (0-tick posts — non-blocking,
+        // allowed under the leaf lock; same as clear_attrs). Null them so a
+        // stale callback can't reference the about-to-be-vacated slot.
+        if (e->occupancy_timer) { xTimerDelete(e->occupancy_timer, 0); e->occupancy_timer = nullptr; }
+        if (e->debounce_timer)  { xTimerDelete(e->debounce_timer, 0);  e->debounce_timer  = nullptr; }
+
+        // Reclaim the slot via swap-with-last (same O(1) pattern as the
+        // zigbee pool's pool_remove). find_or_create_entry only ever appends
+        // at s_count, so a plain tombstone would NOT free the slot — the table
+        // would still grow unbounded on device churn. Swap genuinely shrinks
+        // s_count.
+        uint16_t idx  = (uint16_t)(e - s_shadow);
+        uint16_t last = (uint16_t)(s_count - 1);
+        if (idx != last) {
+            s_shadow[idx] = s_shadow[last];   // move the last entry into the hole
+            // The moved entry's software timers were created with their OLD
+            // address as the FreeRTOS timer ID (pvTimerGetTimerID → entry*).
+            // After relocation that ID dangles, so re-point any live timer to
+            // the entry's NEW address. Timer callbacks only enqueue by ieee
+            // (re-resolved under s_mutex in task_shadow), so a callback that
+            // races this fixup still finds the correct entry by IEEE.
+            DeviceShadowEntry* moved = &s_shadow[idx];
+            if (moved->debounce_timer)  vTimerSetTimerID(moved->debounce_timer,  static_cast<void*>(moved));
+            if (moved->occupancy_timer) vTimerSetTimerID(moved->occupancy_timer, static_cast<void*>(moved));
+        }
+        memset(&s_shadow[last], 0, sizeof(DeviceShadowEntry));  // wipe the vacated tail slot
+        s_count--;
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (!found) return;   // unknown ieee — nothing in RAM or (by construction) NVS
+
+    // Leaf-lock rule: NVS erase outside s_mutex (same window/justification as
+    // clear_attrs — a concurrent sweep write for THIS ieee can't happen now
+    // that the slot is gone, and an in-flight one for the moved entry targets
+    // a different key). Erase BOTH the 'a' (attr) and 'c' (config) keys —
+    // clear_attrs only ever erased 'a', so removed devices leaked their 'c'
+    // config blob in NVS forever.
+    if (s_nvs) {
+        char ka[16], kc[16];
+        shadow_key(ka, 'a', ieee);
+        shadow_key(kc, 'c', ieee);
+        esp_err_t ea = nvs_erase_key(s_nvs, ka);
+        if (ea == ESP_ERR_NVS_NOT_FOUND) ea = ESP_OK;   // never persisted → fine
+        esp_err_t ec = nvs_erase_key(s_nvs, kc);
+        if (ec == ESP_ERR_NVS_NOT_FOUND) ec = ESP_OK;
+        nvs_seq(nullptr, ea, TAG, "erase_key attr remove");
+        nvs_seq(nullptr, ec, TAG, "erase_key config remove");
+        nvs_seq(nullptr, nvs_commit(s_nvs), TAG, "commit remove");
+    }
+    ESP_LOGI(TAG, "Removed shadow entry ieee=0x%016llX (slot+timers+NVS reclaimed)",
+             (unsigned long long)ieee);
 }
 
 bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
