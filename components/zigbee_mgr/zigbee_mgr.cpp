@@ -1066,6 +1066,8 @@ bool zigbee_mgr_init() {
     // a null-check on the queue (same pattern as zigbee_identity_init). The
     // post-coordinator registrations below are likewise re-run only when we
     // actually proceed past a freshly-built queue.
+    // NOT reentrancy-safe: the `first_init` null-check is not atomic; assumes
+    // init is driven from a single boot task (no concurrent first call).
     const bool first_init = (s_zcl_queue == nullptr);
     if (first_init) {
         s_zcl_queue = xQueueCreate(ZCL_QUEUE_DEPTH, sizeof(AfRawFrame));

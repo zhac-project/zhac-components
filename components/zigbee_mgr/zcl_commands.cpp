@@ -667,7 +667,7 @@ static bool zcl_cluster_command_impl(uint16_t nwk_addr, uint8_t endpoint,
     const std::size_t body_len = 3u + static_cast<std::size_t>(payload_len);
 
     const AfReqOpts opts{2000, 1, /*idempotent=*/false,
-                         confirm_timeout_ms, ESP_LOG_WARN, "zcl_cmd"};
+                         /*confirm=*/confirm_timeout_ms, ESP_LOG_WARN, "zcl_cmd"};
     if (!af_data_request(nwk_addr, endpoint, 0x01, cluster_id, seq,
                          zcl_frame, body_len, opts))
         return false;
