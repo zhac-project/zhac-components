@@ -15,35 +15,10 @@
 
 #if CONFIG_METRICS_ENABLED && CONFIG_METRICS_ENABLE_MQTT_EXPORTER
 
-#include <cstdarg>
-#include <cstdio>
-
 namespace metrics {
-namespace {
 
-struct Writer {
-    char*  buf;
-    size_t cap;
-    size_t off;
-    bool   truncated;
-};
-
-void wput(Writer& w, const char* fmt, ...) {
-    if (w.truncated || w.off >= w.cap) return;
-    va_list ap;
-    va_start(ap, fmt);
-    const int n = std::vsnprintf(w.buf + w.off, w.cap - w.off, fmt, ap);
-    va_end(ap);
-    if (n < 0) { w.truncated = true; return; }
-    if (static_cast<size_t>(n) >= w.cap - w.off) {
-        w.truncated = true;
-        w.off = w.cap - 1;
-        return;
-    }
-    w.off += static_cast<size_t>(n);
-}
-
-}  // namespace
+using detail::Writer;
+using detail::wput;
 
 size_t mqtt_format_snapshot_json(char* buf, size_t buf_size) noexcept {
     if (!buf || buf_size == 0) return 0;
@@ -101,6 +76,14 @@ size_t mqtt_format_snapshot_json(char* buf, size_t buf_size) noexcept {
         first = false;
     }
     wput(w, "}}");
+
+    // A truncated snapshot is missing closing braces (and possibly a
+    // value mid-token) — i.e. syntactically invalid JSON. Publishing it
+    // would feed garbage to every broker subscriber, so report 0 bytes
+    // and let the caller skip the publish entirely rather than ship a
+    // malformed document. The buffer stays NUL-terminated either way.
+    // (FINDINGS §8 — truncation flag was never surfaced.)
+    if (w.truncated) return 0;
 
     return w.off;
 }

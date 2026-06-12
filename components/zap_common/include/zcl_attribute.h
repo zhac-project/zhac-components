@@ -61,8 +61,13 @@ static_assert(offsetof(ZclAttribute, int_val)  == 36);
 // runaway vendor port cannot brick the device.
 inline void zcl_attr_set_int(ZclAttribute* a, const char* key,
                               int32_t val, ValType t = VAL_INT) {
+    // strncpy(dst, NULL, n) is UB; the assert macro only guarded against
+    // an over-long key, not a null one (FINDINGS §8). Substitute "" so a
+    // null key yields a well-defined empty-keyed attribute instead of a
+    // crash on the decode path.
+    if (!key) key = "";
 #ifdef ZCL_ATTR_ASSERT_KEY_FITS
-    if (key && std::strlen(key) >= ATTR_KEY_MAX) std::abort();
+    if (std::strlen(key) >= ATTR_KEY_MAX) std::abort();
 #endif
     std::strncpy(a->key, key, ATTR_KEY_MAX - 1);
     a->key[ATTR_KEY_MAX - 1] = '\0';
@@ -75,8 +80,12 @@ inline void zcl_attr_set_int(ZclAttribute* a, const char* key,
 // Helper: populate a STR attribute by name.
 inline void zcl_attr_set_str(ZclAttribute* a, const char* key,
                               const char* val) {
+    // Guard BOTH operands: `val` was already null-checked at the copy
+    // site, but `key` reached strncpy raw — a null key is UB (FINDINGS
+    // §8). Substitute "" for either so the decode path can't crash.
+    if (!key) key = "";
 #ifdef ZCL_ATTR_ASSERT_KEY_FITS
-    if (key && std::strlen(key) >= ATTR_KEY_MAX) std::abort();
+    if (std::strlen(key) >= ATTR_KEY_MAX) std::abort();
 #endif
     std::strncpy(a->key, key, ATTR_KEY_MAX - 1);
     a->key[ATTR_KEY_MAX - 1] = '\0';

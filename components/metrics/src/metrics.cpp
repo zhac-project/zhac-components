@@ -306,19 +306,14 @@ void update_memory_snapshot() noexcept {
 size_t dump_text(char* buf, size_t buf_size) noexcept {
 #if CONFIG_METRICS_ENABLE_TEXT_DUMP
     if (!buf || buf_size == 0) return 0;
-    size_t off = 0;
-    auto append = [&](const char* fmt, auto... args) -> bool {
-        if (off >= buf_size) return false;
-        int n = std::snprintf(buf + off, buf_size - off, fmt, args...);
-        if (n < 0) return false;
-        if (static_cast<size_t>(n) >= buf_size - off) {
-            // snprintf truncated; buffer already NUL-terminated at
-            // `buf_size - 1`. Stop appending.
-            off = buf_size - 1;
-            return false;
-        }
-        off += static_cast<size_t>(n);
-        return true;
+    // Shared bounded writer (one implementation in metrics_internal.h —
+    // formerly a third hand-rolled copy of the exporter logic, FINDINGS
+    // §8 DUP). `append` keeps the call-site shape; truncation latches in
+    // `w.truncated` and further writes are refused, buffer stays
+    // NUL-terminated.
+    detail::Writer w{buf, buf_size, 0, false};
+    auto append = [&](const char* fmt, auto... args) {
+        detail::wput(w, fmt, args...);
     };
 
     for (size_t i = 0; i < kMetricCount; ++i) {
@@ -368,7 +363,7 @@ size_t dump_text(char* buf, size_t buf_size) noexcept {
             }
         }
     }
-    return off;
+    return w.off;
 #else
     (void)buf; (void)buf_size;
     return 0;

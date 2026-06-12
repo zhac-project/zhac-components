@@ -186,12 +186,28 @@ TEST_CASE("mqtt json — has top-level sections", "[metrics]") {
     TEST_ASSERT_EQUAL_CHAR('}', buf[n - 1]);
 }
 
-TEST_CASE("mqtt json — truncation-safe", "[metrics]") {
+TEST_CASE("mqtt json — truncation returns 0 (no garbage publish)",
+          "[metrics]") {
     reset();
     metrics::counter_inc(kHapFrames, 1);
     char tiny[24];
-    metrics::mqtt_format_snapshot_json(tiny, sizeof(tiny));
+    std::memset(tiny, 0xAB, sizeof(tiny));
+    // A buffer too small to hold the closing braces yields invalid JSON.
+    // The exporter must report 0 so the caller skips the broker publish
+    // (FINDINGS §8) — and still leave the buffer NUL-terminated.
+    const size_t n = metrics::mqtt_format_snapshot_json(tiny, sizeof(tiny));
+    TEST_ASSERT_EQUAL_UINT(0, n);
     TEST_ASSERT_EQUAL_CHAR('\0', tiny[sizeof(tiny) - 1]);
+}
+
+TEST_CASE("mqtt json — untruncated returns >0 and closes braces",
+          "[metrics]") {
+    reset();
+    metrics::counter_inc(kHapFrames, 7);
+    char buf[2048];
+    const size_t n = metrics::mqtt_format_snapshot_json(buf, sizeof(buf));
+    TEST_ASSERT_GREATER_THAN_UINT(0, n);
+    TEST_ASSERT_EQUAL_CHAR('}', buf[n - 1]);   // valid: closed object
 }
 
 // ── Text dump ────────────────────────────────────────────────────────

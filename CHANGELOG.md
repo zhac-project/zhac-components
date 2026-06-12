@@ -71,6 +71,59 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   a visible dropped-attr for a subtle correctness bug. The 32-slot cap is now a
   documented limit (raising it is a schema bump, out of scope).
 
+### Fixed — Medium (P4 findings batch, T28 metrics / zap_common)
+
+- **metrics** (MED, FINDINGS §8, `metrics_export_mqtt.cpp` snapshot formatter):
+  when the JSON snapshot did not fit the caller's buffer, the formatter
+  truncated mid-document (dropping the closing `}}` and possibly a value
+  mid-token) but **returned the truncated length anyway** — the `truncated`
+  flag was computed and discarded. The MQTT publisher then shipped that
+  **syntactically invalid JSON** to the broker, poisoning every subscriber's
+  parser. `mqtt_format_snapshot_json` now **returns 0 when the writer
+  truncated**, so the caller skips the publish entirely rather than emit
+  garbage; the buffer is still left NUL-terminated. (Prometheus text stays
+  valid line-wise under truncation, so its `return off` contract is unchanged.)
+- **zap_common** (MED, FINDINGS §8, `sys_metrics.h` CPU% sampler): the
+  per-core CPU%-baseline state was held in function-local `static` vars inside
+  a `static inline` **header** function. Those statics are **per-translation-
+  unit, not "per-call-site"** as the old doc claimed — two call sites compiled
+  into one TU, or two tasks racing one TU's copy, shared and corrupted a single
+  rolling window with **no synchronisation**, reporting bogus CPU%. The
+  baseline now lives in a **caller-owned `sys_metrics_cpu_ctx_t`** passed by
+  reference, so each measurement cadence owns its own window. Signature changed
+  to `sys_metrics_sample_cpu_pct(sys_metrics_cpu_ctx_t&, uint8_t&, uint8_t&)`;
+  both firmware callers updated (P4 heartbeat `hap_dispatch.cpp`, S3
+  `/api/status` `api_system.cpp`), each with a private file-scope ctx touched
+  by a single task. A `seeded` flag keeps the first sample at 0 (no garbage
+  delta) and distinguishes a genuine zero baseline from "never sampled".
+- **zap_common** (MED/SMELL, FINDINGS §8, `zcl_attribute.h` set helpers):
+  `zcl_attr_set_int` / `zcl_attr_set_str` called `std::strncpy(dst, key, n)`
+  with an **unguarded `key`** — `strncpy` from `NULL` is UB. The null guard
+  existed only inside the optional `ZCL_ATTR_ASSERT_KEY_FITS` macro (and
+  `set_str` guarded `val` but not `key`). Both helpers now **substitute `""`
+  for a null `key` (and `val`)** before any copy, so a null name on the decode
+  path yields a well-defined empty-keyed attribute instead of a crash.
+- **metrics** (LOW/DUP, FINDINGS §8, `metrics_export_mqtt.cpp:31`): the
+  `Writer` struct + `wput` bounded-format helper was duplicated **verbatim** in
+  the Prometheus exporter and re-implemented as the `append` lambda in
+  `metrics.cpp`'s text dump. Hoisted to **one** `metrics::detail::Writer` /
+  `detail::wput` in the component-private `metrics_internal.h`; all three
+  formatters now share it (the dump lambda forwards to `detail::wput`). The
+  shared `wput` carries a `printf` format attribute so -Wformat coverage
+  survives the hoist.
+
+#### Tests
+- **metrics** on-target (`test/main/test_metrics.cpp`): the MQTT truncation
+  case now asserts the formatter **returns 0** (skip-publish contract) in
+  addition to NUL-termination, plus a positive case asserting an untruncated
+  snapshot returns >0 and closes its braces.
+- **zap_common** host (`test/host/`): added `test_sys_metrics.cpp` (proves two
+  contexts on interleaved cadences do **not** cross-corrupt baselines, first
+  sample is 0, per-core independence — drives scripted FreeRTOS counters via
+  new `stubs/freertos/*` + `stubs/sdkconfig.h`) and `test_zcl_attribute.cpp`
+  (null key, null val, both-null → no UB; plus normal population + over-long
+  key truncation). Both wired into the host ctest suite (now 3 executables).
+
 ### Fixed — Medium (P4 findings batch, T25 zigbee_mgr / znp_driver radio stack)
 
 - **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:27`
