@@ -27,6 +27,266 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   split + reassembly (30 devices → 4 chunks → full list), single-chunk and
   empty-list edges.
 
+### Fixed — Medium (P4 findings batch, T31 HAP leftovers)
+
+- **hap_protocol** (MED, FINDINGS HAP, `hap_protocol.cpp` `hap_decode_stream`
+  resync scan): off-by-one in the forward resync loop bound. The loop reads
+  `buf[i+2]` but stopped at `i + 3 < len`, so a candidate preamble whose 3rd
+  byte landed on the final buffer index was missed. Tightened to `i + 2 < len`
+  (the true last startable position), so the scan now covers every full-preamble
+  start position including the tail.
+- **hap_protocol** (MED, FINDINGS HAP, `hap_protocol.cpp` `hap_decode_stream`
+  no-candidate consume): when the scan finds NO candidate preamble anywhere, the
+  old code left 3 trailing bytes (`len - 3`), re-presenting the same undecodable
+  head every call (slow re-parse loop). With the scan bound fixed to cover the
+  tail, a "no candidate" verdict is authoritative, so the whole buffer is now
+  consumed (`*consumed = len`). A preamble fragment straddling a read boundary is
+  acceptably lost on this non-DMA v3 path; the live P4↔S3 link uses the
+  fixed-size two-stage DMA decoder, not this scanner.
+- **hap_protocol** (DOC, FINDINGS HAP, `hap_protocol.cpp` + `hap_protocol.h`):
+  documented the v3 single-frame API (`hap_encode` / `hap_decode` /
+  `hap_decode_stream`, CRC8 header) as retained for the host test suite and
+  non-DMA / single-shot transports ONLY — it has zero live callers; the wire
+  path is the v4 two-stage CRC16 DMA helpers (`hap_encode_stage1` /
+  `hap_decode_stage1` / `hap_encode_stage2` / `hap_verify_stage2`). Resolves a
+  stale-comment finding by documenting, not deleting (the functions stay).
+- **hap_session** (MED, FINDINGS HAP, `hap_session.cpp` `STALE_BEHIND_THRESHOLD`):
+  widened the monotonic high-water stale-dup threshold from `WIN_SIZE` (16) to
+  `2 * WIN_SIZE` (32) to close a retransmit false-drop. At `WIN_SIZE` the band
+  had ZERO margin: a legitimate in-window frame (reordered or retransmitted) can
+  sit up to `WIN_SIZE - 1` (15) behind the high-water, and the drop triggered at
+  exactly 16 — one boundary reorder false-dropped a real retransmit. The valid
+  band is strictly `(WIN_SIZE, SEEN_RING_SIZE)` = (16, 64); `2 * WIN_SIZE` sits
+  squarely in the middle with margin on both sides, locked by a `static_assert`.
+  The dedup unit test exercises the exact-match ring (same-seq dup), not the
+  high-water gap, so no test change was needed.
+
+### Fixed — Medium (P4 findings batch, T30 rule_store)
+
+- **rule_store** (MED, FINDINGS §7, `rule_store.cpp` `rule_store_set_enabled`):
+  removed the callerless `rule_store_set_enabled()` from the public API. It
+  loaded via `rule_store_load_unlocked` (NVS-only — missed any uncommitted
+  writeback-overlay edit), flipped `enabled`, and wrote via
+  `rule_store_save_unlocked` (direct NVS, bypassing the overlay), so the next
+  flush of a still-pending overlay WRITE for the same id would **overwrite the
+  enable/disable with the stale copy** (silent lost edit); it also lacked the
+  `if (!s_nvs)` init guard every other public fn has, so a pre-init call could
+  `xSemaphoreTake(nullptr)` and crash. Confirmed callerless in production (only
+  the IDF test referenced it). Routing it through the overlay would add a racy
+  read-modify-write API nobody calls, so the function was deleted (trimming the
+  public surface ahead of open-sourcing); callers flip `enabled` via the
+  existing overlay-aware `rule_store_load` + `rule_store_save`. Test
+  `enabled flag persists` re-expressed through that supported path.
+- **rule_store** (LOW, FINDINGS §7, `rule_store.cpp` `rule_store_load_all`):
+  closed an overlay-merge vanish window. `load_all` released `s_mutex` after
+  the NVS walk and only THEN merged the writeback overlay (which takes the
+  separate `s_mtx`); because the reader reads NVS-then-overlay in the same
+  order the flusher writes NVS-then-clears-overlay, a slot flushed between the
+  two reads could be absent from BOTH and transiently vanish from that one
+  snapshot. The `s_mutex` release now happens AFTER `rule_store_foreach_dirty`,
+  so the merge runs while `s_mutex` is held: the flusher's `rule_store_save` /
+  `rule_store_delete_err` then blocks on `s_mutex` and cannot commit-then-clear
+  mid-merge (the slot stays WRITE in the overlay and is picked up). Deadlock-free
+  — `load_all` nests `s_mutex ⊃ s_mtx` and the flusher never holds `s_mtx`
+  while taking `s_mutex` (it releases `s_mtx` before the NVS write), so there is
+  no opposite-order nesting; `merge_cb` dedups by `rule_id`, collapsing any
+  transient NVS+overlay duplicate.
+
+### Fixed — Medium (P4 findings batch, T27 device_shadow)
+
+- **device_shadow** (MED, FINDINGS §9, `device_shadow.cpp` config-blob path):
+  `set_config` stored a caller-supplied `DeviceConfig` and `nvs_load_config`
+  loaded the raw NVS blob with **no integrity check and no bounds clamp** — a
+  `filtered_count` / `debounce_ignore_count` > `DEVICE_CONFIG_FILTER_MAX` (8)
+  made `shadow_pipeline_filter` and the debounce-bypass scan read past the
+  8-slot `filtered[]` / `debounce_ignore[]` arrays. Both counts are now
+  **clamped to `DEVICE_CONFIG_FILTER_MAX` on every ingest path** (caller
+  `set_config` + `nvs_load_config`), and the config 'c' blob is now persisted
+  as `[CfgBlobHdr][DeviceConfig]` with a version + CRC32 header — mirroring the
+  F26 attr-blob defence — so a torn/corrupt/hand-poked config is **rejected on
+  load** (entry falls back to defaults + re-seeds from the SPA) instead of
+  being trusted. `NVS_SHADOW_VERSION` bumped 7→8 (headerless v7 'c' blobs are
+  wiped on first boot, not rejected per-device).
+- **device_shadow** (MED, FINDINGS §9 / SHA-F3, `device_shadow.cpp` table +
+  NVS leak): shadow entries were **never freed** — there was no remove API and
+  REST/HAP setters `find_or_create` arbitrary ieee, so departed / mistyped
+  devices permanently consumed one of the `ZAP_MAX_DEVICES` (200) table slots
+  **and** left their per-device debounce/occupancy `xTimer`s scheduled (a
+  device-churn workload eventually exhausts the FreeRTOS timer pool and breaks
+  `xTimerCreate` for legitimate joins); `clear_attrs` additionally erased only
+  the 'a' attr-blob NVS key, leaking the 'c' config blob in flash forever. New
+  **`device_shadow_remove(ieee)`** reclaims the slot (swap-with-last + timer-ID
+  fix-up on the relocated entry), deletes both timers, and erases **both** the
+  'a' and 'c' NVS keys. Honours the T10 LEAF lock model: the slot/timer work is
+  under `s_mutex` (0-tick non-blocking timer deletes), the NVS erases run AFTER
+  the lock is released, and no `event_bus` publish is performed. Wired into the
+  P4 HAP **hard** DEVICE_DELETE ("forget forever") path in `hap_dispatch.cpp`
+  (replacing the leaky `clear_attrs`), NOT the soft DEVICE_LEAVE — soft-leave
+  intentionally keeps slot + NVS so a rejoin restores state without a fresh
+  interview.
+- **device_shadow** (MED, FINDINGS §9, `device_shadow.cpp` `upsert_cache`):
+  when a device exceeded `SHADOW_ATTR_MAX` (32) distinct attrs, new keys were
+  **silently dropped** (multi-gang switches / climate TRVs that expose many DPs
+  lose late-reporting attrs). Now logs **once per device** (gated by a new
+  `attr_overflow_logged` flag, re-armed by `clear_attrs` / `device_shadow_remove`)
+  so the condition is diagnosable without per-frame spam on the radio RX path.
+  Deliberately **no auto-eviction**: the only obvious eviction target
+  (`_`-prefixed diagnostics) includes internal bookkeeping like `_last_seen`
+  that the occupancy/last-seen logic depends on, so silent eviction would trade
+  a visible dropped-attr for a subtle correctness bug. The 32-slot cap is now a
+  documented limit (raising it is a schema bump, out of scope).
+
+### Fixed — Medium (P4 findings batch, T28 metrics / zap_common)
+
+- **metrics** (MED, FINDINGS §8, `metrics_export_mqtt.cpp` snapshot formatter):
+  when the JSON snapshot did not fit the caller's buffer, the formatter
+  truncated mid-document (dropping the closing `}}` and possibly a value
+  mid-token) but **returned the truncated length anyway** — the `truncated`
+  flag was computed and discarded. The MQTT publisher then shipped that
+  **syntactically invalid JSON** to the broker, poisoning every subscriber's
+  parser. `mqtt_format_snapshot_json` now **returns 0 when the writer
+  truncated**, so the caller skips the publish entirely rather than emit
+  garbage; the buffer is still left NUL-terminated. (Prometheus text stays
+  valid line-wise under truncation, so its `return off` contract is unchanged.)
+- **zap_common** (MED, FINDINGS §8, `sys_metrics.h` CPU% sampler): the
+  per-core CPU%-baseline state was held in function-local `static` vars inside
+  a `static inline` **header** function. Those statics are **per-translation-
+  unit, not "per-call-site"** as the old doc claimed — two call sites compiled
+  into one TU, or two tasks racing one TU's copy, shared and corrupted a single
+  rolling window with **no synchronisation**, reporting bogus CPU%. The
+  baseline now lives in a **caller-owned `sys_metrics_cpu_ctx_t`** passed by
+  reference, so each measurement cadence owns its own window. Signature changed
+  to `sys_metrics_sample_cpu_pct(sys_metrics_cpu_ctx_t&, uint8_t&, uint8_t&)`;
+  both firmware callers updated (P4 heartbeat `hap_dispatch.cpp`, S3
+  `/api/status` `api_system.cpp`), each with a private file-scope ctx touched
+  by a single task. A `seeded` flag keeps the first sample at 0 (no garbage
+  delta) and distinguishes a genuine zero baseline from "never sampled".
+- **zap_common** (MED/SMELL, FINDINGS §8, `zcl_attribute.h` set helpers):
+  `zcl_attr_set_int` / `zcl_attr_set_str` called `std::strncpy(dst, key, n)`
+  with an **unguarded `key`** — `strncpy` from `NULL` is UB. The null guard
+  existed only inside the optional `ZCL_ATTR_ASSERT_KEY_FITS` macro (and
+  `set_str` guarded `val` but not `key`). Both helpers now **substitute `""`
+  for a null `key` (and `val`)** before any copy, so a null name on the decode
+  path yields a well-defined empty-keyed attribute instead of a crash.
+- **metrics** (LOW/DUP, FINDINGS §8, `metrics_export_mqtt.cpp:31`): the
+  `Writer` struct + `wput` bounded-format helper was duplicated **verbatim** in
+  the Prometheus exporter and re-implemented as the `append` lambda in
+  `metrics.cpp`'s text dump. Hoisted to **one** `metrics::detail::Writer` /
+  `detail::wput` in the component-private `metrics_internal.h`; all three
+  formatters now share it (the dump lambda forwards to `detail::wput`). The
+  shared `wput` carries a `printf` format attribute so -Wformat coverage
+  survives the hoist.
+
+#### Tests
+- **metrics** on-target (`test/main/test_metrics.cpp`): the MQTT truncation
+  case now asserts the formatter **returns 0** (skip-publish contract) in
+  addition to NUL-termination, plus a positive case asserting an untruncated
+  snapshot returns >0 and closes its braces.
+- **zap_common** host (`test/host/`): added `test_sys_metrics.cpp` (proves two
+  contexts on interleaved cadences do **not** cross-corrupt baselines, first
+  sample is 0, per-core independence — drives scripted FreeRTOS counters via
+  new `stubs/freertos/*` + `stubs/sdkconfig.h`) and `test_zcl_attribute.cpp`
+  (null key, null val, both-null → no UB; plus normal population + over-long
+  key truncation). Both wired into the host ctest suite (now 3 executables).
+
+### Fixed — Medium (P4 findings batch, T25 zigbee_mgr / znp_driver radio stack)
+
+- **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:27`
+  DUP): the AF_DATA_REQUEST header assembly + SRSP status check was
+  copy-pasted across ~12 call-sites (on/off, level, color-temp, gen-time,
+  default-resp, read, write, configure-report, cluster-command, magic
+  packet, miboxer set-zones / tuya-setup) and in `zhc_send_bridge.cpp`, each
+  with drifting retry params (timeouts 1000/2000/3000, attempts 1/2/3).
+  Folded into ONE `af_data_request()` builder (+ exported `zigbee_af_send_zcl`
+  for the adapter bridge); each call-site's original timeout/attempt count is
+  **preserved** via parameters, not homogenised.
+- **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:45`
+  SMELL→correctness): AF_DATA_REQUEST was blind-retried up to 3× with the
+  SAME trans_id after an SRSP loss — the SRSP only confirms the NCP
+  *accepted* the frame, so if attempt 1 reached the NCP but its SRSP was
+  dropped, the command executed twice on-air (a Toggle visibly double-fires,
+  a level/color step overshoots). Non-idempotent commands (On/Off, Level,
+  ColorTemp, cluster-specific device commands, the whole zhc_send_bridge
+  adapter→radio path) now send EXACTLY ONCE and gate success on the
+  asynchronous AF_DATA_CONFIRM via the existing `znp_confirm` ring — no
+  blind re-send. Idempotent frames (attribute reads, absolute-value writes,
+  configure-reporting, gen-time / magic-packet probes, default-resp) keep
+  their multi-attempt SREQ retry since re-sending them is harmless.
+- **zigbee_mgr** (MED, FINDINGS §4, `zcl_seq.cpp:17`): the TSN counter
+  `fetch_add` wrapped 0xFF→0x00, handing every 256th frame the reserved
+  "not-set" TSN 0 (which the send bridge writes as a placeholder and the
+  confirm ring treats as a live key) → mis-correlation. Now a CAS loop
+  that skips 0, so `zcl_seq_next()` always returns 1..255.
+- **znp_driver** (MED, FINDINGS §4, `znp_rx.cpp:76`): the AREQ dedup scope
+  named `0xA1` as "TC_DEV_IND", but `0xA1` is ZDO_BIND_RSP — TC_DEV_IND is
+  `0xCA`. So the rapid device-announce double-bursts the dedup was meant to
+  catch (Xiaomi devices fire two on wake) were never deduped, while two
+  distinct BIND_RSPs within 200 ms were wrongly dropped (losing a bind
+  outcome). Target corrected to `0xCA` (+ comment).
+- **znp_driver** (MED, FINDINGS §4, `znp_driver_shim.cpp:30` DUP + `:85`
+  BLOCK): the legacy `mt_fcs` / `mt_encode` reimplemented the MT framing
+  already owned by `znp_parser.cpp` (two paths that could drift) → they now
+  delegate to the parser's single `znp_mt_fcs` / `znp_mt_encode`. And
+  `znp_sreq_retry` looped with NO backoff and retried even
+  RESET_DURING_CALL, hammering a resetting NCP 3× immediately and bypassing
+  the F43 backoff → it now routes through `znp_call_retry` (25/50/100/200 ms
+  backoff, fail-fast on TRANSPORT_DOWN/INTERNAL_ERROR).
+- **znp_driver** (MED, FINDINGS §4, `znp_worker.cpp:289` BLOCK): `znp_call`
+  applied the FULL `timeout_ms` to each of acquire-slot, queue-send, and the
+  worker's SRSP wait (≈3× the advertised timeout under contention) before
+  blocking `portMAX_DELAY` on the slot sem. A single deadline now budgets
+  all the pre-send waits; the worker's SRSP wait is the time LEFT after the
+  request is queued (floored at 50 ms), so a whole call is bounded by
+  ~`timeout_ms`.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_interview.cpp:311`):
+  ACTIVE_EP_RSP set `endpoint_count` from the device's claimed count while
+  the endpoint memcpy clamped separately — a truncated frame left
+  uninitialised stack bytes reported as real endpoints (then probed +
+  registered). The count is now clamped to bytes-present (and to 8) BEFORE
+  it is consumed.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_interview.cpp:375`): the
+  SIMPLE_DESC out-cluster-list offset `out_off = 13 + in_cnt*2` was computed
+  as `uint8_t` and wrapped for `in_cnt ≥ 122` (attacker-influenced wire
+  data), parsing the out-cluster list from the wrong offset. Now size_t math
+  with an explicit bound against the frame length.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:96`): a duplicate
+  matching ZDO AREQ delivered into `store_rsp` (ZNP RX task) could memcpy
+  into `s_rsp_buf` WHILE the interview task (other core) read the previous
+  response — a torn cross-core read. `store_rsp` now CLAIMs each wait
+  single-shot via a CAS on the cmd1 filter, so exactly one writer touches
+  the buffer per arm.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:251`): a NODE_DESC
+  failure makes `do_interview` return early before the work-copy's FAILED
+  state is committed, leaving the live slot at NONE — the FAILED-keyed
+  opportunistic re-interview never fired and the device was stranded until
+  rejoin. The live slot is now stamped FAILED after the final attempt.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:662` BLOCK):
+  `on_tc_dev_ind` runs in the ZNP UART RX task and blocked up to 100 ms in
+  `xQueueSend` on a full join queue — a join storm stalled byte intake →
+  UART overrun. Now a zero-timeout send with drop-oldest (the pool is
+  already seeded/refreshed and the interview task re-reads the pool nwk).
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_mgr.cpp:99`): `s_init_done` was
+  a plain bool written by `coordinator_start` and read by `on_reset_ind` on
+  the RX task (its neighbours were already `std::atomic` for exactly this,
+  ZB-F4) → `std::atomic<bool>`.
+- **zigbee_mgr** (MED/LEAK, FINDINGS §4, `zigbee_mgr.cpp:1021`):
+  `zigbee_mgr_init` was not idempotent — a retry after a `coordinator_start`
+  failure re-created `s_zcl_queue` + spawned a second `zcl_attr_task` (old
+  queue leaked, duplicate consumer + duplicate AREQ subscriptions). The
+  one-time wiring (queue, tasks, sub-module inits, AREQ registrations) is now
+  guarded by a null-check on the queue.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_mgr.cpp:405`): the PRECFGKEY
+  (network key) NV write was hex-dumped in plaintext by the wire trace
+  (`znp_worker.cpp` TX, `znp_rx.cpp` RX) — a debug capture would contain the
+  live key. A new `znp_wire_is_sensitive()` flags SYS NV writes of key item
+  ids (PRECFGKEY 0x0062, NWK active/altern key-info 0x003A/0x003B); both
+  trace sites now print the header but REDACT the payload.
+- **zigbee_mgr** (LOW/SEC, FINDINGS §4, `zigbee_mgr.cpp:342`): the generated
+  `net_key[16]` stack buffer was never zeroized after commissioning →
+  `explicit_bzero` immediately after its last use (the PRECFGKEY write).
+
+### Fixed — High/Medium (P2 findings review, T19 mqtt_gw / tg_gw lifecycle & injection)
+
 - **mqtt_gw (S3)** (HIGH, FINDINGS §7, `mqtt_gw_s3.cpp:53`): the `s_client`
   stop/destroy/recreate ran UNSYNCHRONIZED from REST handlers, the esp_timer
   re-arm/deferred-start callbacks, the STA-up handler, and the pub-worker's

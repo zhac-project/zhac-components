@@ -155,6 +155,12 @@ enum HapDecodeResult {
     HAP_DECODE_RESYNC      = 7,
 };
 
+// ── v3 single-frame framing (CRC8 header + CRC16 payload) ────────────────
+// Retained for the host test suite and any non-DMA / single-shot transport.
+// The live P4<->S3 SPI link does NOT use these — it uses the v4 two-stage
+// DMA helpers below (hap_encode_stage1/hap_decode_stage1/hap_encode_stage2/
+// hap_verify_stage2). Keep both in sync if the wire header layout changes.
+
 // Encode frame into buf. Returns total bytes written, 0 on overflow.
 size_t hap_encode(const HapFrame& frame, uint8_t* buf, size_t buf_size);
 

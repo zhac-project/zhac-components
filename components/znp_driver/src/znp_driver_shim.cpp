@@ -21,30 +21,34 @@
 #include <cstring>
 #include <utility>
 
-static const char* TAG = "znp_shim";
+// Retained for any future shim-local logging; the retry path now delegates
+// to znp_call_retry which logs under its own tag, so this is currently
+// unreferenced (the only call sites that used it moved out).
+[[maybe_unused]] static const char* TAG = "znp_shim";
 
 // ── Legacy mt_fcs / mt_encode / mt_decode ─────────────────────────────────
-// Used by tests and a handful of callers that parse ad-hoc buffers. Kept
-// behaviorally identical; the new parser uses its own private FCS helper so
-// the two code paths never disagree about the wire format.
+// Used by tests and a handful of callers that parse ad-hoc buffers. §4
+// (FINDINGS.md): the FCS + encode framing used to be a SECOND, independent
+// copy of the wire format that already lives in znp_parser.cpp — two paths
+// that could silently drift. They now delegate to the parser's single
+// owner (znp_mt_fcs / znp_mt_encode) so there is exactly one definition of
+// the on-wire MT frame. mt_decode stays here: the parser only offers a
+// streaming decoder, but it shares the same FCS via znp_mt_fcs below.
 uint8_t mt_fcs(uint8_t len, uint8_t cmd0, uint8_t cmd1,
                const uint8_t* payload, uint8_t payload_len) {
-    uint8_t fcs = len ^ cmd0 ^ cmd1;
-    for (uint8_t i = 0; i < payload_len; i++) fcs ^= payload[i];
-    return fcs;
+    return znp_mt_fcs(len, cmd0, cmd1, payload, payload_len);
 }
 
 size_t mt_encode(const MtFrame& f, uint8_t* buf, size_t buf_size) {
-    const size_t total = MT_OVERHEAD + f.payload_len;
-    if (total > buf_size) return 0;
-    buf[0] = MT_SOF;
-    buf[1] = f.payload_len;
-    buf[2] = f.cmd0;
-    buf[3] = f.cmd1;
-    if (f.payload_len > 0 && f.payload) memcpy(buf + 4, f.payload, f.payload_len);
-    buf[4 + f.payload_len] = mt_fcs(f.payload_len, f.cmd0, f.cmd1,
-                                     f.payload, f.payload_len);
-    return total;
+    // Bridge the legacy MtFrame into the owning ZnpFrame encoder. ZnpFrame
+    // carries its own data[]; copy the (non-owning) MtFrame payload in.
+    if (f.payload_len > ZNP_MAX_DATA_LEN) return 0;
+    ZnpFrame zf{};
+    zf.cmd0 = f.cmd0;
+    zf.cmd1 = f.cmd1;
+    zf.len  = f.payload_len;
+    if (f.payload_len > 0 && f.payload) memcpy(zf.data, f.payload, f.payload_len);
+    return znp_mt_encode(zf, buf, buf_size);
 }
 
 MtDecodeResult mt_decode(const uint8_t* buf, size_t len, MtFrame& out) {
@@ -82,12 +86,24 @@ bool znp_sreq(const MtFrame& req, MtFrame& srsp_out, uint32_t timeout_ms) {
 
 bool znp_sreq_retry(const MtFrame& req, MtFrame& srsp_out,
                     uint32_t timeout_ms, int max_attempts) {
-    for (int i = 1; i <= max_attempts; i++) {
-        if (znp_sreq(req, srsp_out, timeout_ms)) return true;
-        ESP_LOGW(TAG, "SREQ attempt %d/%d failed cmd0=0x%02x cmd1=0x%02x",
-                 i, max_attempts, req.cmd0, req.cmd1);
-    }
-    return false;
+    // §4 (FINDINGS.md, znp_driver_shim.cpp:85): this used to loop on
+    // znp_sreq with NO inter-attempt backoff and retried on EVERY failure
+    // — including RESET_DURING_CALL — so a legacy caller hammered a
+    // resetting NCP three times back-to-back, bypassing the F43 backoff
+    // that znp_call_retry already implements. Route through znp_call_retry
+    // instead: it backs off 25/50/100/200 ms between attempts and fails
+    // fast on TRANSPORT_DOWN / INTERNAL_ERROR. (RESET_DURING_CALL is
+    // retried by design there — the NCP is coming back up — but now with
+    // backoff rather than an immediate re-send into the reset window.)
+    const ZnpStatus st = znp_call_retry(req.cmd0, req.cmd1,
+                                        req.payload, req.payload_len,
+                                        tls_srsp_buf, timeout_ms, max_attempts);
+    if (st != ZnpStatus::OK) return false;
+    srsp_out.cmd0        = tls_srsp_buf.cmd0;
+    srsp_out.cmd1        = tls_srsp_buf.cmd1;
+    srsp_out.payload     = tls_srsp_buf.data;
+    srsp_out.payload_len = tls_srsp_buf.len;
+    return true;
 }
 
 // ── AREQ subscription adapter ─────────────────────────────────────────────

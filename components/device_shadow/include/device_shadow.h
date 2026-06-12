@@ -77,6 +77,8 @@ struct DeviceShadowEntry {
     bool          nvs_force;        // runtime-only — next sweep writes regardless of interval
     uint32_t      cfg_crc;          // F26: crc32 of last-persisted config (dedupe writes)
     bool          cfg_crc_valid;    // F26: true once cfg_crc reflects a persisted config
+    bool          attr_overflow_logged; // T27: once-per-device log gate for the
+                                        // 32-slot attr cap (avoids per-frame spam)
 };
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -128,6 +130,28 @@ bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out);
 // Clear cached attr state for a rejoining device.
 // The NVS blob is erased so stale data is not reloaded on the next boot.
 void device_shadow_clear_attrs(uint64_t ieee);
+
+// Forget a device entirely (SHA-F3 / FINDINGS §9). Unlike
+// device_shadow_clear_attrs — which only blanks attrs[] so a *rejoining*
+// device starts clean while the slot lives on — this RECLAIMS the table slot
+// (so a departed/mistyped ieee no longer permanently consumes one of the
+// ZAP_MAX_DEVICES slots), deletes both per-device timers (so a churn workload
+// can't exhaust the FreeRTOS timer pool), and erases BOTH NVS keys — the 'a'
+// attr blob AND the 'c' config blob (clear_attrs erased only 'a', leaking 'c'
+// in flash forever for removed devices).
+//
+// Call on a HARD device delete ("forget forever"), NOT on a soft
+// DEVICE_LEAVE — soft-leave keeps the slot/NVS so a rejoin restores config +
+// last-known state without a fresh interview (see zigbee_mgr on_zdo_leave_ind).
+// No-op for an unknown ieee.
+//
+// Lock contract (T10 LEAF model): the slot zero/swap-with-last is done under
+// the leaf s_mutex; the timer deletes (0-tick, non-blocking) happen under the
+// lock like clear_attrs; the NVS erases run AFTER the lock is released (no
+// nvs_* under s_mutex). No event_bus publish is performed. Safe to call from
+// the HAP dispatcher / a DEVICE_DELETE handler; do NOT call from an event-bus
+// FILTER (no emit involved, but keep parity with the other mutating APIs).
+void device_shadow_remove(uint64_t ieee);
 
 // Set per-device occupancy timeout. 0 = disabled.
 // Returns false if device not found.

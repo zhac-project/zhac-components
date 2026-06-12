@@ -79,13 +79,27 @@ static inline void interview_wake_notify() {
 }
 
 static void store_rsp(const MtFrame& f) {
-    const uint8_t  want_cmd1 = s_expected_rsp_cmd1.load(std::memory_order_acquire);
+    uint8_t        want_cmd1 = s_expected_rsp_cmd1.load(std::memory_order_acquire);
     if (f.cmd1 != want_cmd1) return;            // wrong cmd1
     const uint16_t want_nwk  = s_expected_src_nwk.load(std::memory_order_acquire);
     if (want_nwk != 0xFFFF) {
         if (f.payload_len < 2) return;          // truncated
         uint16_t src = le16(f.payload);         // TI ZDO AREQ: src_nwk in [0..1] LE
         if (src != want_nwk) return;            // not our device
+    }
+    // §4 (FINDINGS.md, :96 SMELL): store_rsp runs in the ZNP RX task while
+    // the interview task (other core) reads s_rsp_frame/s_rsp_buf after
+    // wait_rsp returns. A duplicate matching ZDO AREQ arriving in the
+    // window between the give below and the interview task disarming the
+    // filter could memcpy into s_rsp_buf WHILE that buffer is being read —
+    // a torn cross-core read. CLAIM the wait single-shot: atomically flip
+    // the cmd1 filter to 0xFF (not-waiting). Only the thread that wins the
+    // CAS fills the buffer and gives the sem; a racing duplicate now fails
+    // the `f.cmd1 != want_cmd1` reload above (or the CAS) and is ignored,
+    // so exactly one writer touches s_rsp_buf per arm.
+    if (!s_expected_rsp_cmd1.compare_exchange_strong(
+            want_cmd1, 0xFF, std::memory_order_acq_rel)) {
+        return;   // another delivery already claimed this wait
     }
     s_rsp_frame.cmd0        = f.cmd0;
     s_rsp_frame.cmd1        = f.cmd1;
@@ -310,11 +324,29 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
                       wait_rsp(0x85, nwk, 3000) &&
                       s_rsp_frame.payload_len >= 6;
         if (zdo_ok) {
-            ep_count = s_rsp_frame.payload[5];
-            ep_count = (ep_count > 8) ? 8 : ep_count;
-            memcpy(ep_list, s_rsp_frame.payload + 6,
-                   ep_count < s_rsp_frame.payload_len - 6 ?
-                   ep_count : s_rsp_frame.payload_len - 6);
+            // §4 (FINDINGS.md, :311 SEC): the claimed endpoint count
+            // (payload[5]) was stored as endpoint_count while the memcpy
+            // separately clamped to the bytes actually present. On a
+            // truncated ACTIVE_EP_RSP (claimed N but fewer than N endpoint
+            // bytes on the wire) the trailing ep_list[] entries stayed
+            // UNINITIALISED stack garbage yet were reported as real device
+            // endpoints (then probed via SIMPLE_DESC, registered in the
+            // adapter). Clamp the count to bytes-present (and to 8) BEFORE
+            // anything consumes it, so endpoint_count never exceeds the
+            // bytes we actually copied.
+            const uint8_t claimed   = s_rsp_frame.payload[5];
+            const uint16_t avail    = (s_rsp_frame.payload_len > 6)
+                                        ? (s_rsp_frame.payload_len - 6) : 0;
+            uint8_t safe_count = claimed;
+            if (safe_count > 8)     safe_count = 8;
+            if (safe_count > avail) safe_count = static_cast<uint8_t>(avail);
+            ep_count = safe_count;
+            if (ep_count) memcpy(ep_list, s_rsp_frame.payload + 6, ep_count);
+            if (ep_count != claimed) {
+                ESP_LOGW(TAG, "ACTIVE_EP_RSP claimed %u eps but only %u bytes "
+                              "present nwk=0x%04x — clamped to %u",
+                         claimed, (unsigned)avail, nwk, ep_count);
+            }
         } else {
             ESP_LOGW(TAG, "ZDO_ACTIVE_EP_REQ failed nwk=0x%04x — assuming ep=1 (sleepy device fallback)", nwk);
             ep_list[0] = 1;
@@ -374,12 +406,19 @@ static bool do_interview(uint64_t ieee, uint16_t nwk) {
             work.clusters[e][c] = le16(p + kInListOff + c * 2);
             parsed_in = c + 1;
         }
-        const uint8_t out_off = (uint8_t)(kInListOff + in_cnt * 2);
+        // §4 (FINDINGS.md, :375 SEC): out_off was computed as a uint8_t, so
+        // for an in-cluster count ≥ 122 the expression 13 + in_cnt*2 wraps
+        // past 255 (e.g. in_cnt=122 → 257 → 1) and the out-cluster list is
+        // parsed from the WRONG offset (back inside the in-cluster bytes).
+        // in_cnt is attacker-influenced wire data, so use size_t math and an
+        // explicit bound against the actual frame length.
+        const size_t out_off = static_cast<size_t>(kInListOff) +
+                               static_cast<size_t>(in_cnt) * 2u;
         uint8_t parsed_out = 0;
         if (out_off < s_rsp_frame.payload_len) {
             uint8_t out_cnt = p[out_off];
             for (uint8_t c = 0; c < out_cnt && c < ZAP_CLUSTERS_PER_EP; c++) {
-                uint8_t byte_off = out_off + 1 + c * 2;
+                const size_t byte_off = out_off + 1u + static_cast<size_t>(c) * 2u;
                 if (byte_off + 1 >= s_rsp_frame.payload_len) break;
                 work.clusters_out[e][c] = le16(p + byte_off);
                 parsed_out = c + 1;
@@ -650,6 +689,24 @@ static void task_interview(void*) {
             } else {
                 ESP_LOGE(TAG, "Interview failed after %d attempts for ieee=0x%016llx",
                          INTERVIEW_MAX_ATTEMPTS, (unsigned long long)ev.ieee);
+                // §4 (FINDINGS.md, :251 SMELL): a NODE_DESC failure makes
+                // do_interview() return false BEFORE the work-copy's FAILED
+                // state is ever committed, so the live slot stays at NONE
+                // (set at the top of do_interview). The opportunistic
+                // re-interview in zcl_refresh_liveness is keyed on FAILED —
+                // with the slot stuck at NONE it never re-fires, and the
+                // device is stranded until it rejoins. Stamp FAILED on the
+                // live slot here, after the final attempt, so the next
+                // inbound frame from a (sleepy) device triggers a retry.
+                zigbee_pool_lock();
+                if (ZapDevice* d = pool_find_by_ieee(ev.ieee)) {
+                    if (d->interview_state !=
+                            static_cast<uint8_t>(InterviewState::IDENTITY_READY)) {
+                        d->interview_state =
+                            static_cast<uint8_t>(InterviewState::FAILED);
+                    }
+                }
+                zigbee_pool_unlock();
             }
         }
         s_active_interview_ieee = 0;
@@ -726,9 +783,25 @@ static void on_tc_dev_ind(const MtFrame& f) {
         interview_wake_notify();
     }
     ESP_LOGI(TAG, "Device joined nwk=0x%04x ieee=0x%016llx", ev.nwk, ev.ieee);
-    if (xQueueSend(s_join_queue, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "join queue full — drop nwk=0x%04x ieee=0x%016llx",
-                 ev.nwk, (unsigned long long)ev.ieee);
+    // §4 (FINDINGS.md, :662 BLOCK): this handler runs in the ZNP UART RX
+    // task. A blocking xQueueSend (was 100 ms) means a join storm that
+    // fills s_join_queue stalls the RX loop for up to 100 ms PER announce —
+    // long enough for the UART RX FIFO to overrun and corrupt in-flight
+    // frames. Send with ZERO timeout and, on a full queue, drop the OLDEST
+    // queued JoinEvent then retry: the pool was already seeded/refreshed
+    // above and task_interview re-reads the pool nwk on each attempt, so
+    // the freshest announce is the one worth keeping. The RX task never
+    // blocks here.
+    if (xQueueSend(s_join_queue, &ev, 0) != pdTRUE) {
+        JoinEvent discarded;
+        if (xQueueReceive(s_join_queue, &discarded, 0) == pdTRUE) {
+            ESP_LOGW(TAG, "join queue full — evicted oldest (ieee=0x%016llx)",
+                     (unsigned long long)discarded.ieee);
+        }
+        if (xQueueSend(s_join_queue, &ev, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "join queue full — drop newest nwk=0x%04x ieee=0x%016llx",
+                     ev.nwk, (unsigned long long)ev.ieee);
+        }
     }
     // Wake a currently-sleeping retry loop for a DIFFERENT device so it
     // yields its slot to this fresh join event. The retry loop itself

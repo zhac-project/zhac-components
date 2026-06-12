@@ -27,9 +27,6 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count);
 // an uninitialised store.
 uint16_t rule_store_count();
 
-// Update only the enabled flag of an existing rule. Returns false if not found.
-bool rule_store_set_enabled(uint16_t rule_id, bool enabled);
-
 // Highest rule_id present across the ENTIRE persisted store — all NVS
 // slots (up to ZAP_MAX_RULES) plus any uncommitted writeback edits — not
 // just the subset another layer happens to have cached. Returns 0 when the

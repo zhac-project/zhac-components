@@ -15,35 +15,10 @@
 
 #if CONFIG_METRICS_ENABLED && CONFIG_METRICS_ENABLE_PROMETHEUS_EXPORTER
 
-#include <cstdarg>
-#include <cstdio>
-
 namespace metrics {
-namespace {
 
-struct Writer {
-    char*  buf;
-    size_t cap;
-    size_t off;
-    bool   truncated;
-};
-
-void wput(Writer& w, const char* fmt, ...) {
-    if (w.truncated || w.off >= w.cap) return;
-    va_list ap;
-    va_start(ap, fmt);
-    const int n = std::vsnprintf(w.buf + w.off, w.cap - w.off, fmt, ap);
-    va_end(ap);
-    if (n < 0) { w.truncated = true; return; }
-    if (static_cast<size_t>(n) >= w.cap - w.off) {
-        w.truncated = true;
-        w.off = w.cap - 1;
-        return;
-    }
-    w.off += static_cast<size_t>(n);
-}
-
-}  // namespace
+using detail::Writer;
+using detail::wput;
 
 size_t prometheus_format(char* buf, size_t buf_size,
                            const char* prefix) noexcept {
