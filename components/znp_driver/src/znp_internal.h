@@ -19,6 +19,17 @@ extern QueueHandle_t znp_uart_evt_q;   // Q32: UART event queue (overrun detecti
 // Returns the number of bytes written, or 0 if the buffer is too small.
 size_t znp_mt_encode(const ZnpFrame& f, uint8_t* buf, size_t buf_size);
 
+// MT XOR-8 FCS over (len ^ cmd0 ^ cmd1 ^ data[]). Single owner of the wire
+// FCS — the legacy mt_* shim delegates here so the two paths cannot drift.
+uint8_t znp_mt_fcs(uint8_t len, uint8_t cmd0, uint8_t cmd1,
+                   const uint8_t* data, uint8_t data_len);
+
+// True when this MT frame carries the Zigbee network key in its payload
+// (SYS NV write of a key item id). The wire trace uses this to redact the
+// key data instead of hex-dumping it in plaintext (§4, zigbee_mgr.cpp:405).
+bool znp_wire_is_sensitive(uint8_t cmd0, uint8_t cmd1,
+                           const uint8_t* data, uint8_t len);
+
 // Streaming byte-by-byte parser. Owned by the RX task; not thread-safe.
 class MtStreamParser {
 public:

@@ -13,44 +13,141 @@
 
 static const char* TAG = "zcl_commands";
 
+// ── af_data_request ──────────────────────────────────────────────────────
+// §4 (FINDINGS.md, zcl_commands.cpp:27 DUP + :45 SMELL→correctness).
+//
+// The AF_DATA_REQUEST header assembly + SRSP status check was copy-pasted
+// across ~10 call-sites here (on/off, level, color-temp, gen-time,
+// default-resp, read, write, configure-report, cluster-command, magic
+// packet, miboxer) and in zhc_send_bridge.cpp, each with subtly different
+// retry behaviour (timeouts 1000/2000/3000, attempts 1/2/3). This one
+// helper folds the duplication while PRESERVING each call-site's timeout
+// and attempt count via parameters — behaviour is not homogenised.
+//
+// It also fixes the on-air double-fire (:45): AF_DATA_REQUEST was blindly
+// retried up to 3× with the SAME trans_id after an SRSP loss. The SRSP only
+// confirms the NCP *accepted* the frame; if attempt 1 actually reached the
+// NCP but the SRSP was dropped on the UART, a blind re-send executes the
+// command twice on-air (a Toggle visibly double-fires, a level/color step
+// jumps twice). For non-idempotent commands we therefore do NOT blind-retry
+// the SREQ: we send once and gate success on the asynchronous
+// AF_DATA_CONFIRM (MAC delivery) via the existing znp_confirm ring — the
+// same mechanism zcl_cluster_command_impl already uses. Idempotent frames
+// (attribute reads, configure-reporting, the gen-time / Basic probes) keep
+// their multi-attempt SREQ retry since re-sending them is harmless.
+//
+// `body`/`body_len` is the fully-formed ZCL frame (FC|TSN|CMD|…). `trans_id`
+// is written into the AF header trans_id field and MUST equal the ZCL TSN so
+// the confirm correlates. Returns true when the NCP accepted the frame (and,
+// for non-idempotent commands, the MAC confirm reported success or the
+// confirm ring was saturated — see below).
+struct AfReqOpts {
+    uint32_t srsp_timeout_ms;   // per-attempt SRSP wait
+    int      srsp_attempts;     // SREQ attempts (forced to 1 when !idempotent)
+    bool     idempotent;        // true = safe to blind-retry the SREQ
+    uint32_t confirm_timeout_ms;// AF_DATA_CONFIRM wait for non-idempotent (0=skip)
+    esp_log_level_t fail_level; // ESP_LOG_ERROR / WARN / DEBUG for the no-SRSP log
+    const char* what;           // short label for logs
+};
+
+static bool af_data_request(uint16_t nwk_addr, uint8_t dst_ep, uint8_t src_ep,
+                            uint16_t cluster_id, uint8_t trans_id,
+                            const uint8_t* body, size_t body_len,
+                            const AfReqOpts& o) {
+    // AF_DATA_REQUEST payload (Z-Stack 3.x):
+    //   [dst_addr 2B LE, dst_ep, src_ep, cluster 2B LE,
+    //    trans_id, options, radius, len, data...]
+    if (body_len > 0xFF) return false;
+    uint8_t af_pl[10 + 250];
+    if (body_len > sizeof(af_pl) - 10) return false;
+    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
+    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
+    af_pl[2] = dst_ep;
+    af_pl[3] = src_ep;
+    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
+    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
+    af_pl[6] = trans_id;
+    af_pl[7] = 0x00;        // options
+    af_pl[8] = 0x0F;        // radius (15 hops)
+    af_pl[9] = static_cast<uint8_t>(body_len);
+    if (body && body_len) std::memcpy(af_pl + 10, body, body_len);
+
+    MtFrame req{};
+    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;   // AF_DATA_REQUEST
+    req.payload = af_pl;
+    req.payload_len = static_cast<uint16_t>(10 + body_len);
+
+    // Non-idempotent: reserve the confirm slot BEFORE the SREQ so a fast
+    // AF_DATA_CONFIRM isn't dropped, send exactly once, then gate on the
+    // confirm. Idempotent: keep the (harmless) multi-attempt SREQ retry.
+    const bool gate_confirm = !o.idempotent && o.confirm_timeout_ms > 0;
+    const int  confirm_slot = gate_confirm ? znp_confirm_reserve(trans_id) : -1;
+    const int  attempts     = o.idempotent ? o.srsp_attempts : 1;
+
+    MtFrame rsp{};
+    if (!znp_sreq_retry(req, rsp, o.srsp_timeout_ms, attempts)) {
+        ESP_LOG_LEVEL(o.fail_level, TAG, "%s: no SRSP nwk=0x%04x cluster=0x%04x",
+                      o.what, nwk_addr, cluster_id);
+        if (confirm_slot >= 0) znp_confirm_release(confirm_slot);
+        return false;
+    }
+    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
+        ESP_LOG_LEVEL(o.fail_level, TAG, "%s: status=0x%02x nwk=0x%04x cluster=0x%04x",
+                      o.what, rsp.payload_len ? rsp.payload[0] : 0xFF,
+                      nwk_addr, cluster_id);
+        if (confirm_slot >= 0) znp_confirm_release(confirm_slot);
+        return false;
+    }
+
+    if (confirm_slot >= 0) {
+        const int mac = znp_confirm_wait(confirm_slot, o.confirm_timeout_ms);
+        if (mac != 0) {
+            // MAC delivery failed/timed out. We deliberately do NOT re-send
+            // (that is exactly the double-fire we are avoiding) — report the
+            // failure and let the higher layer decide. A timeout here just
+            // means we never saw the confirm; the frame may still have been
+            // delivered, so a blind re-send would risk a duplicate.
+            ESP_LOGW(TAG, "%s: MAC %s nwk=0x%04x cluster=0x%04x trans=0x%02x",
+                     o.what, mac < 0 ? "timeout" : "fail",
+                     nwk_addr, cluster_id, trans_id);
+            return false;
+        }
+    } else if (gate_confirm) {
+        // Ring saturated (reserve returned -1). The SREQ succeeded and we
+        // could not arm a confirm waiter; accept the SRSP as our best
+        // signal rather than blind-retrying. Logged inside znp_confirm.
+    }
+    return true;
+}
+
+// Exported thin wrapper (declared in zigbee_mgr.h) so other .cpp in this
+// component — notably zhc_send_bridge.cpp, the generic adapter→radio path —
+// route through the SAME af_data_request builder + no-blind-retry policy.
+bool zigbee_af_send_zcl(uint16_t nwk_addr, uint8_t dst_ep,
+                        uint16_t cluster_id, uint8_t trans_id,
+                        const uint8_t* body, uint32_t body_len,
+                        bool idempotent, uint32_t confirm_timeout_ms) {
+    const AfReqOpts opts{2000, idempotent ? 2 : 1, idempotent,
+                         confirm_timeout_ms, ESP_LOG_ERROR, "zhc send"};
+    return af_data_request(nwk_addr, dst_ep, 0x01, cluster_id, trans_id,
+                           body, body_len, opts);
+}
+
 bool zigbee_zcl_on_off(uint16_t nwk_addr, uint8_t ep, uint8_t cmd) {
     // ZCL frame: [frame_ctrl=0x01, seq, cmd_id=cmd]. Seq is the global ZCL
     // counter (zcl_seq_next) shared with the converter layer so responses
     // correlate correctly — a hardcoded 0x01 made every command look like
     // the same transaction to some devices (CODEX §6).
-    uint8_t seq = zcl_seq_next();
-    uint8_t zcl_frame[3] = {0x01, seq, cmd};
-
-    // AF_DATA_REQUEST payload (Z-Stack 3.x format):
-    // [dst_addr 2B LE, dst_ep, src_ep=1, cluster_id 2B LE,
-    //  trans_id, options, radius, len, data...]
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = nwk_addr & 0xFF;
-    af_pl[1] = (nwk_addr >> 8) & 0xFF;
-    af_pl[2] = ep;          // dst_ep
-    af_pl[3] = 0x01;        // src_ep
-    af_pl[4] = 0x06; af_pl[5] = 0x00;  // cluster 0x0006 LE
-    af_pl[6] = seq;         // trans_id (shared with ZCL seq)
-    af_pl[7] = 0x00;        // options
-    af_pl[8] = 0x0F;        // radius (15 hops max)
-    af_pl[9] = sizeof(zcl_frame);       // len
-    for (size_t i = 0; i < sizeof(zcl_frame); i++)
-        af_pl[10 + i] = zcl_frame[i];
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;   // AF_DATA_REQUEST
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 3)) {
-        ESP_LOGE(TAG, "AF_DATA_REQUEST: no SRSP");
+    const uint8_t seq = zcl_seq_next();
+    const uint8_t zcl_frame[3] = {0x01, seq, cmd};
+    // NON-IDEMPOTENT: On/Off (esp. Toggle 0x02) MUST NOT blind-retry the
+    // SREQ — a dropped SRSP after the NCP already accepted attempt 1 would
+    // toggle the load twice. Single send, gate on AF_DATA_CONFIRM (§4 :45).
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL On/Off"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0006, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGE(TAG, "AF_DATA_REQUEST: status=0x%02x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF);
-        return false;
-    }
     ESP_LOGI(TAG, "ZCL On/Off cmd=0x%02x → nwk=0x%04x ep=%d", cmd, nwk_addr, ep);
     return true;
 }
@@ -159,8 +256,8 @@ bool zigbee_zcl_level(uint16_t nwk_addr, uint8_t ep, uint8_t level,
                       uint16_t transition_tenths) {
     // ZCL MoveToLevelWithOnOff: cluster 0x0008, cmd 0x04
     // Payload: [level(1B), transition_time_low(1B), transition_time_high(1B)]
-    uint8_t seq = zcl_seq_next();
-    uint8_t zcl_frame[6] = {
+    const uint8_t seq = zcl_seq_next();
+    const uint8_t zcl_frame[6] = {
         0x01,                              // frame_ctrl
         seq,                               // seq
         0x04,                              // cmd: MoveToLevelWithOnOff
@@ -168,34 +265,13 @@ bool zigbee_zcl_level(uint16_t nwk_addr, uint8_t ep, uint8_t level,
         (uint8_t)(transition_tenths & 0xFF),
         (uint8_t)(transition_tenths >> 8),
     };
-
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = nwk_addr & 0xFF;
-    af_pl[1] = (nwk_addr >> 8) & 0xFF;
-    af_pl[2] = ep;
-    af_pl[3] = 0x01;        // src_ep
-    af_pl[4] = 0x08; af_pl[5] = 0x00;  // cluster 0x0008 LE
-    af_pl[6] = seq;         // trans_id
-    af_pl[7] = 0x00;        // options
-    af_pl[8] = 0x0F;        // radius
-    af_pl[9] = sizeof(zcl_frame);
-    for (size_t i = 0; i < sizeof(zcl_frame); i++)
-        af_pl[10 + i] = zcl_frame[i];
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 3)) {
-        ESP_LOGE(TAG, "ZCL Level: no SRSP");
+    // NON-IDEMPOTENT: a re-sent level step moves twice (visible flicker /
+    // overshoot). Single send + AF_DATA_CONFIRM gate (§4 :45).
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL Level"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0008, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGE(TAG, "ZCL Level: status=0x%02x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF);
-        return false;
-    }
     ESP_LOGI(TAG, "ZCL Level level=%d trans=%d → nwk=0x%04x ep=%d",
              level, transition_tenths, nwk_addr, ep);
     return true;
@@ -205,8 +281,8 @@ bool zigbee_zcl_color_temp(uint16_t nwk_addr, uint8_t ep, uint16_t color_temp_mi
                             uint16_t transition_tenths) {
     // ZCL MoveToColorTemperature: cluster 0x0300, cmd 0x0A
     // Payload: [ct_low(1B), ct_high(1B), transition_low(1B), transition_high(1B)]
-    uint8_t seq = zcl_seq_next();
-    uint8_t zcl_frame[7] = {
+    const uint8_t seq = zcl_seq_next();
+    const uint8_t zcl_frame[7] = {
         0x01,                                       // frame_ctrl
         seq,                                        // seq
         0x0A,                                       // cmd: MoveToColorTemperature
@@ -215,34 +291,12 @@ bool zigbee_zcl_color_temp(uint16_t nwk_addr, uint8_t ep, uint16_t color_temp_mi
         (uint8_t)(transition_tenths & 0xFF),
         (uint8_t)(transition_tenths >> 8),
     };
-
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = nwk_addr & 0xFF;
-    af_pl[1] = (nwk_addr >> 8) & 0xFF;
-    af_pl[2] = ep;
-    af_pl[3] = 0x01;        // src_ep
-    af_pl[4] = 0x00; af_pl[5] = 0x03;  // cluster 0x0300 LE
-    af_pl[6] = seq;         // trans_id
-    af_pl[7] = 0x00;        // options
-    af_pl[8] = 0x0F;        // radius
-    af_pl[9] = sizeof(zcl_frame);
-    for (size_t i = 0; i < sizeof(zcl_frame); i++)
-        af_pl[10 + i] = zcl_frame[i];
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 3)) {
-        ESP_LOGE(TAG, "ZCL ColorTemp: no SRSP");
+    // NON-IDEMPOTENT: re-sent color step overshoots. Single send + confirm.
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL ColorTemp"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0300, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGE(TAG, "ZCL ColorTemp: status=0x%02x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF);
-        return false;
-    }
     ESP_LOGI(TAG, "ZCL ColorTemp ct=%d trans=%d → nwk=0x%04x ep=%d",
              color_temp_mireds, transition_tenths, nwk_addr, ep);
     return true;
@@ -307,32 +361,13 @@ bool zigbee_respond_gen_time(uint16_t nwk_addr, uint8_t dst_ep,
         }
     }
 
-    uint8_t af_pl[10 + sizeof(body)];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = dst_ep;          // remote endpoint that issued the read
-    af_pl[3] = 0x01;            // coord EP1 sources the response
-    af_pl[4] = 0x0A; af_pl[5] = 0x00;  // genTime cluster 0x000A LE
-    af_pl[6] = trans_seq;       // AF trans id = ZCL TSN
-    af_pl[7] = 0x00;            // options
-    af_pl[8] = 0x0F;            // radius (15 hops)
-    af_pl[9] = static_cast<uint8_t>(body_len);
-    std::memcpy(af_pl + 10, body, body_len);
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;   // AF_DATA_REQUEST
-    req.payload = af_pl; req.payload_len = static_cast<uint16_t>(10 + body_len);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "genTime response: no SRSP nwk=0x%04x", nwk_addr);
+    // IDEMPOTENT (a read RESPONSE): re-sending the same time read-response
+    // is harmless, so keep the multi-attempt SREQ retry. WARN on failure.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "genTime response"};
+    if (!af_data_request(nwk_addr, dst_ep, 0x01, 0x000A, trans_seq,
+                         body, body_len, opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "genTime response: status=0x%02x nwk=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF, nwk_addr);
-        return false;
-    }
     ESP_LOGI(TAG, "genTime read-resp -> nwk=0x%04x ep=%u utc2000=%lu%s",
              nwk_addr, dst_ep,
              static_cast<unsigned long>(utc_2000),
@@ -383,31 +418,13 @@ bool zigbee_send_default_response(uint16_t nwk_addr, uint8_t dst_ep,
     body[bl++] = cmd_id; // original command
     body[bl++] = status;
 
-    uint8_t af_pl[10 + sizeof(body)];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = dst_ep;
-    af_pl[3] = 0x01;    // coord EP1
-    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
-    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
-    af_pl[6] = tsn;
-    af_pl[7] = 0x00;    // options
-    af_pl[8] = 0x0F;    // radius
-    af_pl[9] = static_cast<uint8_t>(bl);
-    std::memcpy(af_pl + 10, body, bl);
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;  // AF_DATA_REQUEST
-    req.payload = af_pl;
-    req.payload_len = static_cast<uint16_t>(10 + bl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 1000, 1)) {
-        ESP_LOGD(TAG, "default-resp: no SRSP nwk=0x%04x cluster=0x%04x",
-                 nwk_addr, cluster_id);
-        return false;
-    }
-    return rsp.payload_len >= 1 && rsp.payload[0] == 0x00;
+    // IDEMPOTENT (a Default Response ACK, with disable-default-response set
+    // so it never ping-pongs): re-sending is harmless. Preserve the
+    // original best-effort profile — 1 attempt, 1000 ms, DEBUG on miss.
+    const AfReqOpts opts{1000, 1, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_DEBUG, "default-resp"};
+    return af_data_request(nwk_addr, dst_ep, 0x01, cluster_id, tsn,
+                           body, bl, opts);
 }
 
 // ── zigbee_zcl_read / zigbee_zcl_cluster_command ────────────────────
@@ -447,34 +464,13 @@ bool zigbee_zcl_read(uint16_t nwk_addr, uint8_t endpoint,
     std::memcpy(zcl_frame + hdr_len, attr_ids_le,
                 static_cast<std::size_t>(attr_count) * 2);
 
-    uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = endpoint;
-    af_pl[3] = 0x01;
-    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
-    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;   // options
-    af_pl[8] = 0x0F;   // radius
-    af_pl[9] = static_cast<uint8_t>(body_len);
-    std::memcpy(af_pl + kAfHeaderLen, zcl_frame, body_len);
-
-    MtFrame req{}, rsp{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl;
-    req.payload_len = static_cast<uint16_t>(kAfHeaderLen + body_len);
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "zcl_read: no SRSP nwk=0x%04x cluster=0x%04x",
-                 nwk_addr, cluster_id);
+    // IDEMPOTENT (Read Attributes — no device-side state change): keep the
+    // multi-attempt SREQ retry, WARN on failure.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "zcl_read"};
+    if (!af_data_request(nwk_addr, endpoint, 0x01, cluster_id, seq,
+                         zcl_frame, body_len, opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "zcl_read: status=0x%02x nwk=0x%04x cluster=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF,
-                 nwk_addr, cluster_id);
-        return false;
-    }
     ESP_LOGI(TAG, "zcl_read -> nwk=0x%04x ep=%u cluster=0x%04x attrs=%u",
              nwk_addr, endpoint, cluster_id, attr_count);
     return true;
@@ -513,34 +509,17 @@ bool zigbee_zcl_write_attr(uint16_t nwk_addr, uint8_t endpoint,
     zcl_frame[pos++] = type;
     std::memcpy(zcl_frame + pos, value, value_len);
 
-    uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = endpoint;
-    af_pl[3] = 0x01;
-    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
-    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;   // options
-    af_pl[8] = 0x0F;   // radius
-    af_pl[9] = static_cast<uint8_t>(body_len);
-    std::memcpy(af_pl + kAfHeaderLen, zcl_frame, body_len);
-
-    MtFrame req{}, rsp{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl;
-    req.payload_len = static_cast<uint16_t>(kAfHeaderLen + body_len);
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "zcl_write: no SRSP nwk=0x%04x cluster=0x%04x attr=0x%04x",
-                 nwk_addr, cluster_id, attr_id);
+    // IDEMPOTENT: Write Attributes sets an ABSOLUTE value (unlike a
+    // relative On/Off Toggle or a Level/Color *move*), so writing the same
+    // record twice lands on the same device state — a blind SREQ re-send is
+    // safe. Keep the multi-attempt retry (matches the "Idempotent — safe to
+    // write on every request" contract the IAS CIE-address writer relies on
+    // in zigbee_mgr.cpp). WARN on failure.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "zcl_write"};
+    if (!af_data_request(nwk_addr, endpoint, 0x01, cluster_id, seq,
+                         zcl_frame, body_len, opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "zcl_write: status=0x%02x nwk=0x%04x cluster=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF,
-                 nwk_addr, cluster_id);
-        return false;
-    }
     ESP_LOGI(TAG, "zcl_write -> nwk=0x%04x ep=%u cluster=0x%04x attr=0x%04x type=0x%02x",
              nwk_addr, endpoint, cluster_id, attr_id, type);
     return true;
@@ -642,34 +621,13 @@ bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
             (reportable_change >> (8 * i)) & 0xFF);
     }
 
-    uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = endpoint;
-    af_pl[3] = 0x01;
-    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
-    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;   // options
-    af_pl[8] = 0x0F;   // radius
-    af_pl[9] = static_cast<uint8_t>(body_len);
-    std::memcpy(af_pl + kAfHeaderLen, zcl_frame, body_len);
-
-    MtFrame req{}, rsp{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl;
-    req.payload_len = static_cast<uint16_t>(kAfHeaderLen + body_len);
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "configure_report: no SRSP nwk=0x%04x cluster=0x%04x attr=0x%04x",
-                 nwk_addr, cluster_id, attr_id);
+    // IDEMPOTENT (Configure Reporting sets absolute min/max/change — same
+    // record twice = same config): keep multi-attempt SREQ retry, WARN.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "configure_report"};
+    if (!af_data_request(nwk_addr, endpoint, 0x01, cluster_id, seq,
+                         zcl_frame, body_len, opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "configure_report: status=0x%02x nwk=0x%04x cluster=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF,
-                 nwk_addr, cluster_id);
-        return false;
-    }
     ESP_LOGI(TAG,
               "configure_report -> nwk=0x%04x ep=%u cluster=0x%04x "
               "attr=0x%04x type=0x%02x min=%us max=%us chg=%lu",
@@ -679,16 +637,19 @@ bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
     return true;
 }
 
-// Shared core. When `confirm_timeout_ms > 0`, reserves a confirm ring
-// slot BEFORE the SREQ is queued (so a racing AREQ isn't dropped) and
-// blocks on it after SRSP success. Caller can opt out by passing 0.
+// Shared core for arbitrary cluster-specific commands. These are device
+// commands (cover up/down/step, IR send, Tuya custom ops) and are treated
+// as NON-IDEMPOTENT: we never blind-retry the SREQ (§4 :45 — a re-send
+// after a lost SRSP could fire the command twice on-air). When
+// `confirm_timeout_ms > 0` the helper reserves a confirm ring slot BEFORE
+// the SREQ (so a racing AF_DATA_CONFIRM isn't dropped) and gates success on
+// it; passing 0 is a best-effort single send (still no blind retry).
 static bool zcl_cluster_command_impl(uint16_t nwk_addr, uint8_t endpoint,
                                       uint16_t cluster_id, uint8_t cmd_id,
                                       const uint8_t* payload, uint8_t payload_len,
                                       uint8_t flags,
                                       uint32_t confirm_timeout_ms) {
-    const std::size_t body_len = 3 + static_cast<std::size_t>(payload_len);
-    if (body_len > kAfPayloadMax) return false;
+    if (payload_len > kAfPayloadMax - 3) return false;
 
     // FC byte: bit 0 = cluster-specific (1), bit 3 = direction C→S (0),
     // bit 4 = disable default response. Manu-specific (bit 2) isn't
@@ -697,67 +658,23 @@ static bool zcl_cluster_command_impl(uint16_t nwk_addr, uint8_t endpoint,
     if (flags & 0x01) fc |= 0x10;   // kStepFlagDisableDefaultResponse
 
     const uint8_t seq = zcl_seq_next();
-
-    // Reserve the confirm slot BEFORE posting the request, so a
-    // fast AREQ lands on a waiting slot rather than falling off.
-    const int confirm_slot =
-        (confirm_timeout_ms > 0) ? znp_confirm_reserve(seq) : -1;
-
     uint8_t zcl_frame[kAfPayloadMax];
     zcl_frame[0] = fc;
     zcl_frame[1] = seq;
     zcl_frame[2] = cmd_id;
     if (payload && payload_len)
         std::memcpy(zcl_frame + 3, payload, payload_len);
+    const std::size_t body_len = 3u + static_cast<std::size_t>(payload_len);
 
-    uint8_t af_pl[kAfHeaderLen + kAfPayloadMax];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = endpoint;
-    af_pl[3] = 0x01;
-    af_pl[4] = static_cast<uint8_t>(cluster_id & 0xFF);
-    af_pl[5] = static_cast<uint8_t>((cluster_id >> 8) & 0xFF);
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;
-    af_pl[8] = 0x0F;
-    af_pl[9] = static_cast<uint8_t>(body_len);
-    std::memcpy(af_pl + kAfHeaderLen, zcl_frame, body_len);
-
-    MtFrame req{}, rsp{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl;
-    req.payload_len = static_cast<uint16_t>(kAfHeaderLen + body_len);
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "zcl_cmd: no SRSP nwk=0x%04x cluster=0x%04x cmd=0x%02x",
-                 nwk_addr, cluster_id, cmd_id);
-        if (confirm_slot >= 0) znp_confirm_release(confirm_slot);
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false,
+                         confirm_timeout_ms, ESP_LOG_WARN, "zcl_cmd"};
+    if (!af_data_request(nwk_addr, endpoint, 0x01, cluster_id, seq,
+                         zcl_frame, body_len, opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "zcl_cmd: status=0x%02x nwk=0x%04x cluster=0x%04x cmd=0x%02x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF,
-                 nwk_addr, cluster_id, cmd_id);
-        if (confirm_slot >= 0) znp_confirm_release(confirm_slot);
-        return false;
-    }
-
-    if (confirm_slot >= 0) {
-        const int mac_status = znp_confirm_wait(confirm_slot, confirm_timeout_ms);
-        if (mac_status != 0) {
-            ESP_LOGW(TAG,
-                     "zcl_cmd MAC %s nwk=0x%04x cluster=0x%04x cmd=0x%02x "
-                     "trans=0x%02x%s%x",
-                     mac_status < 0 ? "timeout" : "fail",
-                     nwk_addr, cluster_id, cmd_id, seq,
-                     mac_status < 0 ? "" : " status=0x",
-                     mac_status < 0 ? 0 : static_cast<unsigned>(mac_status));
-            return false;
-        }
-    }
 
     ESP_LOGI(TAG, "zcl_cmd -> nwk=0x%04x ep=%u cluster=0x%04x cmd=0x%02x len=%u flags=0x%02x%s",
              nwk_addr, endpoint, cluster_id, cmd_id, payload_len, flags,
-             confirm_slot >= 0 ? " (MAC-confirmed)" : "");
+             confirm_timeout_ms > 0 ? " (MAC-confirmed)" : "");
     return true;
 }
 
@@ -801,32 +718,12 @@ bool zigbee_tuya_magic_packet(uint16_t nwk_addr, uint8_t dst_ep) {
         0xFE, 0xFF,           // attr 0xFFFE attributeReportingStatus
     };
 
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = static_cast<uint8_t>(nwk_addr & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk_addr >> 8) & 0xFF);
-    af_pl[2] = dst_ep;           // device EP (usually 1)
-    af_pl[3] = 0x01;             // coord src EP
-    af_pl[4] = 0x00; af_pl[5] = 0x00;  // genBasic cluster 0x0000
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;             // options
-    af_pl[8] = 0x0F;             // radius
-    af_pl[9] = sizeof(zcl_frame);
-    std::memcpy(af_pl + 10, zcl_frame, sizeof(zcl_frame));
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;   // AF_DATA_REQUEST
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "tuya magic packet: no SRSP nwk=0x%04x", nwk_addr);
+    // IDEMPOTENT (a genBasic Read probe): keep the multi-attempt retry.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "tuya magic packet"};
+    if (!af_data_request(nwk_addr, dst_ep, 0x01, 0x0000, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "tuya magic packet: status=0x%02x nwk=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF, nwk_addr);
-        return false;
-    }
     ESP_LOGI(TAG, "tuya magic packet -> nwk=0x%04x ep=%u", nwk_addr, dst_ep);
     return true;
 }
@@ -862,32 +759,13 @@ static bool miboxer_set_zones(uint16_t nwk, uint8_t dst_ep) {
         zcl_frame[off + 2] = z;   // zoneNum
     }
 
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = static_cast<uint8_t>(nwk & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk >> 8) & 0xFF);
-    af_pl[2] = dst_ep;
-    af_pl[3] = 0x01;
-    af_pl[4] = 0x04; af_pl[5] = 0x00;   // genGroups cluster 0x0004
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;
-    af_pl[8] = 0x0F;
-    af_pl[9] = sizeof(zcl_frame);
-    std::memcpy(af_pl + 10, zcl_frame, sizeof(zcl_frame));
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "miboxerSetZones: no SRSP nwk=0x%04x", nwk);
+    // NON-IDEMPOTENT (cluster-specific 0xF0 device command): single send +
+    // confirm gate, no blind SREQ retry (§4 :45).
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_WARN, "miboxerSetZones"};
+    if (!af_data_request(nwk, dst_ep, 0x01, 0x0004, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "miboxerSetZones: status=0x%02x nwk=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF, nwk);
-        return false;
-    }
     ESP_LOGI(TAG, "miboxerSetZones -> nwk=0x%04x ep=%u (8 zones)", nwk, dst_ep);
     return true;
 }
@@ -898,32 +776,13 @@ static bool miboxer_tuya_setup(uint16_t nwk, uint8_t dst_ep) {
     // FC 0x11 = cluster-specific + disable default response.
     uint8_t zcl_frame[3] = { 0x11, seq, 0xF0 };
 
-    uint8_t af_pl[10 + sizeof(zcl_frame)];
-    af_pl[0] = static_cast<uint8_t>(nwk & 0xFF);
-    af_pl[1] = static_cast<uint8_t>((nwk >> 8) & 0xFF);
-    af_pl[2] = dst_ep;
-    af_pl[3] = 0x01;
-    af_pl[4] = 0x00; af_pl[5] = 0x00;   // genBasic cluster 0x0000
-    af_pl[6] = seq;
-    af_pl[7] = 0x00;
-    af_pl[8] = 0x0F;
-    af_pl[9] = sizeof(zcl_frame);
-    std::memcpy(af_pl + 10, zcl_frame, sizeof(zcl_frame));
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;
-    req.payload = af_pl; req.payload_len = sizeof(af_pl);
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 2)) {
-        ESP_LOGW(TAG, "tuyaSetup: no SRSP nwk=0x%04x", nwk);
+    // NON-IDEMPOTENT (cluster-specific 0xF0 device command; FC already has
+    // disable-default-response set in zcl_frame[0]). Single send + confirm.
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_WARN, "tuyaSetup"};
+    if (!af_data_request(nwk, dst_ep, 0x01, 0x0000, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
         return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGW(TAG, "tuyaSetup: status=0x%02x nwk=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF, nwk);
-        return false;
-    }
     ESP_LOGI(TAG, "tuyaSetup -> nwk=0x%04x ep=%u", nwk, dst_ep);
     return true;
 }

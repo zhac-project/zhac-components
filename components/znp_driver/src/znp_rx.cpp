@@ -46,8 +46,18 @@ static constexpr uint8_t SYS_RESET_IND_CMD1 = 0x80;
 //   0x82 NODE_DESC_RSP
 //   0x84 SIMPLE_DESC_RSP
 //   0x85 ACTIVE_EP_RSP
-//   0xA1 TC_DEV_IND  (AF/attribute-report AREQs are left alone — they can
-//                      legitimately repeat, e.g. rapid contact open/close.)
+//   0xCA TC_DEV_IND  (the rapid double-burst this dedup actually targets —
+//                      Xiaomi devices fire two TC_DEV_IND on wake, see
+//                      zigbee_interview.cpp; AF/attribute-report AREQs are
+//                      left alone — they can legitimately repeat, e.g.
+//                      rapid contact open/close.)
+//
+// §4 (FINDINGS.md): this list previously named 0xA1 as "TC_DEV_IND", but
+// 0xA1 is ZDO_BIND_RSP — TC_DEV_IND is 0xCA (see the AREQ registrations in
+// zigbee_interview_init). The off-by-target meant the device-announce
+// double-bursts we MEANT to dedup were never deduped, while two distinct
+// BIND_RSPs (e.g. two binds with identical TABLE_FULL status) landing
+// within 200 ms were wrongly dropped — losing a bind outcome.
 //
 // Dedup key: (cmd0, cmd1, FNV-1a hash of data[0..len]) within a 200 ms
 // window. 8-slot ring, wraps on overflow.
@@ -73,7 +83,9 @@ static uint32_t fnv1a(const uint8_t* data, uint8_t len) {
 }
 
 static bool zdo_areq_is_in_scope(uint8_t cmd1) {
-    return cmd1 == 0x82 || cmd1 == 0x84 || cmd1 == 0x85 || cmd1 == 0xA1;
+    // 0x82 NODE_DESC_RSP, 0x84 SIMPLE_DESC_RSP, 0x85 ACTIVE_EP_RSP,
+    // 0xCA TC_DEV_IND (NOT 0xA1 ZDO_BIND_RSP — see header comment, §4).
+    return cmd1 == 0x82 || cmd1 == 0x84 || cmd1 == 0x85 || cmd1 == 0xCA;
 }
 
 // Returns true if the caller should drop the frame as a duplicate.
@@ -104,8 +116,15 @@ static void on_frame(const ZnpFrame& f, void* /*ctx*/) {
     if (znp_get_wire_trace()) {
         ESP_LOGI("znp_wire", "RX cmd0=0x%02x cmd1=0x%02x len=%u",
                  f.cmd0, f.cmd1, (unsigned)f.len);
+        // §4: redact the payload of a key NV write on this direction too
+        // (some stacks echo it; the SREQ may also be observed here under
+        // loopback). Never hex-dump the network key.
         if (f.len > 0) {
-            ESP_LOG_BUFFER_HEX_LEVEL("znp_wire", f.data, f.len, ESP_LOG_INFO);
+            if (znp_wire_is_sensitive(f.cmd0, f.cmd1, f.data, f.len)) {
+                ESP_LOGI("znp_wire", "RX payload REDACTED (network key NV write)");
+            } else {
+                ESP_LOG_BUFFER_HEX_LEVEL("znp_wire", f.data, f.len, ESP_LOG_INFO);
+            }
         }
     }
 

@@ -7,6 +7,102 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed — Medium (P4 findings batch, T25 zigbee_mgr / znp_driver radio stack)
+
+- **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:27`
+  DUP): the AF_DATA_REQUEST header assembly + SRSP status check was
+  copy-pasted across ~12 call-sites (on/off, level, color-temp, gen-time,
+  default-resp, read, write, configure-report, cluster-command, magic
+  packet, miboxer set-zones / tuya-setup) and in `zhc_send_bridge.cpp`, each
+  with drifting retry params (timeouts 1000/2000/3000, attempts 1/2/3).
+  Folded into ONE `af_data_request()` builder (+ exported `zigbee_af_send_zcl`
+  for the adapter bridge); each call-site's original timeout/attempt count is
+  **preserved** via parameters, not homogenised.
+- **zigbee_mgr / zhc_send_bridge** (MED, FINDINGS §4, `zcl_commands.cpp:45`
+  SMELL→correctness): AF_DATA_REQUEST was blind-retried up to 3× with the
+  SAME trans_id after an SRSP loss — the SRSP only confirms the NCP
+  *accepted* the frame, so if attempt 1 reached the NCP but its SRSP was
+  dropped, the command executed twice on-air (a Toggle visibly double-fires,
+  a level/color step overshoots). Non-idempotent commands (On/Off, Level,
+  ColorTemp, cluster-specific device commands, the whole zhc_send_bridge
+  adapter→radio path) now send EXACTLY ONCE and gate success on the
+  asynchronous AF_DATA_CONFIRM via the existing `znp_confirm` ring — no
+  blind re-send. Idempotent frames (attribute reads, absolute-value writes,
+  configure-reporting, gen-time / magic-packet probes, default-resp) keep
+  their multi-attempt SREQ retry since re-sending them is harmless.
+- **zigbee_mgr** (MED, FINDINGS §4, `zcl_seq.cpp:17`): the TSN counter
+  `fetch_add` wrapped 0xFF→0x00, handing every 256th frame the reserved
+  "not-set" TSN 0 (which the send bridge writes as a placeholder and the
+  confirm ring treats as a live key) → mis-correlation. Now a CAS loop
+  that skips 0, so `zcl_seq_next()` always returns 1..255.
+- **znp_driver** (MED, FINDINGS §4, `znp_rx.cpp:76`): the AREQ dedup scope
+  named `0xA1` as "TC_DEV_IND", but `0xA1` is ZDO_BIND_RSP — TC_DEV_IND is
+  `0xCA`. So the rapid device-announce double-bursts the dedup was meant to
+  catch (Xiaomi devices fire two on wake) were never deduped, while two
+  distinct BIND_RSPs within 200 ms were wrongly dropped (losing a bind
+  outcome). Target corrected to `0xCA` (+ comment).
+- **znp_driver** (MED, FINDINGS §4, `znp_driver_shim.cpp:30` DUP + `:85`
+  BLOCK): the legacy `mt_fcs` / `mt_encode` reimplemented the MT framing
+  already owned by `znp_parser.cpp` (two paths that could drift) → they now
+  delegate to the parser's single `znp_mt_fcs` / `znp_mt_encode`. And
+  `znp_sreq_retry` looped with NO backoff and retried even
+  RESET_DURING_CALL, hammering a resetting NCP 3× immediately and bypassing
+  the F43 backoff → it now routes through `znp_call_retry` (25/50/100/200 ms
+  backoff, fail-fast on TRANSPORT_DOWN/INTERNAL_ERROR).
+- **znp_driver** (MED, FINDINGS §4, `znp_worker.cpp:289` BLOCK): `znp_call`
+  applied the FULL `timeout_ms` to each of acquire-slot, queue-send, and the
+  worker's SRSP wait (≈3× the advertised timeout under contention) before
+  blocking `portMAX_DELAY` on the slot sem. A single deadline now budgets
+  all the pre-send waits; the worker's SRSP wait is the time LEFT after the
+  request is queued (floored at 50 ms), so a whole call is bounded by
+  ~`timeout_ms`.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_interview.cpp:311`):
+  ACTIVE_EP_RSP set `endpoint_count` from the device's claimed count while
+  the endpoint memcpy clamped separately — a truncated frame left
+  uninitialised stack bytes reported as real endpoints (then probed +
+  registered). The count is now clamped to bytes-present (and to 8) BEFORE
+  it is consumed.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_interview.cpp:375`): the
+  SIMPLE_DESC out-cluster-list offset `out_off = 13 + in_cnt*2` was computed
+  as `uint8_t` and wrapped for `in_cnt ≥ 122` (attacker-influenced wire
+  data), parsing the out-cluster list from the wrong offset. Now size_t math
+  with an explicit bound against the frame length.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:96`): a duplicate
+  matching ZDO AREQ delivered into `store_rsp` (ZNP RX task) could memcpy
+  into `s_rsp_buf` WHILE the interview task (other core) read the previous
+  response — a torn cross-core read. `store_rsp` now CLAIMs each wait
+  single-shot via a CAS on the cmd1 filter, so exactly one writer touches
+  the buffer per arm.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:251`): a NODE_DESC
+  failure makes `do_interview` return early before the work-copy's FAILED
+  state is committed, leaving the live slot at NONE — the FAILED-keyed
+  opportunistic re-interview never fired and the device was stranded until
+  rejoin. The live slot is now stamped FAILED after the final attempt.
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_interview.cpp:662` BLOCK):
+  `on_tc_dev_ind` runs in the ZNP UART RX task and blocked up to 100 ms in
+  `xQueueSend` on a full join queue — a join storm stalled byte intake →
+  UART overrun. Now a zero-timeout send with drop-oldest (the pool is
+  already seeded/refreshed and the interview task re-reads the pool nwk).
+- **zigbee_mgr** (MED, FINDINGS §4, `zigbee_mgr.cpp:99`): `s_init_done` was
+  a plain bool written by `coordinator_start` and read by `on_reset_ind` on
+  the RX task (its neighbours were already `std::atomic` for exactly this,
+  ZB-F4) → `std::atomic<bool>`.
+- **zigbee_mgr** (MED/LEAK, FINDINGS §4, `zigbee_mgr.cpp:1021`):
+  `zigbee_mgr_init` was not idempotent — a retry after a `coordinator_start`
+  failure re-created `s_zcl_queue` + spawned a second `zcl_attr_task` (old
+  queue leaked, duplicate consumer + duplicate AREQ subscriptions). The
+  one-time wiring (queue, tasks, sub-module inits, AREQ registrations) is now
+  guarded by a null-check on the queue.
+- **zigbee_mgr** (MED/SEC, FINDINGS §4, `zigbee_mgr.cpp:405`): the PRECFGKEY
+  (network key) NV write was hex-dumped in plaintext by the wire trace
+  (`znp_worker.cpp` TX, `znp_rx.cpp` RX) — a debug capture would contain the
+  live key. A new `znp_wire_is_sensitive()` flags SYS NV writes of key item
+  ids (PRECFGKEY 0x0062, NWK active/altern key-info 0x003A/0x003B); both
+  trace sites now print the header but REDACT the payload.
+- **zigbee_mgr** (LOW/SEC, FINDINGS §4, `zigbee_mgr.cpp:342`): the generated
+  `net_key[16]` stack buffer was never zeroized after commissioning →
+  `explicit_bzero` immediately after its last use (the PRECFGKEY write).
+
 ### Fixed — High/Medium (P2 findings review, T19 mqtt_gw / tg_gw lifecycle & injection)
 
 - **mqtt_gw (S3)** (HIGH, FINDINGS §7, `mqtt_gw_s3.cpp:53`): the `s_client`

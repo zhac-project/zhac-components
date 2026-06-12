@@ -37,36 +37,17 @@ extern "C" bool zhc_send_af(uint16_t nwk_addr, uint8_t dst_ep,
     if (manu_specific && zcl_len < 5) return false;
     zcl_local[manu_specific ? 3 : 1] = seq;
 
-    // AF_DATA_REQUEST payload (Z-Stack 3.x):
-    // [dst_addr 2B LE, dst_ep, src_ep=1, cluster 2B LE,
-    //  trans_id, options, radius, len, data...]
-    uint8_t af_pl[10 + 200];
-    af_pl[0] = nwk_addr & 0xFF;
-    af_pl[1] = (nwk_addr >> 8) & 0xFF;
-    af_pl[2] = dst_ep;
-    af_pl[3] = 0x01;                        // src_ep
-    af_pl[4] = cluster_id & 0xFF;
-    af_pl[5] = (cluster_id >> 8) & 0xFF;
-    af_pl[6] = seq;                         // trans_id — share ZCL seq
-    af_pl[7] = 0x00;                        // options
-    af_pl[8] = 0x0F;                        // radius
-    af_pl[9] = static_cast<uint8_t>(zcl_len);
-    std::memcpy(af_pl + 10, zcl_local, zcl_len);
-
-    MtFrame req{};
-    req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;   // AF_DATA_REQUEST
-    req.payload     = af_pl;
-    req.payload_len = 10 + zcl_len;
-
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 2000, 3)) {
-        ESP_LOGE(TAG, "AF_DATA_REQUEST no SRSP nwk=0x%04x cl=0x%04x",
-                 nwk_addr, cluster_id);
-        return false;
-    }
-    if (rsp.payload_len < 1 || rsp.payload[0] != 0x00) {
-        ESP_LOGE(TAG, "AF_DATA_REQUEST status=0x%02x nwk=0x%04x cl=0x%04x",
-                 rsp.payload_len ? rsp.payload[0] : 0xFF,
+    // §4 (FINDINGS.md): this used to hand-assemble the AF_DATA_REQUEST and
+    // blind-retry the SREQ 3× — the generic adapter→radio path is the one
+    // every library-matched device command (On/Off Toggle, cover step, …)
+    // flows through, so a re-sent frame after a lost SRSP double-fired the
+    // command on-air. Route through the shared builder as NON-IDEMPOTENT:
+    // single send, gated on AF_DATA_CONFIRM (no blind retry). The builder
+    // owns the AF header so there is one definition of the wire frame.
+    if (!zigbee_af_send_zcl(nwk_addr, dst_ep, cluster_id, seq,
+                            zcl_local, static_cast<uint32_t>(zcl_len),
+                            /*idempotent=*/false, /*confirm=*/2000)) {
+        ESP_LOGE(TAG, "AF_DATA_REQUEST failed nwk=0x%04x cl=0x%04x",
                  nwk_addr, cluster_id);
         return false;
     }

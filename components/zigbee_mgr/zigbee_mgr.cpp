@@ -12,6 +12,7 @@
 #include "freertos/queue.h"
 #include <atomic>
 #include <cstring>
+#include <strings.h>   // explicit_bzero
 #include <ctime>
 #include "zigbee_pool.h"
 #include "zap_store.h"
@@ -96,7 +97,13 @@ static void on_state_change(const MtFrame& f) {
 // dispatch task, polled from commissioning / startup paths.
 static std::atomic<bool> s_reset_received{false};
 static std::atomic<bool> s_znp_crashed{false};
-static          bool     s_init_done = false;
+// §4 (FINDINGS.md, :99): s_init_done is written by coordinator_start
+// (startup task) and read by on_reset_ind on the ZNP RX task — exactly the
+// cross-task/cross-core hazard its neighbours s_reset_received /
+// s_znp_crashed were made std::atomic for (ZB-F4). A plain bool here lets
+// -O2 hoist/tear the read on dual-core P4, so a real crash reset could be
+// mis-classified as an expected startup reset (or vice-versa).
+static std::atomic<bool> s_init_done{false};
 
 static void on_reset_ind(const MtFrame&) {
     s_reset_received = true;
@@ -402,7 +409,14 @@ static bool do_commissioning() {
         if (!nv_write(NV_CHANLIST, v, 4)) return false;
     }
     // PRECFGKEY — network key from NVS (random on first commission).
-    if (!nv_write(NV_PRECFGKEY, net_key, 16)) return false;
+    const bool precfgkey_ok = nv_write(NV_PRECFGKEY, net_key, 16);
+    // §4 (FINDINGS.md, :342 SEC): net_key is the live network key. Wipe the
+    // stack copy the instant after its last use (this write) with
+    // explicit_bzero (not memset — the compiler may not elide a bzero whose
+    // result is "unused") so it does not linger on the commissioning task's
+    // stack to be scavenged by a later stack-overread or a crash dump.
+    explicit_bzero(net_key, sizeof(net_key));
+    if (!precfgkey_ok) return false;
     // EXTENDED_PAN_ID + APS_USE_EXT_PANID = FF*8 (auto-pick)
     { uint8_t v[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
       if (!nv_write(NV_EXTENDED_PAN_ID, v, 8)) return false;
@@ -1043,37 +1057,59 @@ bool zigbee_mgr_init() {
     // encode flow through the zhc library (see zhc_adapter.h).
     znp_driver_init();
 
-    s_zcl_queue = xQueueCreate(ZCL_QUEUE_DEPTH, sizeof(AfRawFrame));
-    configASSERT(s_zcl_queue);
-    // 8 KB: zhc pipeline puts DecodedMessage (~1.7 KB) + dispatch_from_zigbee
-    // scratches + per-converter locals (lumi MI-struct TLV is ~1 KB on its
-    // own) on this task's stack. 4 KB overflows on rotate/vibrate frames.
-    xTaskCreate(zcl_attr_task, "zcl_attr", zhac::stack::kZclAttr, nullptr, 5, nullptr);
+    // §4 (FINDINGS.md, :1021 LEAK): zigbee_mgr_init must be idempotent.
+    // coordinator_start() below can fail (NCP never sends SYS_RESET_IND,
+    // commissioning times out, …) and a caller that retries zigbee_mgr_init
+    // would otherwise create a SECOND s_zcl_queue (leaking the first) and
+    // spawn a SECOND zcl_attr_task — two consumers racing one queue, plus a
+    // duplicate set of AREQ subscriptions. Guard the one-time wiring behind
+    // a null-check on the queue (same pattern as zigbee_identity_init). The
+    // post-coordinator registrations below are likewise re-run only when we
+    // actually proceed past a freshly-built queue.
+    const bool first_init = (s_zcl_queue == nullptr);
+    if (first_init) {
+        s_zcl_queue = xQueueCreate(ZCL_QUEUE_DEPTH, sizeof(AfRawFrame));
+        configASSERT(s_zcl_queue);
+        // 8 KB: zhc pipeline puts DecodedMessage (~1.7 KB) +
+        // dispatch_from_zigbee scratches + per-converter locals (lumi
+        // MI-struct TLV is ~1 KB on its own) on this task's stack. 4 KB
+        // overflows on rotate/vibrate frames.
+        xTaskCreate(zcl_attr_task, "zcl_attr", zhac::stack::kZclAttr, nullptr, 5, nullptr);
 
-    znp_register_areq(MT_AREQ(ZNP_SYS), 0x80, on_reset_ind);
-    znp_register_areq(MT_AREQ(ZNP_ZDO), 0xC0, on_state_change);
+        znp_register_areq(MT_AREQ(ZNP_SYS), 0x80, on_reset_ind);
+        znp_register_areq(MT_AREQ(ZNP_ZDO), 0xC0, on_state_change);
 
-    // Wire zhc_adapter's hooks to our AF bridge (radio TX) + shadow
-    // bridge (decode → device_shadow). Decls are file-scope via the
-    // extern "C" block near the top of this file.
-    zhc_send_bridge_register();
-    zhc_shadow_bridge_register();
-    zhc_configure_bridge_register();
+        // Wire zhc_adapter's hooks to our AF bridge (radio TX) + shadow
+        // bridge (decode → device_shadow). Decls are file-scope via the
+        // extern "C" block near the top of this file.
+        zhc_send_bridge_register();
+        zhc_shadow_bridge_register();
+        zhc_configure_bridge_register();
+    }
 
     if (!coordinator_start()) return false;
 
-    znp_register_areq(MT_AREQ(ZNP_ZDO), 0xC9, on_zdo_leave_ind); // ZDO_LEAVE_IND
-    zigbee_interview_init();
-    zigbee_identity_init();
-    zigbee_configure_init();
-    // AF_INCOMING_MSG cmd1 values (Z-Stack 3.x): 0x81 = standard,
-    // 0x82 = extended (MSG_EXT, used by some stack builds for payloads
-    // > 128 bytes). The dispatcher does exact-match only, so both must
-    // be registered. Previously this was 0xFF, which is not a valid MT
-    // AF command ID — no inbound ZCL traffic reached the interview /
-    // identity paths (see log investigation 2026-04-15).
-    znp_register_areq(MT_AREQ(ZNP_AF), 0x81, on_af_incoming_msg);
-    znp_register_areq(MT_AREQ(ZNP_AF), 0x82, on_af_incoming_msg);
+    // One-time post-coordinator wiring. Guarded by first_init for the same
+    // idempotency reason (§4 :1021): zigbee_interview_init / identity_init /
+    // configure_init each create queues + spawn tasks, and these AREQ
+    // registrations would otherwise stack duplicates on a retried init. A
+    // first init whose first coordinator_start() failed but a later one
+    // succeeded still has first_init == true (the queue was built up top),
+    // so this block runs exactly once.
+    if (first_init) {
+        znp_register_areq(MT_AREQ(ZNP_ZDO), 0xC9, on_zdo_leave_ind); // ZDO_LEAVE_IND
+        zigbee_interview_init();
+        zigbee_identity_init();
+        zigbee_configure_init();
+        // AF_INCOMING_MSG cmd1 values (Z-Stack 3.x): 0x81 = standard,
+        // 0x82 = extended (MSG_EXT, used by some stack builds for payloads
+        // > 128 bytes). The dispatcher does exact-match only, so both must
+        // be registered. Previously this was 0xFF, which is not a valid MT
+        // AF command ID — no inbound ZCL traffic reached the interview /
+        // identity paths (see log investigation 2026-04-15).
+        znp_register_areq(MT_AREQ(ZNP_AF), 0x81, on_af_incoming_msg);
+        znp_register_areq(MT_AREQ(ZNP_AF), 0x82, on_af_incoming_msg);
+    }
 
     return true;
 }

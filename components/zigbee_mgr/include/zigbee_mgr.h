@@ -89,6 +89,21 @@ bool zigbee_send_default_response(uint16_t nwk_addr, uint8_t dst_ep,
                                    uint8_t tsn, uint8_t cmd_id,
                                    uint8_t status);
 
+// Ship a fully-formed ZCL frame (`body` = FC|TSN|CMD|… already built by
+// the caller; `trans_id` MUST equal the TSN at body[1] / body[3]) inside an
+// AF_DATA_REQUEST to nwk_addr.dst_ep.cluster_id. Used by zhc_send_bridge so
+// the single af_data_request() builder (and its no-blind-retry policy) is
+// the ONE place that assembles AF headers (§4). `idempotent` selects retry
+// behaviour: false (commands) = single send + AF_DATA_CONFIRM gate (no
+// double-fire); true (reads/absolute writes) = multi-attempt SREQ retry.
+// `confirm_timeout_ms` is the MAC-confirm wait for non-idempotent sends
+// (0 = best-effort single send, no confirm). Returns true on accept (+
+// confirmed delivery when gated).
+bool zigbee_af_send_zcl(uint16_t nwk_addr, uint8_t dst_ep,
+                        uint16_t cluster_id, uint8_t trans_id,
+                        const uint8_t* body, uint32_t body_len,
+                        bool idempotent, uint32_t confirm_timeout_ms);
+
 // Generic ZCL Read Attributes. Sends a Read to
 // `nwk_addr.endpoint.cluster_id` listing `attr_ids_le` — packed LE,
 // two bytes per attribute, `attr_count` entries. When `manu_code` is

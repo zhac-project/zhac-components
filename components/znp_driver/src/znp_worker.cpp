@@ -186,7 +186,13 @@ static bool tx_frame(const ZnpFrame& f) {
     if (znp_get_wire_trace()) {
         ESP_LOGI("znp_wire", "TX cmd0=0x%02x cmd1=0x%02x len=%u",
                  f.cmd0, f.cmd1, (unsigned)f.len);
-        ESP_LOG_BUFFER_HEX_LEVEL("znp_wire", buf, n, ESP_LOG_INFO);
+        // §4: never hex-dump the network key onto the trace. Print the
+        // header but redact the payload of a key NV write.
+        if (znp_wire_is_sensitive(f.cmd0, f.cmd1, f.data, f.len)) {
+            ESP_LOGI("znp_wire", "TX payload REDACTED (network key NV write)");
+        } else {
+            ESP_LOG_BUFFER_HEX_LEVEL("znp_wire", buf, n, ESP_LOG_INFO);
+        }
     }
     const int written = uart_write_bytes(znp_uart_port, buf, n);
     if (written != (int)n) {
@@ -282,11 +288,28 @@ ZnpStatus znp_call(uint8_t cmd0, uint8_t cmd1,
     if (!s_request_q) return ZnpStatus::TRANSPORT_DOWN;
     if (data_len > ZNP_MAX_DATA_LEN) return ZnpStatus::INTERNAL_ERROR;
 
-    // Acquire a reply slot. If the pool is saturated, wait up to the same
-    // timeout the caller asked for. This provides natural back-pressure: if
-    // 4 callers are already blocked on SRSPs, the 5th waits instead of
-    // allocating unbounded memory.
-    const int slot = acquire_slot(timeout_ms);
+    // §4 (FINDINGS.md, znp_worker.cpp:289): the three blocking waits below
+    // (acquire_slot, queueSend, and the worker's own SRSP wait) each used
+    // the FULL timeout_ms. Under contention that stacked to ≈3× the
+    // advertised timeout before the request even went on the wire, then the
+    // caller blocked portMAX_DELAY on the slot sem. A single deadline
+    // budgets all the pre-send waits: each derives its share from the time
+    // remaining, and the worker's SRSP timeout is what's left after the
+    // request is queued — so the WHOLE call (slot + queue + SRSP) respects
+    // one timeout_ms ceiling instead of multiplying it.
+    const TickType_t t_start  = xTaskGetTickCount();
+    const TickType_t deadline = t_start + pdMS_TO_TICKS(timeout_ms);
+    auto remaining_ms = [deadline]() -> uint32_t {
+        const TickType_t now = xTaskGetTickCount();
+        if (now >= deadline) return 0;
+        return (uint32_t)pdTICKS_TO_MS(deadline - now);
+    };
+
+    // Acquire a reply slot within the remaining budget. If the pool is
+    // saturated this provides natural back-pressure: if 4 callers are
+    // already blocked on SRSPs, the 5th waits (but no longer than the
+    // shared deadline) instead of allocating unbounded memory.
+    const int slot = acquire_slot(remaining_ms());
     if (slot < 0) return ZnpStatus::TRANSPORT_DOWN;
 
     ZnpRequest r{};
@@ -295,9 +318,19 @@ ZnpStatus znp_call(uint8_t cmd0, uint8_t cmd1,
     r.req.len  = data_len;
     if (data_len && data) memcpy(r.req.data, data, data_len);
     r.slot_idx   = (uint8_t)slot;
-    r.timeout_ms = timeout_ms;
+    // Worker's SRSP wait gets whatever budget is left after the slot is in
+    // hand — never the full timeout again. This is set BEFORE the enqueue
+    // because xQueueSend copies `r` by value; the worker reads this field.
+    // Clamp to a small floor so a request that JUST squeaked past the
+    // deadline still gets a real (if brief) chance on the wire rather than
+    // a 0-tick instant timeout that wastes the UART write it just did.
+    constexpr uint32_t kMinSrspMs = 50;
+    {
+        const uint32_t rem = remaining_ms();
+        r.timeout_ms = (rem < kMinSrspMs) ? kMinSrspMs : rem;
+    }
 
-    if (xQueueSend(s_request_q, &r, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    if (xQueueSend(s_request_q, &r, pdMS_TO_TICKS(remaining_ms())) != pdTRUE) {
         release_slot(slot);
         return ZnpStatus::TRANSPORT_DOWN;
     }
@@ -305,6 +338,11 @@ ZnpStatus znp_call(uint8_t cmd0, uint8_t cmd1,
     // Worker guarantees exactly one give on the slot semaphore per accepted
     // request. Block forever here to avoid a race where the caller gives up
     // and releases the slot while the worker is about to write into it.
+    // This is NOT an unbounded wait in practice: the worker always writes a
+    // reply within r.timeout_ms (SRSP, TIMEOUT, or RESET_DURING_CALL), and
+    // that budget is now the time LEFT on the shared deadline (§4) — so the
+    // total znp_call latency is bounded by ~timeout_ms, not by stacking a
+    // fresh timeout onto each of acquire/queue/SRSP and then portMAX here.
     xSemaphoreTake(s_slots[slot].sem, portMAX_DELAY);
     const ZnpReply reply = s_slots[slot].reply;
     release_slot(slot);
