@@ -379,14 +379,28 @@ void hap_session_on_receive(const HapFrame& frame) {
         return;
     }
 
+    // Consume (dispatch) BEFORE sending the ACK. The ACK goes out via
+    // s_cfg.send → the peer transport's two-stage exchange, which RE-ENTERS the
+    // receive path and overwrites the shared dispatch buffer that frame.payload
+    // still points into. ACK-first therefore let on_frame() below read a
+    // clobbered payload — observed as a DEVICE_LIST reply delivered with a
+    // LOG_LINE's bytes (empty device list). Dispatch first so the consumer
+    // (waiter copy / handler decode) reads the intact payload; the ACK's
+    // re-entry can then safely reuse the buffer. mark_seen() stays before
+    // on_frame so a duplicate arriving during dispatch is still deduped, and
+    // hap_make_reply() reads only the frame header (seq/type), not the payload,
+    // so building the ACK after dispatch is safe.
     if (frame.flags & HAP_FLAG_NEEDS_ACK) {
-        HapFrame ack = hap_make_reply(frame, HapMsgType::ACK, HAP_FLAG_NO_ACK);
-        ack.seq = hap_session_next_seq();
-        s_cfg.send(ack);
         mark_seen(frame.seq, static_cast<uint8_t>(frame.type));
     }
 
     if (s_cfg.on_frame) s_cfg.on_frame(frame);
+
+    if (frame.flags & HAP_FLAG_NEEDS_ACK) {
+        HapFrame ack = hap_make_reply(frame, HapMsgType::ACK, HAP_FLAG_NO_ACK);
+        ack.seq = hap_session_next_seq();
+        s_cfg.send(ack);
+    }
 }
 
 // Concurrency note (responds to Qwen §1.1 "session send race"):
