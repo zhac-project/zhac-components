@@ -603,6 +603,25 @@ static void task_interview(void*) {
                     d->nwk_addr = ev.nwk;
                     zigbee_pool_mark_dirty();   // recursive mutex — safe here
                 }
+                // Force a re-configure on rejoin. task_configure dedups
+                // out any device already in ConfigureState::DONE, so the
+                // zigbee_configure_enqueue() below would otherwise be a
+                // silent no-op. A "DONE" only means the prior configure's
+                // steps were *sent* without a transport error — not that
+                // the device answered. If that device left mid-configure
+                // (its initial zcl_reads hit a since-departed nwk) the
+                // shadow never populated → web UI shows "no states". Reset
+                // to PENDING here (atomically with the nwk fix-up) so the
+                // re-enqueue genuinely re-runs binds + reporting + reads on
+                // the new live nwk. Transient — not persisted; the worker
+                // re-marks DONE/FAILED + persists the real outcome (mirrors
+                // the "Mark IN_PROGRESS … not persisted" pattern). This is
+                // gated to the rejoin fast-path only; the DONE-dedup still
+                // protects every other enqueue caller from duplicate binds.
+                if (d->configure_state == static_cast<uint8_t>(ConfigureState::DONE)) {
+                    d->configure_state    = static_cast<uint8_t>(ConfigureState::PENDING);
+                    d->configure_attempts = 0;
+                }
                 fp_nwk    = d->nwk_addr;
                 fast_path = true;
             }
