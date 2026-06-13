@@ -144,3 +144,42 @@ TEST_CASE("session: duplicate NEEDS_ACK suppressed; ACK still sent", "[session]"
     TEST_ASSERT_EQUAL(HapMsgType::ACK, c.sent[0].type);
     TEST_ASSERT_EQUAL(HapMsgType::ACK, c.sent[1].type);
 }
+
+// Regression: a peer restart (its seq counter rewinds to 1) while we stay up
+// must not wedge NEEDS_ACK delivery. A received SYNC clears the receive-side
+// dedup high-water so the peer's restarted low seqs are accepted instead of
+// being silently dropped as "behind the window". Without the SYNC reset the
+// final frame stays dropped (on_frame_calls == 1) and device.list/get/set time
+// out forever while NO_ACK heartbeats keep flowing.
+TEST_CASE("session: SYNC resets rx dedup so peer-restart low seqs are accepted",
+          "[session]") {
+    Capture c;
+    hap_session_init(make_cfg(c));
+
+    // Establish a high high-water with one accepted NEEDS_ACK data frame.
+    HapFrame hi{};
+    hi.type  = HapMsgType::CMD;
+    hi.seq   = 5000;
+    hi.flags = HAP_FLAG_NEEDS_ACK;
+    hap_session_on_receive(hi);
+    TEST_ASSERT_EQUAL(1, c.on_frame_calls);
+
+    // A fresh low seq now looks far behind the window → dropped (re-ACKed,
+    // never dispatched). Documents the gate that the SYNC reset must defeat.
+    HapFrame low{};
+    low.type  = HapMsgType::CMD;
+    low.seq   = 10;
+    low.flags = HAP_FLAG_NEEDS_ACK;
+    hap_session_on_receive(low);
+    TEST_ASSERT_EQUAL(1, c.on_frame_calls);   // still dropped as stale-behind
+
+    // Peer SYNC ⇒ new session ⇒ dedup state cleared.
+    HapFrame sync{};
+    sync.type = HapMsgType::SYNC;
+    sync.seq  = 1;
+    hap_session_on_receive(sync);
+
+    // The same low seq is now accepted and dispatched.
+    hap_session_on_receive(low);
+    TEST_ASSERT_EQUAL(2, c.on_frame_calls);
+}

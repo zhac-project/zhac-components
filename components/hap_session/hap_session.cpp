@@ -152,6 +152,25 @@ static void mark_seen(uint16_t seq, uint8_t type) {
     }
 }
 
+// Reset the receive-side dedup state (high-water + seen ring). A fresh session
+// MUST clear this — both at boot (hap_session_init) and on receiving a peer
+// SYNC. A SYNC means the peer restarted its session and rewound its seq counter
+// to 1; if we keep the old high-water, every fresh low-seq NEEDS_ACK frame the
+// peer now sends is judged "far behind the window" (is_stale_behind_window) and
+// silently dropped (we still re-ACK, but never dispatch). Worse, the drop
+// happens before mark_seen, so the high-water never advances and the wedge is
+// permanent until the receiver reboots. NO_ACK traffic (heartbeats, *_RSP)
+// bypasses the gate and keeps flowing, so the link looks half-alive while
+// DEVICE_LIST/DEVICE_INFO/SET_ACK (the only P4→S3 NEEDS_ACK replies) time out
+// forever. Runs on the receive task only (same as mark_seen and the SYNC
+// handler below), so no lock is needed.
+static void reset_rx_dedup() {
+    s_rx_high_water       = 0;
+    s_rx_high_water_valid = false;
+    s_seen_head           = 0;
+    memset(s_seen_ring, 0, sizeof(s_seen_ring));
+}
+
 static int64_t now_ms() {
     return esp_timer_get_time() / 1000;
 }
@@ -186,11 +205,8 @@ void hap_session_init(const HapSessionCfg& cfg) {
     // stale mark from a prior session (which reset s_next_seq back to 1) can't
     // wrongly classify the first post-init frames as "behind the window".
     // (hap_session_reset_link deliberately PRESERVES these — seq continuity is
-    // kept there; only a full re-init starts the seq space over.)
-    s_rx_high_water       = 0;
-    s_rx_high_water_valid = false;
-    s_seen_head           = 0;
-    memset(s_seen_ring, 0, sizeof(s_seen_ring));
+    // kept there; only a full re-init or a peer SYNC starts the seq space over.)
+    reset_rx_dedup();
     for (int i = 0; i < WIN_SIZE; i++) {
         if (first) {
             // 16 × 4 KB parked in PSRAM (fallback to internal for non-PSRAM
@@ -356,6 +372,14 @@ void hap_session_on_receive(const HapFrame& frame) {
     }
 
     if (frame.type == HapMsgType::SYNC) {
+        // Peer (re)started its session ⇒ its seq counter rewound to 1. Clear our
+        // receive-side dedup so the peer's restarted seq space is accepted clean
+        // instead of being silently dropped as "behind the window". Without this
+        // a P4 restart while S3 stays up wedges device.list/get/set forever
+        // (heartbeats and NO_ACK *_RSP keep flowing, masking it). SYNC is rare
+        // (connect/reconnect only) and the peer's retransmit window is reset too,
+        // so there are no genuine in-flight dups to lose by clearing here.
+        reset_rx_dedup();
         if (s_cfg.on_sync) s_cfg.on_sync(frame);
         return;
     }
