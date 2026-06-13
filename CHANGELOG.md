@@ -9,6 +9,33 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **zigbee_mgr (rejoin re-read)** — a device that rejoins with a new nwk
+  address now re-reads its state, so its device-shadow repopulates instead of
+  staying empty (web UI "no states"). Root cause was a contradiction between
+  two existing sites: the interview **rejoin fast-path**
+  (`zigbee_interview.cpp`, `InterviewState::IDENTITY_READY`) updates the
+  device's `nwk_addr` and calls `zigbee_configure_enqueue()` to re-run
+  binds/reporting/reads on rejoin — but `task_configure`
+  (`zigbee_configure_queue.cpp`) dedups out any device already in
+  `ConfigureState::DONE`, making that re-enqueue a silent no-op. A device is
+  marked `DONE` once its configure steps were *sent* without a transport error
+  (not verified-answered): a device that joined, started configure, then LEFT
+  mid-sequence had its initial `zcl_read`s fired at the since-departed nwk, was
+  still marked `DONE`, and on rejoin (new nwk) was skipped — so it never
+  re-read and the shadow stayed empty. Fix: the rejoin fast-path now resets a
+  `DONE` device's `configure_state` to `PENDING` (and `configure_attempts` to
+  0) **atomically under `zigbee_pool_lock()`**, alongside the `nwk_addr`
+  fix-up, so the re-enqueue genuinely re-runs on the new live nwk. The reset is
+  transient and intentionally **not** persisted — the configure worker
+  re-marks `DONE`/`FAILED` and persists the real outcome (mirrors the existing
+  "Mark IN_PROGRESS … not persisted" pattern). Surgical and gated to the rejoin
+  fast-path only: the `DONE`-dedup in `task_configure` is untouched, so every
+  other enqueue caller (e.g. `zigbee_identity.cpp` on match) is still protected
+  from duplicate binds / `STATUS_TABLE_FULL` on already-configured devices.
+  Needs a hardware soak (rejoin a device with a new nwk, confirm states
+  populate). Follow-up (not in this fix): a defensive guard so configure does
+  not mark `DONE` when the device left mid-sequence.
+
 - **hap_json (HOTFIX)** — `hap_json_encode_device_list` now PAGES the device
   list. A full fleet's JSON cannot fit one SPI frame (`HAP_MAX_PAYLOAD` =
   4096), and a host test pins the overflow at **16 realistic devices** (15 fit
