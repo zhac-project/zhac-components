@@ -9,6 +9,26 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **hap_session — device.list/get/set wedge after hours of uptime (uint16
+  high-water wrap)** — the receive-side dedup high-water that gates
+  `is_stale_behind_window` advanced only on accepted NEEDS_ACK frames, while the
+  peer's seq counter advances on *every* frame it sends. The only P4→S3
+  NEEDS_ACK frames (DEVICE_LIST/DEVICE_INFO/SET_ACK) are rare; heartbeats + attr
+  updates (NO_ACK) raced the counter ahead until the high-water lagged the live
+  seq by >32768 (half the uint16 space). `seq_diff` then wrapped and misjudged a
+  *fresh* reply as "behind the window", silently dropping it (re-ACK, no
+  dispatch); because the drop preceded the high-water advance, the lag never
+  recovered — a permanent wedge where heartbeats/`*_RSP` still flowed (link
+  looked half-alive) but device.list/get/set timed out forever (observed at 4h
+  and 10h uptime, both chips continuously up). Fix: advance the high-water on
+  every inbound frame (`note_peer_seq`), pinning the lag to SPI-pipeline depth.
+  Also reset the receive dedup on a received SYNC, so a genuine peer restart
+  (seq rewind) can't wedge it either. Regression tests added.
+
+## [v2026061302] - 2026-06-13
+
+### Fixed
+
 - **zigbee_mgr (rejoin re-read)** — a device that rejoins with a new nwk
   address now re-reads its state, so its device-shadow repopulates instead of
   staying empty (web UI "no states"). Root cause was a contradiction between
