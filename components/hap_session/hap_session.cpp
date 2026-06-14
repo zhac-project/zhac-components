@@ -141,15 +141,34 @@ static bool is_stale_behind_window(uint16_t seq) {
     return seq_diff(s_rx_high_water, seq) >= STALE_BEHIND_THRESHOLD;
 }
 
-static void mark_seen(uint16_t seq, uint8_t type) {
-    s_seen_ring[s_seen_head] = {seq, type};
-    s_seen_head = (s_seen_head + 1) % SEEN_RING_SIZE;
-    // Advance the high-water mark only forward (wrap-aware): a freshly accepted
-    // in-window frame may carry a seq slightly ahead of any seen so far.
+// Advance the receive high-water (forward only, wrap-aware) to track the peer's
+// live seq. Called for EVERY inbound frame that carries a real peer seq — ACK,
+// NO_ACK data, and accepted NEEDS_ACK — NOT just NEEDS_ACK.
+//
+// Why all frames: the high-water gates is_stale_behind_window. The peer's seq
+// counter advances on every frame it sends (heartbeats, attr updates, *_RSP,
+// replies), but NEEDS_ACK replies (DEVICE_LIST/DEVICE_INFO/SET_ACK) are rare. If
+// the high-water only advanced on those rare frames, it would lag the peer's
+// live seq by the entire NO_ACK volume in between. After enough hours that lag
+// crosses 32768 (half the uint16 space); seq_diff() then wraps and reports a
+// FRESH reply (legitimately ahead) as "behind the window", so every reply is
+// silently dropped (re-ACKed, never dispatched) and — because the drop is before
+// the high-water advance — the lag never recovers. Net effect: device.list /
+// device.get / set-attribute wedge permanently while NO_ACK traffic keeps
+// flowing. Tracking all frames pins the lag to the SPI pipeline depth (~1-2
+// frames), so a fresh reply is never misclassified.
+static void note_peer_seq(uint16_t seq) {
+    if (seq == 0) return;   // 0 is the skip/uninit sentinel, never a real seq
     if (!s_rx_high_water_valid || seq_diff(seq, s_rx_high_water) > 0) {
         s_rx_high_water = seq;
         s_rx_high_water_valid = true;
     }
+}
+
+static void mark_seen(uint16_t seq, uint8_t type) {
+    s_seen_ring[s_seen_head] = {seq, type};
+    s_seen_head = (s_seen_head + 1) % SEEN_RING_SIZE;
+    note_peer_seq(seq);   // a freshly accepted frame also advances the high-water
 }
 
 // Reset the receive-side dedup state (high-water + seen ring). A fresh session
@@ -368,6 +387,7 @@ void hap_session_on_receive(const HapFrame& frame) {
                      frame.ack_seq, frame.seq);
         }
         xSemaphoreGive(s_mutex);
+        note_peer_seq(frame.seq);   // ACK carries the peer's live seq — keep high-water current
         return;
     }
 
@@ -416,6 +436,12 @@ void hap_session_on_receive(const HapFrame& frame) {
     // so building the ACK after dispatch is safe.
     if (frame.flags & HAP_FLAG_NEEDS_ACK) {
         mark_seen(frame.seq, static_cast<uint8_t>(frame.type));
+    } else {
+        // NO_ACK data (heartbeats, attr updates, *_RSP) carries the peer's live
+        // seq and MUST advance the high-water too — otherwise it lags the live
+        // seq by the whole NO_ACK volume and eventually wraps the stale check
+        // (see note_peer_seq). These frames are not deduped, so no ring entry.
+        note_peer_seq(frame.seq);
     }
 
     if (s_cfg.on_frame) s_cfg.on_frame(frame);

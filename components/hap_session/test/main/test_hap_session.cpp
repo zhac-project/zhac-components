@@ -183,3 +183,42 @@ TEST_CASE("session: SYNC resets rx dedup so peer-restart low seqs are accepted",
     hap_session_on_receive(low);
     TEST_ASSERT_EQUAL(2, c.on_frame_calls);
 }
+
+// Regression: NO_ACK traffic must advance the receive high-water. Over a long
+// continuous session the peer's seq races ahead on NO_ACK frames (heartbeats /
+// attr updates) while NEEDS_ACK replies are rare; if the high-water only tracked
+// NEEDS_ACK frames it would lag past 32768 and seq_diff would wrap, so a FRESH
+// far-ahead reply gets misjudged "behind the window" and silently dropped — the
+// 4h/10h device.list wedge with no reboot involved.
+TEST_CASE("session: NO_ACK traffic advances high-water so a fresh far-ahead reply isn't dropped",
+          "[session]") {
+    Capture c;
+    hap_session_init(make_cfg(c));
+
+    // A NEEDS_ACK reply seeds the high-water at a low seq.
+    HapFrame a{};
+    a.type  = HapMsgType::CMD;
+    a.seq   = 100;
+    a.flags = HAP_FLAG_NEEDS_ACK;
+    hap_session_on_receive(a);
+    TEST_ASSERT_EQUAL(1, c.on_frame_calls);
+
+    // NO_ACK traffic carries the peer's live seq far ahead (> half the uint16
+    // space past the last NEEDS_ACK). It must drag the high-water with it.
+    HapFrame hb{};
+    hb.type  = HapMsgType::CMD;
+    hb.seq   = 40000;
+    hb.flags = HAP_FLAG_NO_ACK;
+    hap_session_on_receive(hb);
+    TEST_ASSERT_EQUAL(2, c.on_frame_calls);
+
+    // A fresh NEEDS_ACK reply just ahead of the live seq must be accepted. With
+    // a lagging high-water (seeded at 100) seq_diff(100,40001) wraps to a small
+    // positive value >= the threshold and this would be dropped as stale.
+    HapFrame r{};
+    r.type  = HapMsgType::CMD;
+    r.seq   = 40001;
+    r.flags = HAP_FLAG_NEEDS_ACK;
+    hap_session_on_receive(r);
+    TEST_ASSERT_EQUAL(3, c.on_frame_calls);
+}
