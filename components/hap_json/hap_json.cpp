@@ -540,7 +540,8 @@ bool hap_json_encode_device_event(uint8_t* buf, size_t cap, uint16_t* out_len,
     doc["ieee"] = ieee_s;
     doc["cl"]   = ev.cluster;
     doc["at"]   = ev.attr;
-    doc["val"]  = ev.val;
+    if (ev.val_type == VAL_FLOAT) doc["val"] = static_cast<float>(ev.val) / 100.0f;
+    else                          doc["val"] = ev.val;
     doc["vt"]   = ev.val_type;
     doc["ts"]   = ev.ts;
     size_t n = serializeJson(doc, reinterpret_cast<char*>(buf), cap);
@@ -1380,7 +1381,8 @@ bool hap_json_encode_bulk(uint8_t* buf, size_t cap, uint16_t* out_len,
         o["ieee"] = ieee_s;
         o["cl"]   = evs[i].cluster;
         o["at"]   = evs[i].attr;
-        o["val"]  = evs[i].val;
+        if (evs[i].val_type == VAL_FLOAT) o["val"] = static_cast<float>(evs[i].val) / 100.0f;
+        else                              o["val"] = evs[i].val;
         o["vt"]   = evs[i].val_type;
         o["ts"]   = evs[i].ts;
     }
@@ -1410,26 +1412,14 @@ bool hap_json_encode_device_attr_update(uint8_t* buf, size_t cap, uint16_t* out_
     } else if (val_type == VAL_STR) {
         if (str_val) attrs[key] = str_val;
         else         attrs[key] = static_cast<const char*>(nullptr);
+    } else if (val_type == VAL_FLOAT) {
+        // Stored as int_val × 100 (2-dp) by the shadow bridge; unscale on the
+        // JSON boundary so the UI sees natural units. The VAL_FLOAT tag replaces
+        // the old hardcoded float-key guess, so this is correct for ANY float
+        // attr and never mis-scales a genuine integer (e.g. integer humidity).
+        attrs[key] = static_cast<float>(int_val) / 100.0f;
     } else {
-        // The ZHC library emits certain attributes as floats
-        // (temperature/humidity in °C and %, color_x/y in [0,1]) and
-        // the shadow bridge stores them as int32 scaled ×100 so the
-        // NVS-backed int-only schema survives. Unscale back on the
-        // JSON boundary so the UI sees natural units. Keeping the
-        // key list here means the bridge + schema stay int32 and
-        // only consumers that need real floats pay the /100.
-        static constexpr const char* kFloatKeys[] = {
-            "temperature", "humidity", "color_x", "color_y",
-        };
-        bool is_float = false;
-        for (const char* k : kFloatKeys) {
-            if (std::strcmp(key, k) == 0) { is_float = true; break; }
-        }
-        if (is_float) {
-            attrs[key] = static_cast<float>(int_val) / 100.0f;
-        } else {
-            attrs[key] = int_val;
-        }
+        attrs[key] = int_val;   // VAL_INT / VAL_NONE — raw integer
     }
     size_t n = serializeJson(doc, reinterpret_cast<char*>(buf), cap);
     if (doc.overflowed() || n == 0 || n >= cap) {

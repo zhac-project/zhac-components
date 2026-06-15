@@ -7,6 +7,21 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed
+
+- **Float attributes display correctly (`VAL_FLOAT`).** Floats were stored as
+  VAL_INT scaled ×100, indistinguishable from a genuine integer, so the JSON
+  encoders guessed which to unscale via a hardcoded float-key list — an integer
+  humidity got ÷100 (→0.49) on the live path while a float temperature showed
+  ×100 (→2870) on the snapshot path. Added a real `VAL_FLOAT` tag (int_val still
+  ×100 — no struct/NVS change): the shadow bridge tags floats VAL_FLOAT and every
+  JSON value-emitter formats by type (VAL_FLOAT → ÷100, else raw); the float-key
+  guess is deleted. Rules/Lua keep the ×100 integer convention (the matcher
+  normalises VAL_FLOAT→VAL_INT, so numeric triggers still fire). Adds
+  `zcl_attr_set_float` + host tests.
+
+## [v2026061501]
+
 ### Changed
 
 - **hap_json — `HapSyncInfo.fw_ver` 16→32 bytes.** The SYNC fw_ver field now

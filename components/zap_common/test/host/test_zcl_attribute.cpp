@@ -87,6 +87,14 @@ int main() {
         CHECK(a.key[ATTR_KEY_MAX - 1] == '\0', "int: key NUL-terminated");
     }
 
+    // ── 8. VAL_FLOAT: zcl_attr_set_float stores value×100 tagged VAL_FLOAT ──
+    {
+        ZclAttribute a{};
+        zcl_attr_set_float(&a, "temperature", 26.5f);
+        CHECK(a.val_type == VAL_FLOAT, "float: val_type is VAL_FLOAT (not VAL_INT)");
+        CHECK(a.int_val == 2650, "float: 26.5 stored as int_val 2650 (x100)");
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS",
            s_failures);
     return s_failures ? 1 : 0;

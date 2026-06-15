@@ -72,10 +72,14 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
             attr.int_val  = static_cast<int32_t>(int_val);
             break;
         case kValueKindFloat:
-            // Shadow stores int32 only; scale by 100 to preserve 2 dp.
-            // Consumers that need exact floats go through the event bus
-            // (not shadow). Matches z2m's .withValueStep(0.01) pattern.
-            attr.val_type = VAL_INT;
+            // Store value × 100 (2-dp fixed point) tagged VAL_FLOAT: the JSON
+            // encoders unscale it (÷100) for display, while rules/Lua compare the
+            // raw ×100 integer. Previously tagged VAL_INT, which made a scaled
+            // float indistinguishable from a genuine integer — the encoders then
+            // guessed by key name (a hardcoded float-key list), so an integer
+            // humidity got wrongly ÷100 (→0.49) on the live path while a float
+            // temperature showed un-unscaled (×100 → 2900) on the snapshot path.
+            attr.val_type = VAL_FLOAT;
             attr.int_val  = static_cast<int32_t>(float_val * 100.0f);
             break;
         case kValueKindString:

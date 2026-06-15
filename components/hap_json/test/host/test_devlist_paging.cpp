@@ -19,6 +19,7 @@
 
 #include "hap_json.h"
 #include "zap_common.h"
+#include "zcl_attribute.h"   // VAL_FLOAT / VAL_INT
 
 #include <cstdio>
 #include <cstring>
@@ -204,6 +205,34 @@ int main() {
         CHECK(next == 4, "STEP3 edge: start==count keeps next==count (done)");
         CHECK(count_devices_in(reinterpret_cast<char*>(buf), len) == 0,
               "STEP3 edge: start==count emits zero devices");
+    }
+
+    // ── STEP4: type-driven value scaling in the live attr encoder. A
+    // VAL_FLOAT attr unscales (/100); a genuine integer (VAL_INT) stays raw —
+    // the type, not a hardcoded key list, decides. Guards the kFloatKeys removal
+    // (which used to ÷100 an integer "humidity" → 0.49, and never unscaled the
+    // snapshot path → temperature 2900).
+    {
+        uint8_t buf[512]; uint16_t len = 0;
+        bool ok = hap_json_encode_device_attr_update(
+            buf, sizeof(buf), &len, 0x1122334455667788ULL,
+            "temperature", VAL_FLOAT, 2650, nullptr, 200, 0);
+        std::string s(reinterpret_cast<char*>(buf), len);
+        CHECK(ok, "STEP4: VAL_FLOAT attr encodes ok");
+        CHECK(s.find("\"temperature\"") != std::string::npos &&
+              s.find("26.5") != std::string::npos,
+              "STEP4: VAL_FLOAT 2650 -> 26.5 (unscaled /100)");
+
+        len = 0;
+        ok = hap_json_encode_device_attr_update(
+            buf, sizeof(buf), &len, 0x1122334455667788ULL,
+            "humidity", VAL_INT, 42, nullptr, 200, 0);
+        std::string s2(reinterpret_cast<char*>(buf), len);
+        CHECK(ok, "STEP4: VAL_INT attr encodes ok");
+        CHECK(s2.find("\"humidity\":42") != std::string::npos,
+              "STEP4: integer humidity stays 42 (no key-list ÷100)");
+        CHECK(s2.find("0.42") == std::string::npos,
+              "STEP4: integer humidity is never ÷100'd");
     }
 
     printf("\n%s (%d failure%s)\n", s_failures ? "FAILED" : "ALL PASSED",
