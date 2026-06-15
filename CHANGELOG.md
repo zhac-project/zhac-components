@@ -7,6 +7,15 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Changed
+
+- **hap_json — `HapSyncInfo.fw_ver` 16→32 bytes.** The SYNC fw_ver field now
+  carries a git-describe firmware version (e.g. `v2026061501`, or
+  `v2026061501-3-gabc1234` when ahead of a tag) instead of the old `"0.4.0"`
+  protocol string, so it can exceed 16 chars. Decode stays `sizeof`-based.
+
+## [v2026061401]
+
 ### Fixed
 
 - **hap_session — device.list/get/set wedge after hours of uptime (uint16
