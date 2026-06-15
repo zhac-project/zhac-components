@@ -765,7 +765,12 @@ void device_shadow_init() {
     // v8 = T27 (FINDINGS §9): the config 'c' blob gained its own version+CRC
     // header (CfgBlobHdr); the headerless v7 'c' blobs no longer match the
     // expected length, so wipe on first boot (configs re-seed from the SPA).
-    static constexpr uint8_t NVS_SHADOW_VERSION = 8;
+    // v9 = VAL_FLOAT: float attrs are now tagged VAL_FLOAT (not VAL_INT scaled
+    // ×100). A pre-v9 cache holds float temperatures/humidities as VAL_INT, which
+    // the type-driven JSON encoders no longer unscale (shown ×100, e.g. 2870),
+    // and a same-value re-report won't refresh the tag — so wipe on upgrade and
+    // let devices re-report as VAL_FLOAT.
+    static constexpr uint8_t NVS_SHADOW_VERSION = 9;
     if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
         if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
