@@ -21,7 +21,7 @@ size_t hap_json_escape_str(const char* src, char* out, size_t out_cap);
 // ── SYNC ──────────────────────────────────────────────────────────────────
 struct HapSyncInfo {
     uint32_t session_id;
-    char     fw_ver[16];
+    char     fw_ver[32];     // git-describe version (tag, or tag-commits-ghash)
     uint16_t device_count;   // only in ACK
     bool     is_ack;         // true if SYNC_ACK, false if SYNC_REQ
 };
