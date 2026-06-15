@@ -217,7 +217,12 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 
         if (t.op == CondOp::ANY || wildcard_attr) return true;
 
-        if (t.match_val_type != ze.val_type) return false;
+        // A VAL_FLOAT attr stores value × 100 as an int — same comparison domain
+        // as VAL_INT (the DSL literal is the ×100 value too, e.g. `temperature>
+        // 2500` = 25.00), so match it as VAL_INT. BOOL/STR matching unchanged.
+        const uint8_t attr_vt = (ze.val_type == VAL_FLOAT) ? (uint8_t)VAL_INT
+                                                           : ze.val_type;
+        if (t.match_val_type != attr_vt) return false;
 
         if (t.match_val_type == VAL_STR) {
             // EQ/NEQ only — other ops don't make sense for string values.

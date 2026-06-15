@@ -18,6 +18,10 @@ enum ValType : uint8_t {
     VAL_INT  = 1,  // int_val interpreted as int32_t
     VAL_BOOL = 2,  // int_val interpreted as 0/1
     VAL_STR  = 3,  // str_val holds a null-terminated string
+    VAL_FLOAT = 4, // int_val holds value × 100 (2-dp fixed point). A DISPLAY-layer
+                   // tag: JSON encoders unscale it (÷100) so the UI shows natural
+                   // units, while rules/Lua keep comparing the raw ×100 integer
+                   // (the DSL/script convention — e.g. `temperature>2500` = 25.00).
 };
 
 // Key / value buffer sizes. Schema v6 widened both:
@@ -75,6 +79,14 @@ inline void zcl_attr_set_int(ZclAttribute* a, const char* key,
     a->int_val  = val;
     a->cluster  = 0;
     a->attr_id  = 0;
+}
+
+// Helper: populate a FLOAT attribute by name. Stored as int_val = value × 100
+// (2-dp fixed point), val_type VAL_FLOAT — the ×100 matches the shadow bridge so
+// the JSON encoders unscale identically. Truncates (matches the bridge); 2 dp is
+// the practical resolution for temperature / humidity / percent values.
+inline void zcl_attr_set_float(ZclAttribute* a, const char* key, float val) {
+    zcl_attr_set_int(a, key, static_cast<int32_t>(val * 100.0f), VAL_FLOAT);
 }
 
 // Helper: populate a STR attribute by name.
