@@ -9,6 +9,18 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **device_shadow — bump NVS schema v8→v9 to clear stale `VAL_INT` floats on the
+  `VAL_FLOAT` upgrade.** A pre-v9 shadow cache holds float temperatures/
+  humidities as `VAL_INT` (×100); the type-driven encoders no longer unscale
+  those (shown ×100 — WSD500A temp 2870 / humidity 4900 after the v2026061502
+  flash), and a same-value re-report won't refresh the tag. Wiping the cache on
+  upgrade lets devices re-report as `VAL_FLOAT`. (Pairs with the `VAL_FLOAT`
+  display fix below.)
+
+## [v2026061502]
+
+### Fixed
+
 - **Float attributes display correctly (`VAL_FLOAT`).** Floats were stored as
   VAL_INT scaled ×100, indistinguishable from a genuine integer, so the JSON
   encoders guessed which to unscale via a hardcoded float-key list — an integer
