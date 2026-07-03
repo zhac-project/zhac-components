@@ -9,6 +9,17 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **simple_rules — `zigbee.set` rule actions now update the device shadow
+  (web-UI parity).** A rule action sent the ZCL command but never wrote the
+  shadow, unlike the web UI's SET_ATTRIBUTE path (`hap_dispatch.cpp`), which
+  calls `device_shadow_update_optimistic` after a successful send. Many devices
+  (esp. Tuya LED drivers) emit no attribute report after a command-driven
+  change, so the shadow — and thus the SPA and any shadow-reading logic —
+  reverted to the last-known value: a rule-issued on/off looked dead even
+  though the device obeyed the byte-identical frame the web UI sends.
+  `ZIGBEE_SET` now mirrors the UI (VAL_BOOL for `state`, else VAL_INT), guarded
+  on send success so a failed command writes no stale value; a real report
+  later overrides it. Adds host regression `test_action_shadow`.
 - **simple_rules — Bool attributes now match `=1` / `=0` triggers.** The matcher
   only folded `VAL_FLOAT` into the integer comparison domain, so a DSL literal
   (parsed as `VAL_INT`) never matched a `VAL_BOOL` shadow value — the

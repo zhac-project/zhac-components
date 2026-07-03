@@ -182,15 +182,24 @@ uint16_t rule_store_max_id(void) {
 }
 uint16_t rule_store_count(void) { return s_store_n; }
 
-// ── zigbee_pool: empty pool ──────────────────────────────────────────────
+// ── zigbee_pool: seedable single-device pool (default empty) ──────────────
+// Existing tests keep the empty behaviour; test_action_shadow seeds one
+// device so a rule `zigbee.set` action can resolve its target device.
+static ZapDevice s_pool[1];
+static uint16_t  s_pool_n = 0;
+
+void stub_pool_reset(void)              { s_pool_n = 0; }
+void stub_pool_seed(const ZapDevice* d) { if (d) { s_pool[0] = *d; s_pool_n = 1; } }
 
 void       zigbee_pool_lock() {}
 void       zigbee_pool_unlock() {}
-ZapDevice* pool_find_by_ieee(uint64_t ieee) { (void)ieee; return nullptr; }
-ZapDevice* pool_all() { return nullptr; }
-uint16_t   pool_count() { return 0; }
+ZapDevice* pool_find_by_ieee(uint64_t ieee) {
+    return (s_pool_n && s_pool[0].ieee_addr == ieee) ? &s_pool[0] : nullptr;
+}
+ZapDevice* pool_all()   { return s_pool_n ? s_pool : nullptr; }
+uint16_t   pool_count() { return s_pool_n; }
 
-// ── device_shadow: no cached attributes ──────────────────────────────────
+// ── device_shadow: no cached attributes; records optimistic writes ────────
 
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {
     (void)ieee; (void)out; (void)max_count;
@@ -202,7 +211,37 @@ bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
     return false;
 }
 
+// Recorder for the optimistic write the rule engine performs after a
+// successful zigbee.set (mirrors the webui SET_ATTRIBUTE path).
+static int      s_opt_count = 0;
+static uint64_t s_opt_ieee  = 0;
+static char     s_opt_key[32] = {0};
+static uint8_t  s_opt_vt    = 0;
+static int32_t  s_opt_val   = 0;
+
+void        stub_shadow_opt_reset(void) { s_opt_count = 0; s_opt_ieee = 0;
+                                          s_opt_key[0] = '\0'; s_opt_vt = 0; s_opt_val = 0; }
+int         stub_shadow_opt_count(void) { return s_opt_count; }
+uint64_t    stub_shadow_opt_ieee(void)  { return s_opt_ieee; }
+const char* stub_shadow_opt_key(void)   { return s_opt_key; }
+uint8_t     stub_shadow_opt_vt(void)    { return s_opt_vt; }
+int32_t     stub_shadow_opt_val(void)   { return s_opt_val; }
+
+void device_shadow_update_optimistic(uint64_t ieee, const char* key,
+                                     uint8_t val_type, int32_t int_val) {
+    s_opt_count++;
+    s_opt_ieee = ieee;
+    strncpy(s_opt_key, key ? key : "", sizeof(s_opt_key) - 1);
+    s_opt_key[sizeof(s_opt_key) - 1] = '\0';
+    s_opt_vt  = val_type;
+    s_opt_val = int_val;
+}
+
 // ── zhc_adapter / mqtt_gw: sinks ─────────────────────────────────────────
+// Send result is settable so a test can exercise the failure path (no
+// optimistic shadow write when the command never went out).
+static bool s_send_result = true;
+void stub_adapter_send_set_result(bool r) { s_send_result = r; }
 
 bool zhac_adapter_send_uint(uint64_t ieee, const char* model_id,
                             const char* manufacturer_name,
@@ -210,7 +249,7 @@ bool zhac_adapter_send_uint(uint64_t ieee, const char* model_id,
                             const char* key, uint64_t value) {
     (void)ieee; (void)model_id; (void)manufacturer_name;
     (void)nwk_addr; (void)dst_endpoint; (void)key; (void)value;
-    return true;
+    return s_send_result;
 }
 
 void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,

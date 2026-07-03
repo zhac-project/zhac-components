@@ -84,7 +84,32 @@ target_include_directories(simple_rules_bool_match_test PRIVATE
 
 target_compile_options(simple_rules_bool_match_test PRIVATE -Wall -Wextra -Werror)
 
+# Rule zigbee.set actions optimistically update the shadow (webui parity).
+add_executable(simple_rules_action_shadow_test
+    test_action_shadow.cpp
+    stubs/host_stubs.cpp
+    ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
+    ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/event_bus/event_bus.cpp
+)
+
+target_include_directories(simple_rules_action_shadow_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${COMPONENTS_DIR}/simple_rules/include
+    ${COMPONENTS_DIR}/event_bus/include
+    ${COMPONENTS_DIR}/rule_store/include
+    ${COMPONENTS_DIR}/zap_common/include
+    ${COMPONENTS_DIR}/zigbee_mgr/include
+    ${COMPONENTS_DIR}/device_shadow/include
+    ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/mqtt_gw/include
+    ${COMPONENTS_DIR}/cron_parser/include
+)
+
+target_compile_options(simple_rules_action_shadow_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
-add_test(NAME simple_rules_event_loop COMMAND simple_rules_event_loop_test)
-add_test(NAME simple_rules_integrity  COMMAND simple_rules_integrity_test)
-add_test(NAME simple_rules_bool_match COMMAND simple_rules_bool_match_test)
+add_test(NAME simple_rules_event_loop  COMMAND simple_rules_event_loop_test)
+add_test(NAME simple_rules_integrity   COMMAND simple_rules_integrity_test)
+add_test(NAME simple_rules_bool_match  COMMAND simple_rules_bool_match_test)
+add_test(NAME simple_rules_action_shadow COMMAND simple_rules_action_shadow_test)

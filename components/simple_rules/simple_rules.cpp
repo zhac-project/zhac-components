@@ -312,6 +312,21 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                                          static_cast<uint64_t>(int_val))) {
                 ESP_LOGW(TAG, "zigbee.set: no tz converter for '%s' key='%s'",
                          a.arg0, a.arg1);
+                break;
+            }
+            // Optimistic shadow update — mirrors the webui SET_ATTRIBUTE path
+            // (hap_dispatch.cpp). Many devices (esp. Tuya LED drivers) send no
+            // attribute report after a command-driven change, so without this a
+            // rule-issued zigbee.set never reflects in the shadow: the SPA
+            // reverts to the last-known value and the rule looks dead even
+            // though the device obeyed the (identical) command. A real report
+            // from the device later overrides this value. No-op unless the
+            // device's shadow config has optimistic==true.
+            if (a.arg1[0] != '\0') {
+                const uint8_t vt = (strcmp(a.arg1, "state") == 0) ? VAL_BOOL
+                                                                  : VAL_INT;
+                device_shadow_update_optimistic(snap.ieee_addr, a.arg1, vt,
+                                                 int_val);
             }
             break;
         }
