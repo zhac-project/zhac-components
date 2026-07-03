@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **simple_rules — Bool attributes now match `=1` / `=0` triggers.** The matcher
+  only folded `VAL_FLOAT` into the integer comparison domain, so a DSL literal
+  (parsed as `VAL_INT`) never matched a `VAL_BOOL` shadow value — the
+  `match_val_type != attr_vt` gate short-circuited before `compare_int` ran.
+  Every binary-expose trigger (occupancy, contact, water_leak, tamper) was
+  therefore silently dead: `ON dev#occupancy=1 DO ... ENDON` never fired even
+  though the shadow bridge already stores the bool as `int_val` 0/1. Fold
+  `VAL_BOOL`→`VAL_INT` like `VAL_FLOAT` so `#occupancy=1` / `=0` match a bool;
+  `VAL_STR` matching is unchanged (an int literal still can't match a string).
+  Adds host regression `test_bool_match`.
 - **device_shadow — bump NVS schema v8→v9 to clear stale `VAL_INT` floats on the
   `VAL_FLOAT` upgrade.** A pre-v9 shadow cache holds float temperatures/
   humidities as `VAL_INT` (×100); the type-driven encoders no longer unscale

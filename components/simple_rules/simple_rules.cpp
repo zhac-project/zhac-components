@@ -217,11 +217,16 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 
         if (t.op == CondOp::ANY || wildcard_attr) return true;
 
-        // A VAL_FLOAT attr stores value × 100 as an int — same comparison domain
-        // as VAL_INT (the DSL literal is the ×100 value too, e.g. `temperature>
-        // 2500` = 25.00), so match it as VAL_INT. BOOL/STR matching unchanged.
-        const uint8_t attr_vt = (ze.val_type == VAL_FLOAT) ? (uint8_t)VAL_INT
-                                                           : ze.val_type;
+        // VAL_FLOAT stores value × 100 as an int (the DSL literal is the ×100
+        // value too, e.g. `temperature>2500` = 25.00); VAL_BOOL stores 0/1 in
+        // int_val (the shadow bridge normalises the bool). Both share the
+        // integer comparison domain as VAL_INT, and DSL binary/numeric literals
+        // parse as VAL_INT — so fold both, letting `#occupancy=1` / `=0` match a
+        // bool attr. VAL_STR is unchanged (an int literal can't match a string).
+        const uint8_t attr_vt =
+            (ze.val_type == VAL_FLOAT || ze.val_type == VAL_BOOL)
+                ? (uint8_t)VAL_INT
+                : ze.val_type;
         if (t.match_val_type != attr_vt) return false;
 
         if (t.match_val_type == VAL_STR) {
