@@ -130,7 +130,7 @@ void hap_encode_stage1(const HapFrame& f, uint8_t out[HAP_STAGE1_LEN]) {
     uint16_t crc = hap_crc16(out, OFF_S1_HDR_CRC);
     out[OFF_S1_HDR_CRC]     = crc & 0xFF;
     out[OFF_S1_HDR_CRC + 1] = (crc >> 8) & 0xFF;
-    out[15] = 0;
+    out[HAP_STAGE1_LEN - 1] = 0;   // trailing pad byte (already zeroed by memset)
 }
 
 HapDecodeResult hap_decode_stage1(const uint8_t in[HAP_STAGE1_LEN], HapFrame& out) {
