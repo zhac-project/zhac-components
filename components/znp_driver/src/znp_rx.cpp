@@ -69,6 +69,8 @@ struct DupEntry {
     uint8_t  cmd1;
     uint32_t hash;
     uint32_t ts_ms;
+    bool     valid;   // false in an unwritten slot; distinguishes a cold slot
+                      // from a real entry stamped at tick 0 (boot).
 };
 static DupEntry s_dup_ring[DUP_RING_SIZE] = {};
 static uint8_t  s_dup_head = 0;
@@ -99,13 +101,13 @@ static bool areq_is_dup(const ZnpFrame& f) {
 
     for (uint8_t i = 0; i < DUP_RING_SIZE; i++) {
         const DupEntry& e = s_dup_ring[i];
-        if (e.ts_ms == 0) continue;
+        if (!e.valid) continue;
         if (e.cmd0 == f.cmd0 && e.cmd1 == f.cmd1 && e.hash == h
             && (now - e.ts_ms) < DUP_WINDOW_MS) {
             return true;
         }
     }
-    s_dup_ring[s_dup_head] = { f.cmd0, f.cmd1, h, now };
+    s_dup_ring[s_dup_head] = { f.cmd0, f.cmd1, h, now, true };
     s_dup_head = (uint8_t)((s_dup_head + 1) % DUP_RING_SIZE);
     return false;
 }
