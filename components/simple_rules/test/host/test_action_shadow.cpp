@@ -34,7 +34,7 @@ static int s_failures = 0;
     else      { printf("FAIL: %s\n", msg); s_failures++; }            \
 } while (0)
 
-static constexpr uint64_t kIeee = 0xa4c138d5f501d501ULL;
+static constexpr uint64_t kIeee = 0xaabbccddeeff0001ULL;   // synthetic test IEEE
 
 // Publish one decoded attribute as a ZCL_ATTR event (drives the matcher).
 static void publish_attr(const char* key, uint8_t vt, int32_t v) {

@@ -33,7 +33,7 @@ static Event make_attr_event(const char* key, uint8_t val_type,
     Event ev{};
     ev.type = EventType::ZCL_ATTR;
     auto& ze = *reinterpret_cast<ZclAttrEvent*>(ev.data);
-    ze.ieee = 0xa4c138d5f501d501ULL;   // arbitrary source device
+    ze.ieee = 0xaabbccddeeff0001ULL;   // synthetic test IEEE (arbitrary source)
     ze.val_type = val_type;
     std::strncpy(ze.key, key, ATTR_KEY_MAX - 1);
     ze.key[ATTR_KEY_MAX - 1] = '\0';
