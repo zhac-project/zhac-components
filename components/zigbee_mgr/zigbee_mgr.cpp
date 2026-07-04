@@ -148,27 +148,10 @@ static constexpr uint16_t NV_PRECFGKEYS_ENABLE   = 0x0063;
 static constexpr uint16_t NV_NIB                 = 0x0021;
 static constexpr uint16_t NV_ZNP_HAS_CONFIGURED  = 0x0F00;
 
-// ── NV item helpers (osalNvReadExt / osalNvWriteExt / osalNvItemInit) ────
-// osalNvReadExt (SYS 0x1C): payload = id(2 LE) + offset(2 LE)
-// Response = status(1) + len(1) + data[len]
-[[maybe_unused]] static bool nv_read(uint16_t id, uint16_t offset, uint8_t* out, uint8_t* out_len,
-                     uint8_t out_cap) {
-    uint8_t pl[4] = {(uint8_t)(id & 0xFF), (uint8_t)(id >> 8),
-                     (uint8_t)(offset & 0xFF), (uint8_t)(offset >> 8)};
-    MtFrame req{}; req.cmd0 = MT_SREQ(ZNP_SYS); req.cmd1 = 0x1C;
-    req.payload = pl; req.payload_len = sizeof(pl);
-    MtFrame rsp{};
-    if (!znp_sreq_retry(req, rsp, 3000, 3)) return false;
-    if (rsp.payload_len < 2 || rsp.payload[0] != 0x00) return false;
-    uint8_t n = rsp.payload[1];
-    if (n > out_cap) n = out_cap;
-    if (out && n) memcpy(out, rsp.payload + 2, n);
-    if (out_len) *out_len = n;
-    return true;
-}
+// ── NV item helpers (osalNvWriteExt / osalNvItemInit) ────────────────────
 
 // Forward decl — nv_write uses nv_item_init (defined below) to pre-create items on fresh NV.
-static bool nv_item_init_fwd(uint16_t id, uint16_t item_len, const uint8_t* init, uint8_t init_len);
+static bool nv_item_init(uint16_t id, uint16_t item_len, const uint8_t* init, uint8_t init_len);
 
 // osalNvWriteExt (SYS 0x1D): payload = id(2) + offset(2) + len(2) + data[len]
 static bool nv_write_raw(uint16_t id, const uint8_t* data, uint16_t len) {
@@ -190,7 +173,7 @@ static bool nv_write_raw(uint16_t id, const uint8_t* data, uint16_t len) {
 static bool nv_write(uint16_t id, const uint8_t* data, uint16_t len) {
     // Pre-create with same length+init value so first-boot works.
     uint8_t init_len = len > 128 ? 0 : (uint8_t)len;
-    if (!nv_item_init_fwd(id, len, data, init_len)) {
+    if (!nv_item_init(id, len, data, init_len)) {
         // non-fatal: item may already exist — proceed to write
     }
     if (nv_write_raw(id, data, len)) return true;
@@ -199,14 +182,8 @@ static bool nv_write(uint16_t id, const uint8_t* data, uint16_t len) {
 }
 
 // osalNvItemInit (SYS 0x07): payload = id(2) + itemlen(2) + initlen(1) + init[initlen]
-static bool nv_item_init_fwd(uint16_t id, uint16_t item_len,
-                              const uint8_t* init, uint8_t init_len);
 static bool nv_item_init(uint16_t id, uint16_t item_len,
                           const uint8_t* init, uint8_t init_len) {
-    return nv_item_init_fwd(id, item_len, init, init_len);
-}
-static bool nv_item_init_fwd(uint16_t id, uint16_t item_len,
-                              const uint8_t* init, uint8_t init_len) {
     uint8_t pl[5 + 128];
     if (init_len > 128) return false;
     pl[0] = id & 0xFF; pl[1] = id >> 8;
