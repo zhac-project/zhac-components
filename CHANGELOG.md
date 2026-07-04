@@ -9,6 +9,19 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **hap_session — retransmit no longer races slot payload reuse (REPORT.md B4).**
+  `hap_session_tick()` collected due retransmit frames under `s_mutex` but sent
+  them after releasing it, with each frame's `payload` still pointing into its
+  window slot's `payload_copy`. In that off-lock window an ACK could free the
+  slot (`hap_session_on_receive`) and a concurrent `hap_session_send()` reuse it,
+  `memcpy`-ing a fresh payload into the same buffer — so the in-flight retransmit
+  shipped the new bytes under the old frame's header with a valid CRC (a silent
+  torn frame on a loaded link). `tick()` now copies each due slot's payload into
+  a dedicated PSRAM scratch buffer *under the lock* and repoints the frame at the
+  scratch before sending, handling one slot per lock acquisition. The scratch is
+  allocated once in `hap_session_init` (one extra `HAP_MAX_PAYLOAD` buffer) and
+  is safe as a single shared buffer because `hap_session_tick()` has exactly one
+  caller per chip and is never re-entrant.
 - **simple_rules — `zigbee.set` rule actions now update the device shadow
   (web-UI parity).** A rule action sent the ZCL command but never wrote the
   shadow, unlike the web UI's SET_ATTRIBUTE path (`hap_dispatch.cpp`), which

@@ -65,6 +65,19 @@ static uint16_t           s_next_seq = 1;
 static HapSessionCfg      s_cfg;
 static SemaphoreHandle_t  s_mutex;
 
+// Scratch for hap_session_tick() retransmits. A retransmit frame must NOT go on
+// the wire while its `payload` still aliases a slot's payload_copy: the tick
+// releases s_mutex before calling send(), and in that window an ACK can free
+// the slot (hap_session_on_receive) and a concurrent hap_session_send() reuse
+// it — memcpy'ing a fresh payload into the SAME payload_copy buffer. The
+// in-flight retransmit would then ship those new bytes under the old frame's
+// header, with a valid CRC computed at send time (silent torn frame). tick()
+// copies the payload here UNDER the lock and repoints the frame at this scratch
+// before sending. One shared buffer is safe: hap_session_tick() has exactly one
+// caller per chip (S3: the hap_bridge master-recv loop; P4: TaskHAP) and is
+// never re-entrant. Allocated once in hap_session_init alongside the window.
+static uint8_t*           s_retx_scratch = nullptr;
+
 // Defect 3 (FINDINGS §1.3): dedup against re-dispatch of NEEDS_ACK frames on
 // peer retransmit. See README §"Receive-side dedup & sequence space" for the
 // authoritative description. Two complementary mechanisms:
@@ -242,6 +255,16 @@ void hap_session_init(const HapSessionCfg& cfg) {
         s_win[i].seq     = 0;
         s_win[i].retries = 0;
         s_win[i].sent_ms = 0;
+    }
+    if (first) {
+        // One extra slot-sized buffer for retransmit payloads (see s_retx_scratch).
+        s_retx_scratch = static_cast<uint8_t*>(
+            heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!s_retx_scratch) {
+            s_retx_scratch = static_cast<uint8_t*>(
+                heap_caps_malloc(SLOT_BUF_SIZE, MALLOC_CAP_8BIT));
+        }
+        configASSERT(s_retx_scratch);
     }
     ESP_LOGI(TAG, "win slots: %u × %zu B in PSRAM (%u KB)",
              WIN_SIZE, SLOT_BUF_SIZE,
@@ -470,12 +493,14 @@ void hap_session_on_receive(const HapFrame& frame) {
 //
 // Retransmit latency note (Qwen §5):
 //
-// Retransmits are collected under the mutex and sent afterwards. Worst case
-// under a degraded link: WIN_SIZE * frame_transit ≈ 8 * 3 ms = 24 ms of
-// synchronous work in the caller's task. task_hap tolerates this because
-// it's not a hot path (retransmits fire only when the peer is late to ACK).
-// If measurements ever show retransmit storms blocking REST, the fix is a
-// dedicated TX worker task fed by a queue; we haven't needed it.
+// Retransmits are sent one slot per lock acquisition — the slot's payload is
+// copied into s_retx_scratch under the mutex, then send() runs off-lock (never
+// under s_mutex). Worst case under a degraded link: WIN_SIZE * frame_transit ≈
+// 16 * 3 ms ≈ 48 ms of synchronous work in the caller's task. task_hap
+// tolerates this because it's not a hot path (retransmits fire only when the
+// peer is late to ACK). If measurements ever show retransmit storms blocking
+// REST, the fix is a dedicated TX worker task fed by a queue; we haven't needed
+// it.
 void hap_session_tick() {
     if (!s_mutex) return;  // tick scheduled before init — no-op until ready
     // int64 to match WinSlot.sent_ms (Defect 4): the timeout delta `ms -
@@ -485,35 +510,52 @@ void hap_session_tick() {
     int64_t ms = now_ms();
     bool link_dead_fired = false;
 
-    // Collect frames to retransmit outside the lock to avoid calling send() under mutex
-    HapFrame retransmit_frames[WIN_SIZE];
-    int retransmit_count = 0;
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    // One slot per lock acquisition. Each due frame's payload is copied into
+    // s_retx_scratch UNDER the lock and the frame repointed at the scratch
+    // before send() runs off-lock — otherwise the sent frame would alias the
+    // slot's payload_copy, which a concurrent ACK-free + hap_session_send()
+    // reuse can overwrite mid-flight (torn frame, valid CRC). Handling one slot
+    // at a time keeps a single shared scratch sufficient and avoids both
+    // holding the lock across send() and stack-reserving WIN_SIZE ×
+    // HAP_MAX_PAYLOAD (64 KB). Retransmits are the rare slow path, so the extra
+    // (uncontended) lock cycles per tick are negligible.
     for (int i = 0; i < WIN_SIZE; i++) {
+        HapFrame frame{};
+        bool due = false;
+
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
         WinSlot& ws = s_win[i];
-        if (!ws.active) continue;
-        if (ms - ws.sent_ms < ACK_TIMEOUT_MS) continue;
-
-        if (ws.retries >= MAX_RETRIES) {
-            ESP_LOGE(TAG, "link dead — seq=%u type=0x%02x (%u retransmits failed)",
-                     ws.seq, static_cast<uint8_t>(ws.frame.type),
-                     (unsigned)MAX_RETRIES);
-            ws.active = false;
-            link_dead_fired = true;
-            continue;
+        if (ws.active && (ms - ws.sent_ms >= ACK_TIMEOUT_MS)) {
+            if (ws.retries >= MAX_RETRIES) {
+                ESP_LOGE(TAG, "link dead — seq=%u type=0x%02x (%u retransmits failed)",
+                         ws.seq, static_cast<uint8_t>(ws.frame.type),
+                         (unsigned)MAX_RETRIES);
+                ws.active = false;
+                link_dead_fired = true;
+            } else {
+                ws.retries++;
+                ws.sent_ms = ms;
+                frame = ws.frame;
+                uint16_t n = ws.frame.payload_len;
+                if (n > 0 && ws.frame.payload) {
+                    // payload_len is bounded to SLOT_BUF_SIZE at send time; clamp
+                    // defensively so a corrupted slot can never overrun scratch.
+                    if (n > SLOT_BUF_SIZE) n = SLOT_BUF_SIZE;
+                    memcpy(s_retx_scratch, ws.payload_copy, n);
+                    frame.payload     = s_retx_scratch;
+                    frame.payload_len = n;
+                }
+                ESP_LOGW(TAG, "retransmit seq=%u type=0x%02x try=%d", ws.seq,
+                         static_cast<uint8_t>(ws.frame.type), ws.retries);
+                due = true;
+            }
         }
+        xSemaphoreGive(s_mutex);
 
-        ws.retries++;
-        ws.sent_ms = ms;
-        ESP_LOGW(TAG, "retransmit seq=%u type=0x%02x try=%d", ws.seq,
-                 static_cast<uint8_t>(ws.frame.type), ws.retries);
-        retransmit_frames[retransmit_count++] = ws.frame;
-    }
-    xSemaphoreGive(s_mutex);
-
-    for (int i = 0; i < retransmit_count; i++) {
-        s_cfg.send(retransmit_frames[i]);
+        // scratch holds this slot's payload until the next due slot overwrites
+        // it; this loop is the only writer (single tick caller), so sending here
+        // — after releasing the lock — is safe and keeps send() off the mutex.
+        if (due) s_cfg.send(frame);
     }
 
     // Call on_link_dead after the loop to avoid re-entrancy
