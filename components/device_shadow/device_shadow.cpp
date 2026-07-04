@@ -464,8 +464,12 @@ static void debounce_timer_cb(TimerHandle_t xTimer) {
 // every software timer in the firmware froze. Now lock-free: zero-timeout
 // enqueue; task_shadow does the locked work. On a full queue, fall back to a
 // per-entry flag the SWEEP_PERIOD_MS sweep picks up — nothing is dropped, the timeout
-// just lands one sweep late. Entry slots are never freed (the table is
-// append-only), so the unlocked flag store cannot dangle; same pattern as
+// just lands one sweep late. The unlocked flag store targets the entry through
+// the timer's ID pointer, which device_shadow_remove() keeps consistent — it
+// deletes a removed entry's timers before reclaiming the slot and re-points a
+// relocated entry's timer ID to the new address — so the store never lands on a
+// live but wrong entry (a store racing the reclaim hits the zeroed tail slot,
+// which find_or_create_entry re-zeroes on reuse). Same pattern as
 // debounce_pending_flush.
 static void occupancy_timeout_cb(TimerHandle_t timer) {
     DeviceShadowEntry* e = static_cast<DeviceShadowEntry*>(pvTimerGetTimerID(timer));
@@ -687,9 +691,10 @@ EXT_RAM_BSS_ATTR static uint8_t s_sweep_blob[sizeof(ShadowBlobHdr) + SHADOW_ATTR
 // entry: lock → flush/serialize into task-owned scratch + clear flags →
 // unlock → publish + flash write OUTSIDE the locks. Worst-case s_mutex hold
 // is one entry's RAM work; flash latency never blocks the lock. The table is
-// append-only (entries are never removed or compacted), so indices and
-// pointers stay valid across the unlock windows; s_count is re-read under
-// the lock each round.
+// NOT append-only — device_shadow_remove() swap-with-last-compacts it — so a
+// raw entry pointer must never be held across an unlock window: s_count and e
+// are re-read under the lock each round (below), and the failed-write retry
+// re-resolves the entry by ieee instead of reusing a stale pointer.
 static void task_shadow(void* arg) {
     ShadowTaskMsg msg{};
     for (;;) {
@@ -746,8 +751,15 @@ static void task_shadow(void* arg) {
             xSemaphoreGive(s_emit_mutex);
 
             if (blob_len > 0 && !nvs_write_attr_blob(ieee, s_sweep_blob, blob_len)) {
+                // Re-resolve by ieee under the lock — do NOT reuse `e`. During the
+                // unlocked flash write above, a concurrent device_shadow_remove()
+                // swap-with-last-compacts the table (no longer append-only), so
+                // &s_shadow[i] may now hold a different device or the wiped tail
+                // slot. find_entry() re-marks the correct entry, or no-ops if this
+                // device was removed mid-write (nothing left to persist).
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
-                e->nvs_dirty = true;   // entry slots are stable — e still valid
+                DeviceShadowEntry* re = find_entry(ieee);
+                if (re) re->nvs_dirty = true;
                 xSemaphoreGive(s_mutex);
             }
         }
