@@ -9,6 +9,18 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **simple_rules — `update()` preserves enabled state and rejects unknown ids
+  (REPORT.md §2.1).** `simple_rules_update()` persisted the edited rule with a
+  hardcoded `enabled=1` and called `rule_store_mark_dirty()` unconditionally,
+  before checking the rule existed. Two NVS bugs followed: (1) editing a
+  **disabled** rule silently re-enabled it on disk — the in-memory cache kept it
+  disabled, but a reboot reloaded it enabled and active; (2) `update()` of an
+  **unknown** `rule_id` persisted an orphan enabled rule (and returned success)
+  that surfaced on the next reload. `update()` now resolves the current enabled
+  state from the cache or the store, returns `false` for an unknown id (no
+  orphan), and persists the **preserved** flag. Host regression
+  `simple_rules_update_persist` covers both.
+
 - **hap_session — retransmit no longer races slot payload reuse (REPORT.md B4).**
   `hap_session_tick()` collected due retransmit frames under `s_mutex` but sent
   them after releasing it, with each frame's `payload` still pointing into its

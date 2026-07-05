@@ -704,9 +704,30 @@ bool simple_rules_update(uint16_t rule_id,
         xSemaphoreGiveRecursive(s_mutex);
         return false;
     }
+    // Resolve the rule's current enabled state and confirm it EXISTS before
+    // persisting. update() must not (a) resurrect a disabled rule by forcing
+    // enabled=1, nor (b) create an orphan when rule_id is unknown. A rule can
+    // live in the cache, or only in NVS (cache overflow at load — see the store
+    // fallback in simple_rules_delete).
+    int cache_idx = -1;
+    for (uint16_t i = 0; i < s_rule_count; i++) {
+        if (s_rules[i].rule_id == rule_id) { cache_idx = (int)i; break; }
+    }
+    uint8_t was_enabled;
+    if (cache_idx >= 0) {
+        was_enabled = s_rules[cache_idx].enabled ? 1 : 0;
+    } else {
+        RuleSlot existing{};
+        if (!rule_store_load(rule_id, &existing)) {
+            xSemaphoreGiveRecursive(s_mutex);
+            return false;   // unknown rule_id — do not persist an orphan
+        }
+        was_enabled = existing.enabled ? 1 : 0;
+    }
+
     RuleSlot slot{};
     slot.rule_id      = rule_id;
-    slot.enabled      = 1;
+    slot.enabled      = was_enabled;   // preserve current state, don't force-enable
     slot._reserved    = 0;
     slot.rule_type    = (uint8_t)RuleType::SIMPLE;
     slot.trigger_type = (uint8_t)r.trigger.type;
@@ -717,15 +738,11 @@ bool simple_rules_update(uint16_t rule_id,
     slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
     memcpy(slot.src, dsl, dsl_len);
     rule_store_mark_dirty(&slot);  // deferred NVS commit (see simple_rules_add)
-    for (uint16_t i = 0; i < s_rule_count; i++) {
-        if (s_rules[i].rule_id == rule_id) {
-            bool was_enabled = s_rules[i].enabled;
-            s_rules[i] = r;
-            s_rules[i].enabled = was_enabled;
-            simple_rules_resolve_names(&s_rules[i], 1);
-            cron_cache_invalidate();   // F27
-            break;
-        }
+    if (cache_idx >= 0) {
+        s_rules[cache_idx] = r;
+        s_rules[cache_idx].enabled = was_enabled;
+        simple_rules_resolve_names(&s_rules[cache_idx], 1);
+        cron_cache_invalidate();   // F27
     }
     xSemaphoreGiveRecursive(s_mutex);
     return true;

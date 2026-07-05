@@ -145,7 +145,18 @@ void vTaskDelay(TickType_t ticks) { (void)ticks; }
 static uint16_t s_store_ids[512];
 static uint16_t s_store_n = 0;
 
-void stub_rule_store_reset(void) { s_store_n = 0; }
+// Capture the most recent slot handed to rule_store_mark_dirty so tests can
+// assert exactly what simple_rules persisted — the id-only model above does not
+// retain slot fields like `enabled`.
+static RuleSlot s_last_dirty;
+static bool     s_last_dirty_valid = false;
+bool stub_rule_store_last_dirty(RuleSlot* out) {
+    if (!s_last_dirty_valid) return false;
+    if (out) *out = s_last_dirty;
+    return true;
+}
+
+void stub_rule_store_reset(void) { s_store_n = 0; s_last_dirty_valid = false; }
 void stub_rule_store_seed_id(uint16_t id) {
     if (s_store_n < (uint16_t)(sizeof(s_store_ids) / sizeof(s_store_ids[0])))
         s_store_ids[s_store_n++] = id;
@@ -166,6 +177,7 @@ void     rule_store_mark_dirty(const RuleSlot* slot) {
     // Record the create so a subsequent next_rule_id() sees it persisted,
     // mirroring the real writeback overlay being folded into rule_store_max_id.
     if (slot && !rule_store_load(slot->rule_id, nullptr)) stub_rule_store_seed_id(slot->rule_id);
+    if (slot) { s_last_dirty = *slot; s_last_dirty_valid = true; }
 }
 void     rule_store_mark_delete(uint16_t rule_id) {
     for (uint16_t i = 0; i < s_store_n; i++) {
