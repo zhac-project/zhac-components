@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **hap_session — reliability-layer host test.** New `test/host/` (controllable
+  virtual clock + mock transport callbacks, no ESP-IDF) covers the HAP session
+  layer: send + monotonic seq allocation (never 0, wrap-skip), NEEDS_ACK
+  windowing vs NO_ACK/SYNC bypass, ACK echo, dedup (duplicate seq → dispatched
+  once, re-ACKed), the retransmit ladder (1 retx / `ACK_TIMEOUT` × `MAX_RETRIES` →
+  `on_link_dead`), ACK-clears-window, `reset_link`, SYNC → `on_sync` + dedup
+  reset, sliding-window capacity, and the wrap-aware high-water dedup (pins the
+  `device.list`-wrap fix). 59 assertions. No behaviour change. (Note: `reset_link`
+  preserves the outbound seq counter + dedup ring — it does not emit SYNC; that
+  lives in the transport layer above.)
 - **zap_store — host coverage (reuses the rule_store in-memory NVS harness).**
   New `test_zap_store_matrix` (the existing host test only mirrored two predicates
   and didn't link the component) links the real `zap_store.cpp` +
