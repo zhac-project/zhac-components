@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **simple_rules — action-side host test.** New `test_action_matrix` exercises
+  `execute_rule`: `%value%` substitution (event value → the emitted set value),
+  `zigbee.set` value/key/type routing, `script.run` → the registered hook incl.
+  the `SimpleRulesScriptEvent` trigger context and quoted names, `event` emit
+  chaining into a second rule and the `MAX_EVENT_HOPS` self-feed cut (a
+  `ON Event#x DO … ; event x` loop terminates at 9 fires), multiple
+  `;`-separated actions, action parse rejections (missing arg / unknown verb /
+  empty `DO` / no `ENDON` / >4 actions), and the device-not-found +
+  toggle-without-cached-value no-ops. 18 assertions; registered as
+  `simple_rules_action_matrix` (host suite now 7 tests). No behaviour change.
 - **simple_rules — comprehensive condition-matrix host test.** New
   `test_condition_matrix` exercises the full matcher surface: every comparison
   operator (`=`, `!=`, `>`, `<`, `>=`, `<=`, ANY) on `VAL_INT` with below/equal/
