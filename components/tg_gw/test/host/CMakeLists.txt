@@ -33,5 +33,17 @@ add_executable(tg_gw_helpers_host_test
 
 target_compile_options(tg_gw_helpers_host_test PRIVATE -Wall -Wextra -Werror)
 
+# Characterization MATRIX: P4 accept-gates, cross-core token cap (F8-T19),
+# S3 compose (chat select / URL / body), parse_mode second gate, and the
+# json_escape edges the helpers test omits. Mirrors the pure fragments of
+# both TUs (neither links on the host); needs include/ for TG_TOKEN_MAX.
+add_executable(tg_gw_matrix_host_test
+    test_tg_gw_matrix.cpp
+)
+
+target_include_directories(tg_gw_matrix_host_test PRIVATE ../../include)
+target_compile_options(tg_gw_matrix_host_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME tg_gw_helpers_host COMMAND tg_gw_helpers_host_test)
+add_test(NAME tg_gw_matrix_host COMMAND tg_gw_matrix_host_test)

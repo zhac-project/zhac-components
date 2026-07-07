@@ -9,6 +9,14 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **tg_gw — Telegram gateway host test.** New `test_tg_gw_matrix` (the existing
+  host test pinned only two helpers) covers the P4 accept-gates
+  (`settoken`/`setchat`/`send` null/empty/length boundaries + optional
+  chat/parse_mode overrides), cross-core token-cap agreement (F8-T19), the S3
+  send-compose path (chat selection, URL + JSON body ±parse_mode), the parse_mode
+  whitelist as S3's second gate, and `json_escape` edge cases. 62 assertions. No
+  behaviour change. (Noted, not fixed: empty-token P4-vs-S3 asymmetry; parse_mode
+  length-vs-content two-stage split — both by design.)
 - **hap_protocol — pure host codec test.** New `test/host/` (no stubs — the codec
   is pure `<cstdint>`/`<cstring>`) covers the v3 encode↔decode round-trip + the
   full decode error ladder (`TRUNCATED` / `BAD_MAGIC` / `BAD_VERSION` /
