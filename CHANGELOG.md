@@ -9,6 +9,17 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **rule_store — host coverage via a from-scratch in-memory NVS harness.**
+  rule_store previously had only an on-device (`test/main`) test; a new
+  `test/host/` builds the real `rule_store.cpp` + `rule_store_flush.cpp` against
+  an in-memory NVS stub + minimal esp/FreeRTOS shims (no ESP-IDF needed).
+  `test_rule_store` covers save/load round-trip (all `RuleSlot` fields + CRC),
+  update-in-place (no duplicate), delete, `count`/`max_id`, `load_all` incl.
+  skipping a CRC-corrupt blob, schema-version mismatch wiping all rules on init,
+  and the write-coalescing overlay (`mark_dirty` visible to `load` before flush →
+  `flush_now` persists to NVS; `mark_delete` tombstones → `flush_now` removes).
+  22 assertions; the NVS stub is reusable for other NVS-backed components. No
+  behaviour change.
 - **cron_parser — comprehensive grammar/matching host test.** New
   `test_cron_matrix` (complementing `test_cron`'s over-length / leap-second
   regressions): field-count validation (5/6 accepted, 4/7 rejected), per-field
