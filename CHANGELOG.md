@@ -9,6 +9,20 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **device_shadow — host coverage (2 TUs over the shared NVS harness + real
+  event_bus/zap_store).** New `test/host/` covers the per-device shadow:
+  optimistic write → `get_attr`/`get_attrs` round-trip (INT/BOOL/FLOAT),
+  multi-key/multi-device isolation, in-place overwrite, `set`/`get_config` +
+  occupancy/debounce/throttle setters, find-only vs find-or-create semantics,
+  `clear_attrs` vs `remove`, the `shadow_pipeline` (upsert incl. STR, filter-drop,
+  `_last_seen`, debounce buffer→flush, occupancy-timer arm/disarm) + the pure
+  pipeline helpers, and persistence (config write-back, `restore_from_pool`
+  rehydration, CRC-guard rejection of corrupt blobs). 82 assertions.
+  Timer-service-driven firing (occupancy-TTL, debounce flush, sweep NVS write)
+  isn't host-runnable and is covered at the arm/disarm bookkeeping level only. No
+  behaviour change. (Noted: `update_optimistic`/`set_occupancy_timeout` are
+  find-only while `set_config`/`set_debounce`/`set_throttle` are find-or-create —
+  a mild API asymmetry.)
 - **hap_session — reliability-layer host test.** New `test/host/` (controllable
   virtual clock + mock transport callbacks, no ESP-IDF) covers the HAP session
   layer: send + monotonic seq allocation (never 0, wrap-skip), NEEDS_ACK
