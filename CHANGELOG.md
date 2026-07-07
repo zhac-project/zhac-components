@@ -7,6 +7,21 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Testing
+
+- **simple_rules — comprehensive condition-matrix host test.** New
+  `test_condition_matrix` exercises the full matcher surface: every comparison
+  operator (`=`, `!=`, `>`, `<`, `>=`, `<=`, ANY) on `VAL_INT` with below/equal/
+  above boundaries; `VAL_FLOAT` (stored ×100) and `VAL_BOOL` folded into the
+  integer domain; `VAL_STR` equality plus the deliberate rejection of ordered
+  ops on strings; int↔string type-mismatch guards; numeric-literal parse edges
+  (round-half-away, NaN/inf/out-of-int32 reject, negatives); the IEEE device
+  filter and the bare-`ON <device>` wildcard (and the parse-reject of a trailing
+  `#` with empty attr); and every non-DEVICE_ATTR trigger (`System#Boot`,
+  `Event#`, `Rules#Timer=`, `Mqtt#` incl. payload capture) plus cross-trigger-type
+  rejection. ~38 assertions; registered as `simple_rules_condition_matrix` in the
+  host CMake suite. No behaviour change.
+
 ### Fixed
 
 - **simple_rules — `update()` preserves enabled state and rejects unknown ids
