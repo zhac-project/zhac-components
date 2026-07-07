@@ -9,6 +9,17 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **cron_parser — comprehensive grammar/matching host test.** New
+  `test_cron_matrix` (complementing `test_cron`'s over-length / leap-second
+  regressions): field-count validation (5/6 accepted, 4/7 rejected), per-field
+  range boundaries (minute 0-59, hour 0-23, mday 1-31, month 1-12, wday 0-6,
+  second 0-59), syntax (`*/N`, `N-M`, `N-M/N`, comma lists; rejects `*/0`,
+  reversed ranges, non-numeric, named weekdays), per-field time matching incl.
+  the 5-field "second 0 only" rule, the POSIX DOM/DOW OR semantics (LUA-F4:
+  `0 8 1 * 1` fires the 1st **or** Monday; a `*` on either side gates by the
+  other), and `cron_next` (same-day slot, next-day wrap, impossible-date → 0).
+  TZ pinned to UTC for determinism; ~40 assertions; registered as
+  `cron_parser_matrix` (cron host suite now 2 tests). No behaviour change.
 - **simple_rules — DSL structural-grammar host test.** New `test_dsl_structure`
   covers the `ON <trigger> DO <actions> ENDON` grammar (complementing
   `test_integrity`'s numeric/overflow cases): every top-level `ParseResult` path

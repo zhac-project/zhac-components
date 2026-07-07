@@ -24,5 +24,16 @@ target_include_directories(cron_parser_host_test PRIVATE
 
 target_compile_options(cron_parser_host_test PRIVATE -Wall -Wextra -Werror)
 
+# Comprehensive grammar / matching / DOM-DOW / cron_next coverage.
+add_executable(cron_parser_matrix_test
+    test_cron_matrix.cpp
+    ${COMPONENTS_DIR}/cron_parser/cron_parser.cpp
+)
+target_include_directories(cron_parser_matrix_test PRIVATE
+    ${COMPONENTS_DIR}/cron_parser/include
+)
+target_compile_options(cron_parser_matrix_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
-add_test(NAME cron_parser_host COMMAND cron_parser_host_test)
+add_test(NAME cron_parser_host   COMMAND cron_parser_host_test)
+add_test(NAME cron_parser_matrix COMMAND cron_parser_matrix_test)
