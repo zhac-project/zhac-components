@@ -9,6 +9,20 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **hap_protocol — pure host codec test.** New `test/host/` (no stubs — the codec
+  is pure `<cstdint>`/`<cstring>`) covers the v3 encode↔decode round-trip + the
+  full decode error ladder (`TRUNCATED` / `BAD_MAGIC` / `BAD_VERSION` /
+  `BAD_HDR_CRC` / `OVERFLOW` / `CRC_ERROR`, in the decoder's own check order), the
+  v4 two-stage DMA form (stage-1 header round-trip + errors, stage-2
+  encode/verify), `hap_make_reply` correlation, and `hap_decode_stream` resync
+  past leading garbage. 22 assertions. No behaviour change.
+- **mqtt_gw — comprehensive topic/routing host test.** New `test_mqtt_gw_matrix`
+  (the existing host test covered only two security helpers) exercises the
+  root-topic module (default/set/trim/truncate/clear), `format_topic` join +
+  overflow, the `is_secure` scheme gate, publish prefixing + overflow-drop,
+  `mqtt_topic_ok` integration, and the QoS clamp. 46 assertions. No behaviour
+  change. (Noted, not fixed: empty-root prefixing diverges between `publish` and
+  `format_topic`; both strip only a single slash.)
 - **rule_store — host coverage via a from-scratch in-memory NVS harness.**
   rule_store previously had only an on-device (`test/main`) test; a new
   `test/host/` builds the real `rule_store.cpp` + `rule_store_flush.cpp` against

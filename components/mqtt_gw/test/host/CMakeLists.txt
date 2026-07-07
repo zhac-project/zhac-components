@@ -31,5 +31,14 @@ add_executable(mqtt_gw_helpers_host_test
 
 target_compile_options(mqtt_gw_helpers_host_test PRIVATE -Wall -Wextra -Werror)
 
+# Characterization matrix: root-topic module (get/set/format), is_secure
+# scheme gate, mqtt_gw_publish topic-prefixing/routing, and the QoS clamp.
+add_executable(mqtt_gw_matrix_host_test
+    test_mqtt_gw_matrix.cpp
+)
+
+target_compile_options(mqtt_gw_matrix_host_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME mqtt_gw_helpers_host COMMAND mqtt_gw_helpers_host_test)
+add_test(NAME mqtt_gw_matrix_host  COMMAND mqtt_gw_matrix_host_test)
