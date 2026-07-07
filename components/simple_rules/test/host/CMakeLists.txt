@@ -181,6 +181,31 @@ target_include_directories(simple_rules_action_matrix_test PRIVATE
 
 target_compile_options(simple_rules_action_matrix_test PRIVATE -Wall -Wextra -Werror)
 
+# Structural DSL-grammar coverage (ParseResult paths, field limits, trigger
+# types, friendly-name resolution).
+add_executable(simple_rules_dsl_structure_test
+    test_dsl_structure.cpp
+    stubs/host_stubs.cpp
+    ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
+    ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/event_bus/event_bus.cpp
+)
+
+target_include_directories(simple_rules_dsl_structure_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${COMPONENTS_DIR}/simple_rules/include
+    ${COMPONENTS_DIR}/event_bus/include
+    ${COMPONENTS_DIR}/rule_store/include
+    ${COMPONENTS_DIR}/zap_common/include
+    ${COMPONENTS_DIR}/zigbee_mgr/include
+    ${COMPONENTS_DIR}/device_shadow/include
+    ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/mqtt_gw/include
+    ${COMPONENTS_DIR}/cron_parser/include
+)
+
+target_compile_options(simple_rules_dsl_structure_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME simple_rules_event_loop  COMMAND simple_rules_event_loop_test)
 add_test(NAME simple_rules_integrity   COMMAND simple_rules_integrity_test)
@@ -189,3 +214,4 @@ add_test(NAME simple_rules_action_shadow COMMAND simple_rules_action_shadow_test
 add_test(NAME simple_rules_update_persist COMMAND simple_rules_update_persist_test)
 add_test(NAME simple_rules_condition_matrix COMMAND simple_rules_condition_matrix_test)
 add_test(NAME simple_rules_action_matrix COMMAND simple_rules_action_matrix_test)
+add_test(NAME simple_rules_dsl_structure COMMAND simple_rules_dsl_structure_test)

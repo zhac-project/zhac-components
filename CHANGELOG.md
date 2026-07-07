@@ -9,6 +9,18 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **simple_rules — DSL structural-grammar host test.** New `test_dsl_structure`
+  covers the `ON <trigger> DO <actions> ENDON` grammar (complementing
+  `test_integrity`'s numeric/overflow cases): every top-level `ParseResult` path
+  (`ERR_NO_ON` / `ERR_NO_DO` / `ERR_NO_ENDON` / `ERR_BAD_TRIGGER` / `OK`) incl.
+  the `ON ` and ` DO ` spacing rules + leading-whitespace tolerance; field-length
+  limits (attr_key ≤27, string value ≤47, trigger key ≤19 reject on overflow;
+  action args truncate to the buffer); trigger-type parse inspected on the public
+  `ParsedRule` (`DEVICE_ATTR` / `System#Boot` / `Time#Cron=` / `Event#` /
+  `Rules#Timer=` / `Mqtt#`); and friendly-name→IEEE resolution (a resolved name
+  filters by device, an unresolved name stays a wildcard). 26 assertions;
+  registered as `simple_rules_dsl_structure` (host suite now 8 tests). No
+  behaviour change.
 - **simple_rules — action-side host test.** New `test_action_matrix` exercises
   `execute_rule`: `%value%` substitution (event value → the emitted set value),
   `zigbee.set` value/key/type routing, `script.run` → the registered hook incl.
