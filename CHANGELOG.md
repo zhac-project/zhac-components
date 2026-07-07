@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **zap_store — host coverage (reuses the rule_store in-memory NVS harness).**
+  New `test_zap_store_matrix` (the existing host test only mirrored two predicates
+  and didn't link the component) links the real `zap_store.cpp` +
+  `zap_store_flush.cpp` against the shared in-memory NVS stub. Covers save/load
+  fidelity, in-place rewrite (no slot growth), multi-device slot allocation +
+  swap-with-last delete compaction, the `ZAP_MAX_DEVICES` ceiling, `load_devices`
+  guards, CRC32-corrupt skip, schema-version mismatch wipe, and the writeback
+  cache (immediate fallback + deferred `flush_now`/`flush_device`). 47
+  assertions. No behaviour change. (Noted: `delete_device` clears the in-RAM IEEE
+  index unconditionally, even on a not-found delete — benign.)
 - **tg_gw — Telegram gateway host test.** New `test_tg_gw_matrix` (the existing
   host test pinned only two helpers) covers the P4 accept-gates
   (`settoken`/`setchat`/`send` null/empty/length boundaries + optional
