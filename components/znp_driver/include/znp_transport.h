@@ -27,7 +27,10 @@ ZnpStatus znp_call(uint8_t cmd0, uint8_t cmd1,
                    ZnpFrame& srsp_out, uint32_t timeout_ms);
 
 // Register an AREQ handler. cmd0 must carry the AREQ type bits (0x40|subsys).
-// Multiple handlers can be registered for the same (cmd0,cmd1); all fire.
+// One handler per (cmd0,cmd1): re-subscribing the same pair REPLACES the
+// previous handler (last registration wins), and znp_areq_dispatch delivers
+// each frame to that single matching handler — it does NOT fan out. Every
+// current subscription uses a distinct pair, so this is sufficient.
 void znp_subscribe_areq(uint8_t cmd0, uint8_t cmd1, ZnpAreqHandler cb);
 
 // Synthesise an AREQ dispatch. Normal RX path calls this; exposed here

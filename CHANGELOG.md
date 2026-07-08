@@ -160,6 +160,14 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **znp_driver — corrected the `znp_subscribe_areq` doc contract.** The
+  `znp_transport.h` comment claimed "multiple handlers can be registered for the
+  same (cmd0,cmd1); all fire," but the implementation dedups by key — a
+  re-subscribe REPLACES the previous handler and `znp_areq_dispatch` delivers each
+  frame to the single matching handler (no fan-out). A caller audit confirmed all
+  five current subscriptions use distinct pairs, so there is no functional bug;
+  the comment now matches the implementation to avoid a future fan-out footgun.
+  (Surfaced by the new `znp_driver` host test.)
 - **simple_rules — `update()` preserves enabled state and rejects unknown ids
   (REPORT.md §2.1).** `simple_rules_update()` persisted the edited rule with a
   hardcoded `enabled=1` and called `rule_store_mark_dirty()` unconditionally,
