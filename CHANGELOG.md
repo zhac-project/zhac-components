@@ -7,6 +7,28 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Added
+
+- **simple_rules — value expressions in rule actions (Tier 2).** The `<value>` of
+  `zigbee.set` and the `<payload>` of `publish` now accept an integer expression
+  over `%value%` — `!%value%` (invert), `%value%/100` (scale), `(%value%*10)/3+5`
+  (full arithmetic: `+ - * / %`, parens, unary `-`/`!`, C precedence, spaces
+  allowed) — so one rule replaces the two-rule sensor→actuator pattern
+  (`ON door#contact DO zigbee.set lamp state !%value% ENDON`). New pure TU
+  `expr_eval.{h,cpp}`: non-recursive shunting-yard compiled ONCE at rule-add into
+  RPN bytecode (hard caps: 48 chars / 12 ops / paren depth 6 → rejected at save
+  with a readable error), evaluated per fire on a fixed 8-slot stack — no heap,
+  no recursion, no per-fire parsing; all arithmetic int64-then-clamp-to-int32 (no
+  UB). Literal `/0` rejects at save; a runtime zero divisor or a non-numeric
+  trigger value skips the action with a warning (nothing sent, shadow untouched).
+  Legacy literal + bare `%value%` values are byte-identical (compat pinned).
+  `ParsedRule` is transient (PSRAM, rebuilt from `src`) → zero NVS impact.
+  Tests: 60-assertion evaluator matrix under ASan+UBSan incl. a 20k-input fuzz
+  loop, +10 parse-level and +7 end-to-end assertions (suite 9/9). Docs:
+  `zhac-docs/RULES_DSL.md` §Value substitution & expressions. **HW-test-pending**
+  (rule engine runs on the P4 — reflash + live-rule check). Follow-up: mirror the
+  caps in the cloud `AutomationValidator` (private repo).
+
 ### Testing
 
 - **znp_driver — host coverage via a UART stub.** New `test/host/` covers the

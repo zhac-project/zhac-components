@@ -18,6 +18,7 @@ add_executable(simple_rules_event_loop_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -42,6 +43,7 @@ add_executable(simple_rules_integrity_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -66,6 +68,7 @@ add_executable(simple_rules_bool_match_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -90,6 +93,7 @@ add_executable(simple_rules_action_shadow_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -114,6 +118,7 @@ add_executable(simple_rules_update_persist_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -138,6 +143,7 @@ add_executable(simple_rules_condition_matrix_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -163,6 +169,7 @@ add_executable(simple_rules_action_matrix_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -188,6 +195,7 @@ add_executable(simple_rules_dsl_structure_test
     stubs/host_stubs.cpp
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -206,7 +214,22 @@ target_include_directories(simple_rules_dsl_structure_test PRIVATE
 
 target_compile_options(simple_rules_dsl_structure_test PRIVATE -Wall -Wextra -Werror)
 
+# Tier-2 value-expression evaluator — pure TU, no stubs. ASan+UBSan because
+# expr_compile parses REST/cloud-supplied text on the P4 (fuzz loop inside).
+add_executable(simple_rules_expr_test
+    test_expr_eval.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+)
+target_include_directories(simple_rules_expr_test PRIVATE
+    ${COMPONENTS_DIR}/simple_rules/include
+)
+target_compile_options(simple_rules_expr_test PRIVATE
+    -Wall -Wextra -Werror -fsanitize=address,undefined)
+target_link_options(simple_rules_expr_test PRIVATE
+    -fsanitize=address,undefined)
+
 enable_testing()
+add_test(NAME simple_rules_expr COMMAND simple_rules_expr_test)
 add_test(NAME simple_rules_event_loop  COMMAND simple_rules_event_loop_test)
 add_test(NAME simple_rules_integrity   COMMAND simple_rules_integrity_test)
 add_test(NAME simple_rules_bool_match  COMMAND simple_rules_bool_match_test)

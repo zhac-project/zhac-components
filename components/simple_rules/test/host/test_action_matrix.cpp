@@ -75,6 +75,18 @@ static void publish_attr(const char* key, uint8_t vt, int32_t v) {
     ze.int_val = v;
     event_bus_publish(ev);
 }
+static void publish_attr_str(const char* key, const char* sval) {
+    Event ev{};
+    ev.type = EventType::ZCL_ATTR;
+    auto& ze = *reinterpret_cast<ZclAttrEvent*>(ev.data);
+    ze.ieee = kIeee;
+    ze.val_type = VAL_STR;
+    std::strncpy(ze.key, key, ATTR_KEY_MAX - 1);
+    ze.key[ATTR_KEY_MAX - 1] = '\0';
+    std::strncpy(ze.str_val, sval, ATTR_STR_MAX - 1);
+    ze.str_val[ATTR_STR_MAX - 1] = '\0';
+    event_bus_publish(ev);
+}
 static void publish_rule_event(const char* name, uint8_t hop) {
     Event ev{};
     ev.type = EventType::RULE_EVENT;
@@ -234,6 +246,55 @@ int main() {
         uint16_t id = add("a8", "ON s8#occupancy=1 DO zigbee.toggle lamp state ENDON");
         publish_attr("occupancy", VAL_BOOL, 1); drain_attr();
         CHECK(stub_shadow_opt_count() == 0, "toggle with no cached shadow value is skipped");
+        simple_rules_delete(id);
+    }
+
+    // ── 9. Tier-2 value expressions (end-to-end through the engine) ──────
+    {
+        stub_shadow_opt_reset();
+        uint16_t id = add("x1", "ON s9#lux DO zigbee.set lamp brightness (%value%*10)/3+5 ENDON");
+        publish_attr("lux", VAL_INT, 25); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 &&
+              strcmp(stub_shadow_opt_key(), "brightness") == 0 &&
+              stub_shadow_opt_val() == 88,
+              "expression (25*10)/3+5 = 88 lands in the shadow");
+        simple_rules_delete(id);
+
+        stub_shadow_opt_reset();
+        id = add("x2", "ON s9#contact DO zigbee.set lamp state !%value% ENDON");
+        publish_attr("contact", VAL_BOOL, 1); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 &&
+              strcmp(stub_shadow_opt_key(), "state") == 0 &&
+              stub_shadow_opt_vt() == VAL_BOOL && stub_shadow_opt_val() == 0,
+              "!%value% inverts contact 1 -> state 0");
+        publish_attr("contact", VAL_BOOL, 0); drain_attr();
+        CHECK(stub_shadow_opt_count() == 2 && stub_shadow_opt_val() == 1,
+              "!%value% inverts contact 0 -> state 1");
+        simple_rules_delete(id);
+
+        // The ×100 float idiom: temperature 25.50 arrives as int 2550.
+        stub_shadow_opt_reset();
+        id = add("x3", "ON s9#temperature DO zigbee.set lamp level %value%/100 ENDON");
+        publish_attr("temperature", VAL_FLOAT, 2550); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 && stub_shadow_opt_val() == 25,
+              "%value%/100 scales a x100 float event to whole units");
+        simple_rules_delete(id);
+
+        // Runtime division by zero skips; nonzero divisor fires.
+        stub_shadow_opt_reset();
+        id = add("x4", "ON s9#x DO zigbee.set lamp level %value%/(%value%-1) ENDON");
+        publish_attr("x", VAL_INT, 1); drain_attr();
+        CHECK(stub_shadow_opt_count() == 0, "runtime division by zero skips the action");
+        publish_attr("x", VAL_INT, 3); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 && stub_shadow_opt_val() == 1,
+              "same rule fires when the divisor is nonzero");
+        simple_rules_delete(id);
+
+        // A string event value cannot feed a numeric expression.
+        stub_shadow_opt_reset();
+        id = add("x5", "ON s9#action DO zigbee.set lamp level %value%+1 ENDON");
+        publish_attr_str("action", "single"); drain_attr();
+        CHECK(stub_shadow_opt_count() == 0, "string event value skips a numeric expression");
         simple_rules_delete(id);
     }
 

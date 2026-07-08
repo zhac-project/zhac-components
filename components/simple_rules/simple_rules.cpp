@@ -10,6 +10,8 @@
 #include "device_shadow.h"
 #include "cron_parser.h"
 #include "esp_log.h"
+#include <cerrno>    // strtol range check in resolve_action_value
+#include <cstdlib>
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
@@ -170,6 +172,36 @@ static void expand_value(const char* src, const char* val,
              (int)before, src, val, p + strlen(needle));
 }
 
+// Tier-2: resolve an action VALUE — a compiled %value% expression or the
+// legacy expand_value path. Returns false when the action must be SKIPPED
+// (non-numeric trigger value feeding a numeric expression, or a runtime
+// division/modulo by zero); a skipped action sends nothing and writes no
+// optimistic shadow value.
+static bool resolve_action_value(const RuleAction& a, const char* legacy_arg,
+                                 const char* event_val,
+                                 char* out, size_t out_size) {
+    if (!a.has_expr) {
+        expand_value(legacy_arg, event_val, out, out_size);
+        return true;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const long v = strtol(event_val, &end, 10);
+    if (end == event_val || *end != '\0' || errno == ERANGE ||
+        (int64_t)v > INT32_MAX || (int64_t)v < INT32_MIN) {
+        ESP_LOGW(TAG, "value expression: non-numeric trigger value '%s' — action skipped",
+                 event_val);
+        return false;
+    }
+    int32_t res = 0;
+    if (!expr_eval(a.expr, (int32_t)v, res)) {
+        ESP_LOGW(TAG, "value expression failed (division by zero?) — action skipped");
+        return false;
+    }
+    snprintf(out, out_size, "%ld", (long)res);
+    return true;
+}
+
 // ── Value comparison ──────────────────────────────────────────────────────
 
 // Compare two pre-parsed int values using a conditional operator.
@@ -275,7 +307,9 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
 
         case ActionType::ZIGBEE_SET: {
             char val_buf[32];
-            expand_value(a.arg2, event_val, val_buf, sizeof(val_buf));
+            if (!resolve_action_value(a, a.arg2, event_val,
+                                      val_buf, sizeof(val_buf)))
+                break;   // expression skip — send nothing, shadow untouched
 
             // F35 (FINDINGS.md): resolve under the pool lock and snapshot
             // the device — never hold a raw pool pointer across the blocking
@@ -392,7 +426,9 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
 
         case ActionType::PUBLISH: {
             char payload_buf[64];
-            expand_value(a.arg1, event_val, payload_buf, sizeof(payload_buf));
+            if (!resolve_action_value(a, a.arg1, event_val,
+                                      payload_buf, sizeof(payload_buf)))
+                break;   // expression skip — publish nothing
             mqtt_gw_publish(a.arg0, payload_buf, strlen(payload_buf),
                             0, false);
             break;

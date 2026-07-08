@@ -156,6 +156,45 @@ int main() {
         simple_rules_delete(id);
     }
 
+    // ── E. Tier-2 value expressions (parse level) ─────────────────────────
+    {
+        ParsedRule r{};
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp state !%value% ENDON", 1, &r) == ParseResult::OK &&
+              r.actions[0].has_expr,
+              "!%value% compiles as a value expression");
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp brightness (%value%*10)/3+5 ENDON", 1, &r) == ParseResult::OK &&
+              r.actions[0].has_expr,
+              "parenthesised expression accepted");
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp brightness ( %value% * 10 ) / 3 + 5 ENDON", 1, &r) == ParseResult::OK &&
+              r.actions[0].has_expr,
+              "expression with spaces spans the whole value tail");
+        // Compat: literal + bare passthrough stay on the legacy path.
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp state 1 ENDON", 1, &r) == ParseResult::OK &&
+              !r.actions[0].has_expr && strcmp(r.actions[0].arg2, "1") == 0,
+              "literal value unchanged (no expression)");
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp state %value% ENDON", 1, &r) == ParseResult::OK &&
+              !r.actions[0].has_expr && strcmp(r.actions[0].arg2, "%value%") == 0,
+              "bare %value% passthrough unchanged");
+        // publish payload gets the same treatment.
+        CHECK(dsl_parse("ON x#a=1 DO publish home/x %value%*2 ENDON", 1, &r) == ParseResult::OK &&
+              r.actions[0].has_expr,
+              "publish payload expression compiles");
+        CHECK(dsl_parse("ON x#a=1 DO publish home/x hello ENDON", 1, &r) == ParseResult::OK &&
+              !r.actions[0].has_expr && strcmp(r.actions[0].arg1, "hello") == 0,
+              "publish literal payload unchanged");
+        // Rejects surface at rule-add.
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp state %value%/0 ENDON", 1, &r) != ParseResult::OK,
+              "literal /0 expression rejected at add");
+        CHECK(dsl_parse("ON x#a=1 DO zigbee.set lamp state %value%) ENDON", 1, &r) != ParseResult::OK,
+              "malformed expression rejected at add");
+        {
+            std::string big = "ON x#a=1 DO zigbee.set lamp state %value%+" +
+                              std::string(48, '1') + " ENDON";
+            CHECK(dsl_parse(big.c_str(), 1, &r) != ParseResult::OK,
+                  "over-long value expression rejected at add");
+        }
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

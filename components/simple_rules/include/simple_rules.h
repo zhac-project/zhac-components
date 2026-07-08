@@ -5,6 +5,7 @@
 #include "rule_store.h"
 #include "event_bus.h"
 #include "zcl_attribute.h"
+#include "expr_eval.h"
 #include <cstdint>
 #include <stdbool.h>
 
@@ -70,6 +71,13 @@ struct RuleAction {
     char       arg0[32];  // device ref / topic / event name / message
     char       arg1[20];  // attr key / payload / timer index
     char       arg2[20];  // attr value
+    // Tier-2 value expression (extra/docs/2026-07-08-simple-rules-expr-tier2-plan.md):
+    // when the VALUE argument of zigbee.set / publish uses %value% beyond the
+    // bare passthrough, it is compiled ONCE here at parse time and evaluated
+    // per fire. ParsedRule is transient (rebuilt from RuleSlot.src on load and
+    // heap-allocated in PSRAM), so this costs no NVS and no internal DRAM.
+    bool       has_expr;
+    ExprProg   expr;
 };
 
 struct ParsedRule {

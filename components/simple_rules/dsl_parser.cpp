@@ -250,6 +250,46 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
     return ParseResult::OK;
 }
 
+// ── Tier-2 value argument (zigbee.set / publish) ──────────────────────────
+// The VALUE is the rest of the action segment. If it contains %value% beyond
+// the bare passthrough, it is compiled ONCE here as an expression (spaces
+// allowed inside — see expr_eval.h); otherwise the FIRST token is copied into
+// `dst` with the legacy copy_token semantics, so existing literal / bare
+// %value% rules stay byte-identical.
+static ParseResult parse_value_arg(const char* s, RuleAction* a,
+                                   char* dst, size_t dst_cap) {
+    s = skip_ws(s);
+    size_t tlen = strlen(s);
+    while (tlen > 0 && (s[tlen - 1] == ' ' || s[tlen - 1] == '\t')) tlen--;
+
+    // Probe window is deliberately > EXPR_TEXT_MAX so an over-long expression
+    // is DETECTED and rejected instead of silently truncating into a
+    // different-but-parseable one (the P2-T18 clamp lesson).
+    char tail[128];
+    const size_t probe = (tlen < sizeof(tail) - 1) ? tlen : sizeof(tail) - 1;
+    memcpy(tail, s, probe);
+    tail[probe] = '\0';
+
+    if (strstr(tail, "%value%") != nullptr && strcmp(tail, "%value%") != 0) {
+        if (tlen > EXPR_TEXT_MAX) {
+            dsl_set_err("value expression too long (max %u)",
+                        (unsigned)EXPR_TEXT_MAX);
+            return ParseResult::ERR_BAD_ACTION;
+        }
+        char err[64] = {};
+        if (!expr_compile(tail, a->expr, err, sizeof err)) {
+            dsl_set_err("bad value expression: %s", err);
+            return ParseResult::ERR_BAD_ACTION;
+        }
+        a->has_expr = true;
+        strncpy(dst, tail, dst_cap - 1);   // truncated copy for display/debug
+        dst[dst_cap - 1] = '\0';
+        return ParseResult::OK;
+    }
+    copy_token(s, ' ', dst, dst_cap);
+    return ParseResult::OK;
+}
+
 // ── Action parsing ────────────────────────────────────────────────────────
 
 static ParseResult parse_action(const char* s, RuleAction* a) {
@@ -266,9 +306,7 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
         s = skip_ws(s);
         s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
-        s = skip_ws(s);
-        s = copy_token(s, ' ', a->arg2, sizeof(a->arg2));
-        return ParseResult::OK;
+        return parse_value_arg(s, a, a->arg2, sizeof(a->arg2));
     }
     if (strncmp(s, "zigbee.toggle ", 14) == 0) {
         a->type = ActionType::ZIGBEE_TOGGLE;
@@ -283,9 +321,7 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         a->type = ActionType::PUBLISH;
         s += 8; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
-        s = skip_ws(s);
-        s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
-        return ParseResult::OK;
+        return parse_value_arg(s, a, a->arg1, sizeof(a->arg1));
     }
     if (strncmp(s, "event ", 6) == 0) {
         a->type = ActionType::EVENT;
