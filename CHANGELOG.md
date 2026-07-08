@@ -9,6 +9,22 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **znp_driver — host coverage via a UART stub.** New `test/host/` covers the
+  host-tractable ZNP/MT transport layers: the MT wire codec (`znp_mt_fcs`,
+  `znp_mt_encode`, the streaming byte-parser — encode↔parse round-trip incl.
+  empty / 250-byte max, garbage-skip + resync, bad-FCS drop + `bad_frames` stat,
+  truncation, over-length LEN, doubled-SOF), the `znp_is_expected_srsp` +
+  wire-key-redaction predicates, AREQ dispatch (match / multi-subscriber /
+  no-match), the confirm ring (ring-full=16 + `-1` sentinel, synchronous confirm
+  delivery via an injected AF_DATA_CONFIRM, timeout, wrong-tid, short-payload),
+  and the `znp_state` stat/state machine. 74 assertions. The worker-task
+  SREQ/SRSP round-trip + RX/UART pump are integration-shaped (the RX task doesn't
+  tick on host) and skipped — the recording UART stub is in place to add them
+  later. No behaviour change. **Found (not fixed — flag for triage):
+  AREQ-subscription doc/impl mismatch** — `znp_transport.h` +
+  `znp_areq_dispatch.cpp` docs say multiple handlers for the same `(cmd0,cmd1)`
+  "all fire," but the implementation dedups by key (last-registered wins); the
+  test pins the real last-wins behaviour.
 - **zigbee_mgr — host coverage via a mocked ZNP transport (largest component,
   4169 LOC).** New `test/host/` mocks the ZNP seam (`znp_sreq*` /
   `znp_register_areq` / `znp_confirm_*` at the MtFrame level — programmable SRSP +
