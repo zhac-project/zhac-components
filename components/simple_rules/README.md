@@ -39,19 +39,26 @@ the scripting engine.
 ## DSL at a glance
 
 ```
-ON Rules#Boot DO log "controller up" ENDON
-ON Rules#Cron="*/5 * * * *" DO event "heartbeat" ENDON
-ON Sensor.action == "single"
-   DO zigbee.set "hallway light" state 1
-   DO timer 0 300000
-ENDON
-ON Rules#Timer=0 DO zigbee.set "hallway light" state 0 ENDON
+ON System#Boot DO log controller up ENDON
+ON Time#Cron=0 */5 * * * * DO event heartbeat ENDON
+ON sensor#action="single" DO zigbee.set hallway_light state 1 ; timer 1 300000 ENDON
+ON Rules#Timer=1 DO zigbee.set hallway_light state 0 ENDON
+ON door#contact DO zigbee.set hallway_light state !%value% ENDON
+ON room#temperature DO publish home/temp/c %value%/100 ENDON
 ```
 
-Full grammar in `docs/RULES_DSL.md`. Triggers: `DEVICE_ATTR`,
+Full grammar in `zhac-docs/RULES_DSL.md`. Triggers: `DEVICE_ATTR`,
 `TIME_CRON`, `BOOT`, `EVENT`, `TIMER`, `MQTT_TOPIC`. Actions:
-`ZIGBEE_SET`, `PUBLISH`, `EVENT`, `TIMER`, `LOG`, `SCRIPT`.
-Comparison ops: `ANY`, `==`, `!=`, `>`, `<`, `>=`, `<=`.
+`ZIGBEE_SET`, `ZIGBEE_TOGGLE`, `PUBLISH`, `EVENT`, `TIMER`, `LOG`, `SCRIPT`.
+Comparison ops: `ANY` *(no operator)*, `=`, `!=`, `>`, `<`, `>=`, `<=`.
+Action device names are a single token — quotes are NOT stripped.
+
+`zigbee.set` values and `publish` payloads accept `%value%` (the trigger
+value) or an integer expression over it — `!%value%`, `%value%/100`,
+`(%value%*10)/3+5` — compiled once at rule save by `expr_eval.cpp` (caps
+48 chars / 12 ops / 6 parens reject at save; a runtime zero divisor or a
+non-numeric trigger value skips the action). See `zhac-docs/RULES_DSL.md`
+§"Value substitution & expressions".
 
 ## Public API (`include/simple_rules.h`)
 
@@ -97,6 +104,7 @@ Comparison ops: `ANY`, `==`, `!=`, `>`, `<`, `>=`, `<=`.
 | `MAX_EVENT_HOPS` | 8 | TTL for rule→rule `RULE_EVENT` chains, carried per-payload (`RuleEventPayload.hop`) — cuts self-feeding loops |
 | `MAX_CRON_FIRES` | 16 | cap on rules that can fire in one minute |
 | `RuleAction.arg{0,1,2}` | 32/20/20 | scratch space for device ref / payload / value |
+| `RuleAction.expr` | `ExprProg`, ≤12 RPN ops | compiled `%value%` expression (`expr_eval.h`) — set when the value arg is an expression; transient (PSRAM), never persisted |
 | `ParsedRule` | 4 actions per rule | `actions[4]` array |
 | Mutex acquire timeout | 2 s (cron snapshot) / 500 ms (per-fire), `portMAX_DELAY` only for init/reload |
 
