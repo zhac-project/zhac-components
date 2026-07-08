@@ -9,6 +9,26 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Testing
 
+- **zigbee_mgr — host coverage via a mocked ZNP transport (largest component,
+  4169 LOC).** New `test/host/` mocks the ZNP seam (`znp_sreq*` /
+  `znp_register_areq` / `znp_confirm_*` at the MtFrame level — programmable SRSP +
+  AREQ injection) and links the 12 real zigbee_mgr TUs + event_bus / zap_store /
+  device_shadow over the reused NVS/esp/freertos stubs. 197 assertions:
+  **zigbee_pool** fully (add / find_by_ieee / find_by_nwk / swap-compaction
+  remove / capacity / recursive lock / mark_dirty nwk-reindex); **zcl_commands**
+  fully — every builder (on/off, level, color-temp, permit-join, bind/unbind,
+  leave, read, write, configure-report, cluster-command incl. flags, tuya,
+  miboxer, default-response) asserted against the exact recorded MtFrame, plus
+  SRSP-status / no-SRSP / MAC-confirm-timeout / null-input failure gates;
+  `restore_persisted`; and the **state machine** (scripted init ladder →
+  coordinator IEEE, device-join / rejoin / ZDO-leave AREQ → pool, post-init reset
+  → `crashed()`). FreeRTOS-worker-driven paths (configure-queue drain, deferred
+  interview read ladder, zcl-attr decode task) don't tick on host and are covered
+  at their synchronous surface only. No behaviour change; `-Wno-*` / `-include
+  cstddef` scoped to the production TUs via `set_source_files_properties` (test +
+  stubs stay strict). Noted: `zigbee_mgr.h` uses bare `size_t` without
+  `<cstddef>` (latent host-portability nit); confirmed the no-blind-retry fix on
+  MAC-confirm timeout; characterized the `mark_dirty` nwk-index hazard.
 - **device_shadow — host coverage (2 TUs over the shared NVS harness + real
   event_bus/zap_store).** New `test/host/` covers the per-device shadow:
   optimistic write → `get_attr`/`get_attrs` round-trip (INT/BOOL/FLOAT),
