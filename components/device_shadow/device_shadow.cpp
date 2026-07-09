@@ -410,13 +410,15 @@ static void stage_attrs(const DeviceShadowEntry* e, const ZclAttribute* attrs, u
 }
 
 // Caller holds s_emit_mutex (asserted) and must have RELEASED s_mutex.
-// Publishes the staged attrs and resets the buffer.
-static void publish_staged() {
+// Publishes the staged attrs and resets the buffer. `type` selects the event
+// type: ZCL_ATTR for confirmed device reports (default), SHADOW_OPTIMISTIC for
+// command-driven optimistic writes (relayed to the gateway but not to rules).
+static void publish_staged(EventType type = EventType::ZCL_ATTR) {
     configASSERT(xSemaphoreGetMutexHolder(s_emit_mutex) == xTaskGetCurrentTaskHandle());
     for (uint8_t i = 0; i < s_staged.count; i++) {
         const ZclAttribute& a = s_staged.attrs[i];
         Event ev{};
-        ev.type = EventType::ZCL_ATTR;
+        ev.type = type;
         ZclAttrEvent* payload = reinterpret_cast<ZclAttrEvent*>(ev.data);
         payload->ieee     = s_staged.ieee;
         payload->val_type = a.val_type;
@@ -937,14 +939,30 @@ void device_shadow_process(const ZapDevice* dev,
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,
                                      uint8_t val_type, int32_t int_val)
 {
+    if (!key) return;
+    // Update the cache AND publish a SHADOW_OPTIMISTIC event so the value
+    // reaches the HAP forwarder → S3 gateway → local webui + cloud. A no-report
+    // device (Tuya LED driver) sends no attribute report after a command, so
+    // without this the optimistic value stays trapped in the P4 cache and the
+    // cloud webUI never reflects the change. The event type is
+    // SHADOW_OPTIMISTIC, not ZCL_ATTR, so the rule engine (ZCL_ATTR-only) never
+    // fires on an unconfirmed value. Emit protocol (see the s_emit_mutex note
+    // above): s_emit_mutex outermost, held across stage + publish; s_mutex is
+    // released before publish_staged().
+    xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
-    if (e && key) {
+    bool staged = false;
+    if (e) {
         ZclAttribute a{};
         zcl_attr_set_int(&a, key, int_val, static_cast<ValType>(val_type));
         upsert_cache(e, &a, 1);
+        stage_attrs(e, &a, 1);
+        staged = true;
     }
     xSemaphoreGive(s_mutex);
+    if (staged) publish_staged(EventType::SHADOW_OPTIMISTIC);
+    xSemaphoreGive(s_emit_mutex);
 }
 
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {

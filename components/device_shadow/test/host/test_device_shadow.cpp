@@ -214,6 +214,40 @@ int main() {
         CHECK(device_shadow_get_attrs(A, all, 8) == 3, "overwrite did NOT add a new slot (still 3)");
     }
 
+    // ── G2b: optimistic write EMITS SHADOW_OPTIMISTIC (the HAP → cloud/local
+    //    push) but NOT ZCL_ATTR (which the rule engine subscribes to). Without
+    //    this event a no-report device (Tuya LED) never reflects a command-
+    //    driven change past the P4 cache — the cloud webUI stays stale.
+    //    This harness's queue stub is a no-op (event *delivery* is covered in
+    //    the event_bus suite), so probe the publish synchronously via a
+    //    subscriber FILTER — it runs in the publisher's task, before the
+    //    (stubbed) enqueue, so it observes the emit without a live queue.
+    {
+        printf("\nG2b optimistic emit: SHADOW_OPTIMISTIC yes, ZCL_ATTR no\n");
+        const uint64_t A = 0x00A1ULL;   // known device from G1
+
+        ZclAttrEvent got{};
+        int opt_seen = 0, zcl_seen = 0;
+        auto noop = [](const Event&){};
+        EventSubHandle opt = event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, noop,
+            [&](const Event& e){ opt_seen++; got = *reinterpret_cast<const ZclAttrEvent*>(e.data); return false; });
+        EventSubHandle zcl = event_bus_subscribe(EventType::ZCL_ATTR, noop,
+            [&](const Event&){ zcl_seen++; return false; });
+
+        device_shadow_update_optimistic(A, "state", VAL_BOOL, 1);
+        CHECK(opt_seen == 1, "optimistic write publishes exactly one SHADOW_OPTIMISTIC event");
+        CHECK(got.ieee == A && strcmp(got.key, "state") == 0 &&
+              got.val_type == VAL_BOOL && got.int_val == 1,
+              "SHADOW_OPTIMISTIC payload carries ieee/key/type/value");
+        CHECK(zcl_seen == 0, "optimistic write emits NO ZCL_ATTR (rule engine won't self-trigger)");
+
+        device_shadow_update_optimistic(0x0DEADULL, "state", VAL_BOOL, 1);  // unknown → find-only
+        CHECK(opt_seen == 1, "unknown device: no optimistic emit");
+
+        event_bus_unsubscribe(opt);   // filters capture block-locals — remove before they dangle
+        event_bus_unsubscribe(zcl);
+    }
+
     // ── G3: isolation by IEEE + unknown-device reads ───────────────────────
     {
         printf("\nG3 multi-device isolation\n");

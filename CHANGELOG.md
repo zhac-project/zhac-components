@@ -31,6 +31,19 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **device_shadow — optimistic (command-driven) state changes now reach the S3
+  gateway + cloud.** `device_shadow_update_optimistic()` used to write only the
+  cache and emit no event, so for a no-report device (Tuya LED driver, which
+  sends no attribute report after a command) the new state never propagated past
+  the P4 cache — the cloud webUI stayed stale while a self-reporting device
+  (e.g. a socket) updated fine. It now publishes a new `EventType::SHADOW_OPTIMISTIC`
+  event carrying the same `ZclAttrEvent` payload: the HAP forwarder relays it to
+  the S3 gateway → local webui + cloud, while the rule engine (which subscribes
+  to `ZCL_ATTR` only) ignores it, so an unconfirmed optimistic value never
+  self-triggers automations. `publish_staged()` gained a `type` parameter;
+  `EventType::_COUNT` is 12. Host test G2b (device_shadow) probes the emit via a
+  synchronous subscriber filter. Pairs with the main-core `hap_dispatch`
+  subscription. **HW-test-pending** (P4 reflash + on-device cloud check).
 - **simple_rules — boot stack overflow on the P4 main task (regression from the
   Tier-2 expression work above).** Embedding `ExprProg` by value in each of
   `RuleAction`'s four slots grew `ParsedRule` to ~0.9 KB. `reload_locked()` staged

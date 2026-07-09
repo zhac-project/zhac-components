@@ -17,6 +17,14 @@ enum class EventType : uint8_t {
     MQTT_MSG         = 8,   // MQTT message received
     RULE_EVENT       = 9,   // custom named event (rule chaining)
     RULE_TIMER_FIRE  = 10,  // rule timer N fired
+    // Optimistic (command-driven, unconfirmed) shadow change. Carries the
+    // ZclAttrEvent payload, same as ZCL_ATTR, but on a distinct type so the
+    // HAP forwarder relays it to the S3 gateway (→ local webui + cloud) while
+    // the rule engine — which subscribes to ZCL_ATTR only — never fires on an
+    // unconfirmed value. Emitted by device_shadow_update_optimistic() for
+    // no-report devices (Tuya LED drivers) that otherwise never reflect a
+    // command past the P4 cache.
+    SHADOW_OPTIMISTIC = 11,
 
     // Sentinel — one past the highest valid type. Sizes the subscriber
     // table (event_bus.cpp); NOT a publishable type. Keep last. Source-only
