@@ -184,11 +184,14 @@ static bool resolve_action_value(const RuleAction& a, const char* legacy_arg,
         expand_value(legacy_arg, event_val, out, out_size);
         return true;
     }
+    // strtoll, not strtol: long is 32-bit on the ESP32 targets, which would
+    // both truncate and make the range guard an always-false comparison
+    // (-Werror=type-limits on the IDF build).
     char* end = nullptr;
     errno = 0;
-    const long v = strtol(event_val, &end, 10);
+    const long long v = strtoll(event_val, &end, 10);
     if (end == event_val || *end != '\0' || errno == ERANGE ||
-        (int64_t)v > INT32_MAX || (int64_t)v < INT32_MIN) {
+        v > INT32_MAX || v < INT32_MIN) {
         ESP_LOGW(TAG, "value expression: non-numeric trigger value '%s' — action skipped",
                  event_val);
         return false;
