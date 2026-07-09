@@ -110,6 +110,16 @@ static uint16_t next_rule_id() {
     return 0;
 }
 
+// Regression guard for the 2026-07-09 boot stack overflow (main task = 3584 B).
+// ParsedRule carries 4 RuleActions, each embedding an ExprProg, so it is large.
+// reload_locked() keeps it OFF the stack by parsing into the PSRAM pool; the
+// fire-path snapshots (dispatch_event / task_cron) keep a stack copy but run on
+// 8 KB task stacks (kEventBus / kRuleCron). This cap trips if the struct
+// balloons past what those task stacks can safely hold as a local — recheck
+// both the pool-parse and the snapshot paths if it ever fires.
+static_assert(sizeof(ParsedRule) <= 2048,
+              "ParsedRule too large — see the reload_locked / fire-path stack note");
+
 static void reload_locked() {
     // F47 (FINDINGS.md): ~34 KB scratch — allocate from PSRAM (internal DRAM is
     // the tight pool on this device), falling back to internal heap on failure.
@@ -121,8 +131,16 @@ static void reload_locked() {
     s_rule_count = 0;
     for (uint16_t i = 0; i < cnt && s_rule_count < MAX_CACHED_RULES; i++) {
         if (slots[i].rule_type != (uint8_t)RuleType::SIMPLE) continue;
-        ParsedRule r{};
-        ParseResult res = dsl_parse((const char*)slots[i].src, slots[i].rule_id, &r);
+        // Parse straight into the PSRAM pool slot. ParsedRule is ~0.9 KB — each
+        // of its 4 RuleActions embeds an ExprProg (Tier-2 %value% expressions) —
+        // and this reload runs on the 3584-byte main task at boot
+        // (simple_rules_init/reload). A stack-local ParsedRule here overflowed it
+        // once dsl_parse's own frame (parse_value_arg probe + expr_compile) sat
+        // on top. The slot is not committed until s_rule_count is bumped, so a
+        // parse failure just leaves it for the next iteration to overwrite.
+        ParsedRule* r = &s_rules[s_rule_count];
+        *r = ParsedRule{};
+        ParseResult res = dsl_parse((const char*)slots[i].src, slots[i].rule_id, r);
         if (res != ParseResult::OK) {
             ESP_LOGW(TAG, "rule %u parse error %d — skipped", slots[i].rule_id, (int)res);
             if (s_error_cb) {
@@ -132,8 +150,8 @@ static void reload_locked() {
             }
             continue;
         }
-        r.enabled = slots[i].enabled != 0;
-        s_rules[s_rule_count++] = r;
+        r->enabled = slots[i].enabled != 0;
+        s_rule_count++;
     }
     simple_rules_resolve_names(s_rules, s_rule_count);
     cron_cache_invalidate();   // F27: rules reloaded — drop stale cron cache

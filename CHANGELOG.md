@@ -29,6 +29,23 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   (rule engine runs on the P4 — reflash + live-rule check). Follow-up: mirror the
   caps in the cloud `AutomationValidator` (private repo).
 
+### Fixed
+
+- **simple_rules — boot stack overflow on the P4 main task (regression from the
+  Tier-2 expression work above).** Embedding `ExprProg` by value in each of
+  `RuleAction`'s four slots grew `ParsedRule` to ~0.9 KB. `reload_locked()` staged
+  each rule in a *stack-local* `ParsedRule` before copying it into the PSRAM pool,
+  and that reload runs on the 3584-byte ESP-IDF main task at boot — so the fatter
+  struct, plus `dsl_parse`'s own frame, overflowed the stack and panicked
+  (`***ERROR*** A stack overflow in task main`). `reload_locked()` now parses
+  straight into the PSRAM pool slot (the pattern F47 already used for the 34 KB
+  `slots` scratch), keeping the large transient off the main stack; a
+  `static_assert(sizeof(ParsedRule) <= 2048)` guards future growth (the fire-path
+  snapshots run on the 8 KB `kEventBus`/`kRuleCron` tasks and were never at risk).
+  No behaviour change — host suite 9/9. **HW-test-pending** (P4 reflash must boot
+  clean). Corrects the "zero-impact" note above: the pool is PSRAM, but the parse
+  had still been staging through a stack local.
+
 ### Testing
 
 - **znp_driver — host coverage via a UART stub.** New `test/host/` covers the
