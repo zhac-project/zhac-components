@@ -31,6 +31,27 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **zhc_adapter — stop overwriting the decoder's manufacturer-aware cluster name
+  (CODEX M-01).** `decode_frame()` sets `DecodedMessage::cluster` via the
+  manufacturer-aware `cluster_name(id, mfg_code, mfg_specific)`; the adapter then
+  overwrote it with the id-only `cluster_id_to_name(id)`, erasing
+  manufacturer-specific resolution and mislabelling colliding cluster ids so the
+  wrong converter (or none) claimed the frame. The overwrite is removed — the
+  decoder's classification is the single source of truth.
+- **zigbee_mgr — Basic interview response race + atomic interview state
+  (CODEX M-02).** The ZNP RX task copied a matching Basic-cluster response into
+  the shared `s_basic_buf` and gave the semaphore without disarming
+  `s_basic_expect_nwk`, so a second matching report could overwrite the buffer
+  before the interview task parsed it. The handler now claims the wait
+  single-shot (atomic CAS to 0xFFFF) before writing, mirroring the generic
+  `wait_rsp` path. `s_basic_expect_nwk`, `s_active_interview_ieee` and
+  `s_active_interview_nwk` are now `std::atomic` (a 64-bit `volatile` read on the
+  32-bit target could tear).
+- **ODR + null-contract smells.** `DirtySlot` in `zap_store_flush.cpp` and
+  `rule_store_flush.cpp` were external-linkage types with different layouts (a
+  One Definition Rule violation) — both are now in anonymous namespaces.
+  `hap_json_encode_device_info_full()` checked `!dev` only *after* calling the
+  inner encoder that dereferences `dev`; the guard is moved ahead of the call.
 - **simple_rules — an unresolved rule device name is inert, not a wildcard
   (CODEX H-03).** The matcher applied the device filter only when
   `trigger.ieee != 0`, so a friendly name that never resolved (typo, renamed, or

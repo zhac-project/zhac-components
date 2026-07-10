@@ -1385,7 +1385,12 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
                  static_cast<unsigned long long>(ieee), cluster_id);
         return false;
     }
-    msg.cluster = cluster_id_to_name(cluster_id);
+    // CODEX M-01: keep the decoder's classification as the single source of
+    // truth. decode_frame() already set msg.cluster via the manufacturer-aware
+    // cluster_name(id, mfg_code, mfg_specific). The previous
+    // `msg.cluster = cluster_id_to_name(cluster_id)` overwrote it with the
+    // id-only label — erasing manufacturer-specific resolution and mislabelling
+    // colliding ids so the wrong converter (or none) claimed the frame.
 
     // If this is a Tuya DP-stream frame, parse the on-wire record list
     // so the definition's TuyaDp-family converters see real DPs.

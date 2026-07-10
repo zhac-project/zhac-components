@@ -385,8 +385,11 @@ bool hap_json_encode_device_info_full(uint8_t* buf, size_t cap, uint16_t* out_le
                                        HapJsonLabelResolverFn resolve,
                                        HapJsonAttrsEmitter   attrs,
                                        HapJsonExposesEmitter exposes) {
+    // CODEX (nullable-contract): guard BEFORE the inner encoder, which
+    // dereferences `dev`. The check used to sit after the call, so a null
+    // device would crash there rather than fail cleanly.
+    if (!dev) return false;
     if (!hap_json_encode_device_info(buf, cap, out_len, dev, resolve)) return false;
-    if (!dev) return true;
 
     uint16_t len = *out_len;
     auto splice = [&](const char* key, size_t (*emit)(const ZapDevice*, char*, size_t)) -> bool {

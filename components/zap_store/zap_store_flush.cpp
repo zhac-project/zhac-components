@@ -56,6 +56,11 @@ static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;
 // flush barriers (flush_now / flush_device) can wait on it. Only the
 // flusher that set FLUSHING ever settles the slot; concurrent flushers
 // see FLUSHING and back off, so ownership is unambiguous.
+// CODEX ODR: `DirtySlot` (and the related state enum) is a private, file-local
+// type — rule_store_flush.cpp defines a different `struct DirtySlot`. At
+// external linkage that is a One Definition Rule violation. Anonymous namespace
+// gives both internal linkage so the two never collide.
+namespace {
 enum SlotState : uint8_t { SLOT_FREE = 0, SLOT_DIRTY = 1, SLOT_FLUSHING = 2 };
 
 struct DirtySlot {
@@ -65,6 +70,7 @@ struct DirtySlot {
     uint8_t  state;      // SlotState
     bool     remarked;   // mark_dirty landed while FLUSHING — newer data pending
 };
+}  // namespace
 
 static DirtySlot            s_dirty[DIRTY_CAP] = {};
 static SemaphoreHandle_t    s_mtx = nullptr;

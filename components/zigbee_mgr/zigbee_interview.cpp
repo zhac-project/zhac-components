@@ -53,7 +53,10 @@ static std::atomic<uint16_t> s_expected_src_nwk {0xFFFF}; // 0xFFFF = no nwk fil
 static SemaphoreHandle_t s_basic_sem = nullptr;
 static uint8_t           s_basic_buf[128];
 static uint8_t           s_basic_len = 0;
-static volatile uint16_t s_basic_expect_nwk = 0xFFFF;  // 0xFFFF = not waiting
+// CODEX M-02: std::atomic, not volatile — volatile guarantees neither atomicity
+// nor cross-task ordering. The RX handler claims this single-shot (CAS to
+// 0xFFFF) before touching s_basic_buf, mirroring the generic wait_rsp path.
+static std::atomic<uint16_t> s_basic_expect_nwk{0xFFFF};  // 0xFFFF = not waiting
 // Sleepy battery devices (Xiaomi sensors, Miboxer remotes) only wake
 // for ~50-200 ms after a user action. 2 attempts × 3 s was missing the
 // wake window. 5 × 5 s = up to 25 s per EP, giving multiple wake
@@ -71,8 +74,10 @@ static constexpr uint32_t BASIC_READ_RETRY_DELAY_MS = 400;
 // still awake. Producers: `zigbee_interview_on_af_incoming` (any AF
 // ingress from active ieee/nwk) and `on_tc_dev_ind` (rejoin refresh).
 static SemaphoreHandle_t s_wake_sem = nullptr;
-static volatile uint64_t s_active_interview_ieee = 0;
-static volatile uint16_t s_active_interview_nwk  = 0xFFFE;
+// CODEX M-02: atomic, not volatile — a 64-bit ieee read on the 32-bit target
+// can otherwise tear, and volatile provides no cross-task synchronisation.
+static std::atomic<uint64_t> s_active_interview_ieee{0};
+static std::atomic<uint16_t> s_active_interview_nwk {0xFFFE};
 
 static inline void interview_wake_notify() {
     if (s_wake_sem) xSemaphoreGive(s_wake_sem);
@@ -138,21 +143,31 @@ void zigbee_interview_on_af_incoming(const uint8_t* payload, uint8_t payload_len
     // Wake signal — any AF ingress from the device currently under
     // interview shortens the inter-attempt sleep so the next ZDO
     // attempt rides the same awake window.
-    if (src_nwk == s_active_interview_nwk) {
+    if (src_nwk == s_active_interview_nwk.load(std::memory_order_acquire)) {
         interview_wake_notify();
     }
 
-    if (s_basic_expect_nwk == 0xFFFF) return;  // not waiting on Basic
+    uint16_t want_nwk = s_basic_expect_nwk.load(std::memory_order_acquire);
+    if (want_nwk == 0xFFFF) return;            // not waiting on Basic
     if (payload_len < 17) return;
 
     const uint16_t cluster =
         static_cast<uint16_t>(payload[2]) |
         (static_cast<uint16_t>(payload[3]) << 8);
-    if (cluster != 0x0000 || src_nwk != s_basic_expect_nwk) return;
+    if (cluster != 0x0000 || src_nwk != want_nwk) return;
 
     uint8_t data_len = payload[16];
     if (17u + data_len > payload_len) return;
 
+    // CODEX M-02: claim the wait single-shot BEFORE writing the shared buffer,
+    // atomically flipping the expectation to 0xFFFF. A second matching Basic
+    // report otherwise overwrites s_basic_buf between this copy and the
+    // interview task's parse (torn / stale read). Only the CAS winner fills the
+    // buffer and gives the sem; a racing duplicate fails the CAS and is dropped.
+    if (!s_basic_expect_nwk.compare_exchange_strong(
+            want_nwk, 0xFFFF, std::memory_order_acq_rel)) {
+        return;
+    }
     s_basic_len = (data_len < sizeof(s_basic_buf)) ? data_len : sizeof(s_basic_buf);
     memcpy(s_basic_buf, payload + 17, s_basic_len);
     xSemaphoreGive(s_basic_sem);
@@ -188,7 +203,7 @@ static bool interview_read_basic_once(ZapDevice* dev, uint16_t nwk, uint8_t ep) 
     // Arm the interceptor
     xSemaphoreTake(s_basic_sem, 0);
     s_basic_len = 0;
-    s_basic_expect_nwk = nwk;
+    s_basic_expect_nwk.store(nwk, std::memory_order_release);
 
     MtFrame req{};
     req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x01;  // AF_DATA_REQUEST
@@ -196,7 +211,7 @@ static bool interview_read_basic_once(ZapDevice* dev, uint16_t nwk, uint8_t ep) 
     MtFrame rsp{};
     if (!znp_sreq_retry(req, rsp, 2000, 2)) {
         ESP_LOGW(TAG, "Basic cluster read: AF_DATA_REQUEST failed");
-        s_basic_expect_nwk = 0xFFFF;
+        s_basic_expect_nwk.store(0xFFFF, std::memory_order_release);
         return false;
     }
 
@@ -213,12 +228,12 @@ static bool interview_read_basic_once(ZapDevice* dev, uint16_t nwk, uint8_t ep) 
         dev->manufacturer_code = mfg_code;
         ESP_LOGI(TAG, "Basic cluster: model_id='%s' manufacturer='%s'",
                  dev->model_id, dev->manufacturer_name);
-        s_basic_expect_nwk = 0xFFFF;
+        s_basic_expect_nwk.store(0xFFFF, std::memory_order_release);
         return dev->model_id[0] != '\0' || dev->manufacturer_name[0] != '\0';
     } else {
         ESP_LOGW(TAG, "Basic cluster read timeout for nwk=0x%04x ep=%u", nwk, ep);
     }
-    s_basic_expect_nwk = 0xFFFF;
+    s_basic_expect_nwk.store(0xFFFF, std::memory_order_release);
     return false;
 }
 
@@ -648,7 +663,7 @@ static void task_interview(void*) {
             continue;   // next queued JoinEvent
         }
 
-        s_active_interview_ieee = ev.ieee;
+        s_active_interview_ieee.store(ev.ieee, std::memory_order_release);
         for (uint8_t attempt = 1; attempt <= INTERVIEW_MAX_ATTEMPTS; attempt++) {
             // Prefer the pool's current nwk over the nwk captured when
             // this event was queued. A rejoin that lands mid-retry (and
@@ -664,7 +679,7 @@ static void task_interview(void*) {
                 }
             }
             zigbee_pool_unlock();
-            s_active_interview_nwk = nwk;
+            s_active_interview_nwk.store(nwk, std::memory_order_release);
             if (do_interview(ev.ieee, nwk)) break;
             if (attempt < INTERVIEW_MAX_ATTEMPTS) {
                 ESP_LOGW(TAG, "Interview failed (attempt %d/%d) for ieee=0x%016llx nwk=0x%04x — retry in %lums (or on wake)",
@@ -728,8 +743,8 @@ static void task_interview(void*) {
                 zigbee_pool_unlock();
             }
         }
-        s_active_interview_ieee = 0;
-        s_active_interview_nwk  = 0xFFFE;
+        s_active_interview_ieee.store(0, std::memory_order_release);
+        s_active_interview_nwk .store(0xFFFE, std::memory_order_release);
     }
 }
 
@@ -798,7 +813,7 @@ static void on_tc_dev_ind(const MtFrame& f) {
     }
     // Rejoin is itself a wake signal — kicks task_interview if it's
     // currently sleeping between attempts for this device.
-    if (ev.ieee == s_active_interview_ieee) {
+    if (ev.ieee == s_active_interview_ieee.load(std::memory_order_acquire)) {
         interview_wake_notify();
     }
     ESP_LOGI(TAG, "Device joined nwk=0x%04x ieee=0x%016llx", ev.nwk, ev.ieee);
@@ -825,7 +840,8 @@ static void on_tc_dev_ind(const MtFrame& f) {
     // Wake a currently-sleeping retry loop for a DIFFERENT device so it
     // yields its slot to this fresh join event. The retry loop itself
     // checks the queue and re-enqueues its current ev to the tail.
-    if (ev.ieee != s_active_interview_ieee && s_active_interview_ieee != 0) {
+    const uint64_t active = s_active_interview_ieee.load(std::memory_order_acquire);
+    if (ev.ieee != active && active != 0) {
         interview_wake_notify();
     }
 }

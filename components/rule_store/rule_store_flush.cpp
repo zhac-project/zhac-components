@@ -62,6 +62,10 @@ enum DirtyState : uint8_t { CLEAN = 0, WRITE = 1, TOMBSTONE = 2 };
 // flusher that set `flushing` settles the slot; concurrent flushers
 // back off, so ownership is unambiguous.
 
+// CODEX ODR: file-local type — zap_store_flush.cpp defines a differently-laid-out
+// `struct DirtySlot`. Anonymous namespace gives internal linkage so the two
+// external-linkage definitions no longer violate the One Definition Rule.
+namespace {
 struct DirtySlot {
     uint16_t    rule_id;
     uint8_t     state;       // DirtyState — pending op; CLEAN = slot free
@@ -70,6 +74,7 @@ struct DirtySlot {
     uint32_t    marked_ms;
     RuleSlot    slot;        // full payload for WRITE; zeroed for TOMBSTONE
 };
+}  // namespace
 
 static DirtySlot*        s_dirty = nullptr;  // allocated in PSRAM
 static SemaphoreHandle_t s_mtx   = nullptr;
