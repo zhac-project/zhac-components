@@ -195,18 +195,25 @@ uint16_t rule_store_max_id(void) {
 uint16_t rule_store_count(void) { return s_store_n; }
 
 // ── zigbee_pool: seedable single-device pool (default empty) ──────────────
-// Existing tests keep the empty behaviour; test_action_shadow seeds one
-// device so a rule `zigbee.set` action can resolve its target device.
-static ZapDevice s_pool[1];
+// Existing tests keep the empty behaviour; test_action_shadow/test_action_matrix
+// seed device(s) so a rule's `zigbee.set` action and its friendly-name trigger
+// can resolve. stub_pool_seed APPENDS (up to kPoolMax) — every test seeds once
+// per binary, so append-once is identical to the old replace-once, while tests
+// that need several devices (CODEX H-03: triggers must resolve, not wildcard)
+// can seed more than one.
+static constexpr uint16_t kPoolMax = 16;
+static ZapDevice s_pool[kPoolMax];
 static uint16_t  s_pool_n = 0;
 
 void stub_pool_reset(void)              { s_pool_n = 0; }
-void stub_pool_seed(const ZapDevice* d) { if (d) { s_pool[0] = *d; s_pool_n = 1; } }
+void stub_pool_seed(const ZapDevice* d) { if (d && s_pool_n < kPoolMax) s_pool[s_pool_n++] = *d; }
 
 void       zigbee_pool_lock() {}
 void       zigbee_pool_unlock() {}
 ZapDevice* pool_find_by_ieee(uint64_t ieee) {
-    return (s_pool_n && s_pool[0].ieee_addr == ieee) ? &s_pool[0] : nullptr;
+    for (uint16_t i = 0; i < s_pool_n; i++)
+        if (s_pool[i].ieee_addr == ieee) return &s_pool[i];
+    return nullptr;
 }
 ZapDevice* pool_all()   { return s_pool_n ? s_pool : nullptr; }
 uint16_t   pool_count() { return s_pool_n; }

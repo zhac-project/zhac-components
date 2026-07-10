@@ -122,6 +122,20 @@ int main() {
     std::strncpy(dev.model_id, "TS0503B", sizeof(dev.model_id) - 1);
     stub_pool_seed(&dev);
 
+    // CODEX H-03: friendly-name triggers must now resolve to fire (an unresolved
+    // name is inert, not a wildcard). Seed each trigger device this suite
+    // references, all sharing the published ieee so publish_attr() (which uses
+    // kIeee) matches the resolved rule.
+    for (const char* name : {"s1", "s2", "s3", "s5", "s6", "s7", "s8", "s9"}) {
+        ZapDevice t{};
+        t.ieee_addr      = kIeee;
+        t.nwk_addr       = 0x1274;
+        t.endpoints[0]   = 1;
+        t.endpoint_count = 1;
+        std::strncpy(t.friendly_name, name, sizeof(t.friendly_name) - 1);
+        stub_pool_seed(&t);
+    }
+
     // ── 1. expand_value %value% + literal value routing ──────────────────
     {
         stub_shadow_opt_reset();

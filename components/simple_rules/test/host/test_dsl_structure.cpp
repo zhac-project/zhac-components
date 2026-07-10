@@ -148,11 +148,13 @@ int main() {
         CHECK(stub_shadow_opt_count() == 0, "resolved friendly name: a different IEEE is filtered");
         simple_rules_delete(id);
 
-        // A name not in the pool stays unresolved → ieee 0 → wildcard.
+        // CODEX H-03: a name not in the pool stays unresolved → INERT. It must
+        // NOT match every device — otherwise a typo'd/renamed/unpaired device
+        // name silently actuates an unrelated device.
         id = add("d2", "ON ghostdev#state=1 DO zigbee.set lamp brightness 9 ENDON");
         stub_shadow_opt_reset();
         publish_attr_ieee(kOther, "state", VAL_INT, 1); drain_attr();
-        CHECK(stub_shadow_opt_count() == 1, "unresolved friendly name matches any IEEE (wildcard)");
+        CHECK(stub_shadow_opt_count() == 0, "unresolved friendly name is inert (not a wildcard)");
         simple_rules_delete(id);
     }
 

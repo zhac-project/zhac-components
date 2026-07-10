@@ -250,7 +250,12 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
     case EventType::ZCL_ATTR: {
         if (t.type != TriggerType::DEVICE_ATTR) return false;
         const auto& ze = *reinterpret_cast<const ZclAttrEvent*>(ev.data);
-        if (t.ieee != 0 && t.ieee != ze.ieee) return false;
+        // CODEX H-03: a DEVICE_ATTR trigger fires ONLY on its resolved device.
+        // ieee == 0 means the friendly name never resolved (typo, renamed, not
+        // yet paired). That is INERT, not a wildcard — the old `!= 0 &&`
+        // short-circuit let an unresolved rule match events from every device,
+        // so a typo could actuate an unrelated light/lock/script.
+        if (t.ieee == 0 || t.ieee != ze.ieee) return false;
         // Empty attr_key = wildcard: match every attribute change on this
         // device. Useful for `ON friendly_name DO script.run "..."` where
         // the Lua handler inspects the incoming event table and decides
@@ -665,6 +670,15 @@ static void task_cron(void*) {
     }
 }
 
+// CODEX H-03: a device joined or left — re-resolve friendly-name triggers so a
+// rule authored before the device paired binds to it (and a removed device's
+// stale binding is dropped) deterministically, not only on the next reload.
+static void on_pool_change(const Event&) {
+    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
+    simple_rules_resolve_names(s_rules, s_rule_count);
+    xSemaphoreGiveRecursive(s_mutex);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 void simple_rules_init() {
@@ -678,6 +692,9 @@ void simple_rules_init() {
     event_bus_subscribe(EventType::RULE_EVENT,      dispatch_event);
     event_bus_subscribe(EventType::RULE_TIMER_FIRE, dispatch_event);
     event_bus_subscribe(EventType::MQTT_MSG,        dispatch_event);
+    // CODEX H-03: re-resolve friendly-name triggers when the device pool changes.
+    event_bus_subscribe(EventType::DEVICE_JOIN,     on_pool_change);
+    event_bus_subscribe(EventType::DEVICE_LEAVE,    on_pool_change);
 
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     reload_locked();
@@ -867,14 +884,24 @@ void simple_rules_resolve_names(ParsedRule* rules, uint16_t count) {
     for (uint16_t i = 0; i < count; i++) {
         RuleTrigger& t = rules[i].trigger;
         if (t.type != TriggerType::DEVICE_ATTR) continue;
-        if (t.ieee != 0)            continue;
-        if (t.device_name[0] == '\0') continue;
+        if (t.device_name[0] == '\0') continue;   // ieee literal — nothing to resolve
+        // CODEX H-03: re-resolve by name on EVERY pass — do not skip an already
+        // non-zero ieee. A device that was removed or re-paired with a new
+        // address otherwise keeps a stale binding forever (the old
+        // `if (t.ieee != 0) continue`). A name that no longer matches resolves
+        // back to 0, which the matcher treats as inert (never a wildcard).
+        uint64_t resolved = 0;
         for (uint16_t j = 0; j < cnt; j++) {
             if (strcmp(pool[j].friendly_name, t.device_name) == 0) {
-                t.ieee = pool[j].ieee_addr;
+                resolved = pool[j].ieee_addr;
                 break;
             }
         }
+        if (resolved == 0) {
+            ESP_LOGW(TAG, "rule %u: device \"%s\" not paired — trigger inert until it joins",
+                     (unsigned)rules[i].rule_id, t.device_name);
+        }
+        t.ieee = resolved;
     }
     zigbee_pool_unlock();
 }

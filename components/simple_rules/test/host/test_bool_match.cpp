@@ -53,6 +53,11 @@ static bool parse_and_match(const char* dsl, const Event& ev) {
         printf("  (parse failed for '%s': %s)\n", dsl, dsl_last_error());
         return false;
     }
+    // Emulate the name resolver: bind a DEVICE_ATTR trigger to the event's
+    // device so the ieee filter passes and we exercise the value/type logic.
+    // (CODEX H-03: an unresolved trigger is now inert, not a wildcard.)
+    if (rule.trigger.type == TriggerType::DEVICE_ATTR && ev.type == EventType::ZCL_ATTR)
+        rule.trigger.ieee = reinterpret_cast<const ZclAttrEvent*>(ev.data)->ieee;
     char buf[64];
     return simple_rules_match(rule, ev, buf, sizeof buf);
 }

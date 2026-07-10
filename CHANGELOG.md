@@ -31,6 +31,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **simple_rules — an unresolved rule device name is inert, not a wildcard
+  (CODEX H-03).** The matcher applied the device filter only when
+  `trigger.ieee != 0`, so a friendly name that never resolved (typo, renamed, or
+  not-yet-paired device) matched attribute events from **every** device — a
+  typo in one rule could actuate an unrelated light/lock/script. A DEVICE_ATTR
+  trigger now fires only on its resolved device (`ieee == 0` → no match). The
+  resolver re-resolves by name on every pass (dropping stale bindings when a
+  device is removed or re-paired) and logs a diagnostic for an unresolved name;
+  friendly-name triggers are also re-resolved on `DEVICE_JOIN`/`DEVICE_LEAVE`.
+  The host test that pinned the old wildcard behaviour is inverted.
 - **device_shadow — optimistic (command-driven) state changes now reach the S3
   gateway + cloud.** `device_shadow_update_optimistic()` used to write only the
   cache and emit no event, so for a no-report device (Tuya LED driver, which

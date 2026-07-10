@@ -73,7 +73,7 @@ int main() {
     // ── state=1 → optimistic (ieee, "state", VAL_BOOL, 1) ────────────────
     stub_shadow_opt_reset();
     CHECK(simple_rules_add("r_on",
-            "ON motion#occupancy=1 DO zigbee.set lamp state 1 ENDON", &id),
+            "ON lamp#occupancy=1 DO zigbee.set lamp state 1 ENDON", &id),
           "install state-on rule");
     publish_attr("occupancy", VAL_BOOL, 1);
     drain();
@@ -88,7 +88,7 @@ int main() {
     // ── state=0 → VAL_BOOL 0 ─────────────────────────────────────────────
     stub_shadow_opt_reset();
     CHECK(simple_rules_add("r_off",
-            "ON contact_dev#contact=1 DO zigbee.set lamp state 0 ENDON", &id),
+            "ON lamp#contact=1 DO zigbee.set lamp state 0 ENDON", &id),
           "install state-off rule");
     publish_attr("contact", VAL_BOOL, 1);
     drain();
@@ -101,7 +101,7 @@ int main() {
     // ── a non-state key → VAL_INT ────────────────────────────────────────
     stub_shadow_opt_reset();
     CHECK(simple_rules_add("r_dim",
-            "ON lux_dev#illuminance=1 DO zigbee.set lamp brightness 128 ENDON", &id),
+            "ON lamp#illuminance=1 DO zigbee.set lamp brightness 128 ENDON", &id),
           "install brightness rule");
     publish_attr("illuminance", VAL_INT, 1);
     drain();
@@ -116,7 +116,7 @@ int main() {
     stub_shadow_opt_reset();
     stub_adapter_send_set_result(false);
     CHECK(simple_rules_add("r_fail",
-            "ON smoke_dev#smoke=1 DO zigbee.set lamp state 1 ENDON", &id),
+            "ON lamp#smoke=1 DO zigbee.set lamp state 1 ENDON", &id),
           "install fail-path rule");
     publish_attr("smoke", VAL_BOOL, 1);
     drain();
