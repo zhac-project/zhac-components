@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Zigbee radio backend selection (design doc §4). Peer to the existing znp /
+# ezsp backends. DEFAULT = ZNP so every current firmware's behaviour is
+# unchanged; ESP_ZIGBEE is opt-in and gates the esp-zigbee-lib dependency
+# (idf_component.yml) + all glue code (#if CONFIG_ZHAC_ZIGBEE_BACKEND_ESP_ZIGBEE).
+#
+# Placed in a component so the symbols are visible project-wide; the choice is
+# also readable by the component manager's $CONFIG{...} conditional-dep rules.
+
+menu "ZHAC Zigbee backend"
+
+choice ZHAC_ZIGBEE_BACKEND
+    prompt "Zigbee radio backend"
+    default ZHAC_ZIGBEE_BACKEND_ZNP
+    help
+        Which radio backend registers with zhc_adapter / device_backend.
+        All three feed the same device library, shadow, rules and gateway.
+
+    config ZHAC_ZIGBEE_BACKEND_ZNP
+        bool "TI Z-Stack (CC2652/CC2530) over MT/UART — znp_driver"
+
+    config ZHAC_ZIGBEE_BACKEND_EZSP
+        bool "Silabs EFR32 over EZSP/UART"
+
+    config ZHAC_ZIGBEE_BACKEND_ESP_ZIGBEE
+        bool "esp-zigbee-lib (RCP: external ESP32-H2/C6 running ot_rcp)"
+        help
+            Native esp-zigbee-lib stack on the host, driving an external
+            802.15.4 radio (ESP32-H2/C6 with stock ot_rcp) over Spinel/UART.
+            The ESP32-P4 has no radio, so on the flagship this is RCP-only.
+            Pulls in espressif/esp-zigbee-lib.
+
+endchoice
+
+endmenu

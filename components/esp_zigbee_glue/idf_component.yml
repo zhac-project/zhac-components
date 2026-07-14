@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# esp_zigbee_glue — the SDK-binding half of the esp-zigbee backend (P1).
+#
+# NON-REGRESSION LINCHPIN (design doc §4/§11): esp-zigbee-lib is a
+# Kconfig-conditional dependency — resolved ONLY when the esp-zigbee backend is
+# selected. With the default ZNP backend the `if` is false, so a flagship/mono
+# build pulls nothing and its dependencies.lock is unchanged. Requires the
+# component manager's kconfig-conditional deps (ESP-IDF >= 6.0 — ZHAC is on
+# v6.0). Version pin mirrors esp-znp-core (2.x, cap the next major).
+dependencies:
+  espressif/esp-zigbee-lib:
+    version: ">=2.0.0,<3.0.0"
+    rules:
+      - if: "$CONFIG{ZHAC_ZIGBEE_BACKEND_ESP_ZIGBEE} == True"
