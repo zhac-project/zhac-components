@@ -147,55 +147,45 @@ TEST_CASE("session: duplicate NEEDS_ACK suppressed; ACK still sent", "[session]"
 
 // Regression: a peer restart (its seq counter rewinds to 1) while we stay up
 // must not wedge NEEDS_ACK delivery. A received SYNC clears the receive-side
-// dedup high-water so the peer's restarted low seqs are accepted instead of
-// being silently dropped as "behind the window". Without the SYNC reset the
-// final frame stays dropped (on_frame_calls == 1) and device.list/get/set time
-// out forever while NO_ACK heartbeats keep flowing.
-TEST_CASE("session: SYNC resets rx dedup so peer-restart low seqs are accepted",
+// dedup ring so a (seq,type) the peer reuses after its restart is accepted again
+// instead of colliding with a stale ring entry and being wrongly deduped.
+TEST_CASE("session: SYNC resets rx dedup so a reused seq is accepted again",
           "[session]") {
     Capture c;
     hap_session_init(make_cfg(c));
 
-    // Establish a high high-water with one accepted NEEDS_ACK data frame.
-    HapFrame hi{};
-    hi.type  = HapMsgType::CMD;
-    hi.seq   = 5000;
-    hi.flags = HAP_FLAG_NEEDS_ACK;
-    hap_session_on_receive(hi);
-    TEST_ASSERT_EQUAL(1, c.on_frame_calls);
+    // Accept a NEEDS_ACK frame; its exact duplicate is then deduped (ring hit).
+    HapFrame f{};
+    f.type  = HapMsgType::CMD;
+    f.seq   = 100;
+    f.flags = HAP_FLAG_NEEDS_ACK;
+    hap_session_on_receive(f);
+    hap_session_on_receive(f);
+    TEST_ASSERT_EQUAL(1, c.on_frame_calls);   // duplicate deduped via the ring
 
-    // A fresh low seq now looks far behind the window → dropped (re-ACKed,
-    // never dispatched). Documents the gate that the SYNC reset must defeat.
-    HapFrame low{};
-    low.type  = HapMsgType::CMD;
-    low.seq   = 10;
-    low.flags = HAP_FLAG_NEEDS_ACK;
-    hap_session_on_receive(low);
-    TEST_ASSERT_EQUAL(1, c.on_frame_calls);   // still dropped as stale-behind
-
-    // Peer SYNC ⇒ new session ⇒ dedup state cleared.
+    // Peer SYNC ⇒ new session ⇒ dedup ring cleared.
     HapFrame sync{};
     sync.type = HapMsgType::SYNC;
     sync.seq  = 1;
     hap_session_on_receive(sync);
 
-    // The same low seq is now accepted and dispatched.
-    hap_session_on_receive(low);
+    // The same seq is a fresh frame again and is dispatched.
+    hap_session_on_receive(f);
     TEST_ASSERT_EQUAL(2, c.on_frame_calls);
 }
 
-// Regression: NO_ACK traffic must advance the receive high-water. Over a long
-// continuous session the peer's seq races ahead on NO_ACK frames (heartbeats /
-// attr updates) while NEEDS_ACK replies are rare; if the high-water only tracked
-// NEEDS_ACK frames it would lag past 32768 and seq_diff would wrap, so a FRESH
-// far-ahead reply gets misjudged "behind the window" and silently dropped — the
-// 4h/10h device.list wedge with no reboot involved.
-TEST_CASE("session: NO_ACK traffic advances high-water so a fresh far-ahead reply isn't dropped",
+// Regression (device.list wedge, 2026-07-16): dedup is the exact (seq,type) ring
+// ONLY. Sustained NO_ACK bulk (a chatty sensor's attr reports) races the shared
+// seq counter far ahead; a genuinely-fresh NEEDS_ACK reply whose first transmit
+// was lost then arrives on retransmit carrying an older, now-far-"behind" seq. It
+// MUST be dispatched — the removed "stale-behind high-water" arm false-dropped it
+// and wedged device.list / device.get / set-attribute.
+TEST_CASE("session: a fresh NEEDS_ACK reply far behind recent NO_ACK bulk is dispatched",
           "[session]") {
     Capture c;
     hap_session_init(make_cfg(c));
 
-    // A NEEDS_ACK reply seeds the high-water at a low seq.
+    // A NEEDS_ACK reply enters the ring at a low seq.
     HapFrame a{};
     a.type  = HapMsgType::CMD;
     a.seq   = 100;
@@ -203,21 +193,19 @@ TEST_CASE("session: NO_ACK traffic advances high-water so a fresh far-ahead repl
     hap_session_on_receive(a);
     TEST_ASSERT_EQUAL(1, c.on_frame_calls);
 
-    // NO_ACK traffic carries the peer's live seq far ahead (> half the uint16
-    // space past the last NEEDS_ACK). It must drag the high-water with it.
+    // NO_ACK bulk races the peer's live seq ahead.
     HapFrame hb{};
     hb.type  = HapMsgType::CMD;
-    hb.seq   = 40000;
+    hb.seq   = 200;
     hb.flags = HAP_FLAG_NO_ACK;
     hap_session_on_receive(hb);
     TEST_ASSERT_EQUAL(2, c.on_frame_calls);
 
-    // A fresh NEEDS_ACK reply just ahead of the live seq must be accepted. With
-    // a lagging high-water (seeded at 100) seq_diff(100,40001) wraps to a small
-    // positive value >= the threshold and this would be dropped as stale.
+    // A FRESH NEEDS_ACK reply 50 behind the bulk (>= the old 2*WIN_SIZE=32
+    // threshold) but never seen — it must be dispatched, not stale-dropped.
     HapFrame r{};
     r.type  = HapMsgType::CMD;
-    r.seq   = 40001;
+    r.seq   = 150;
     r.flags = HAP_FLAG_NEEDS_ACK;
     hap_session_on_receive(r);
     TEST_ASSERT_EQUAL(3, c.on_frame_calls);

@@ -61,7 +61,7 @@ on a 100-device network); the trade-off is documented in
 
 This is the authoritative description of how the RX path keeps a peer's
 retransmits from being dispatched twice. The inline comment block in
-`hap_session.cpp` (around the `seq_diff` / `SEEN_RING` region) points here;
+`hap_session.cpp` (around the `SEEN_RING` region) points here;
 keep this section in sync if the mechanics change.
 
 ### Sequence space
@@ -74,47 +74,50 @@ keep this section in sync if the mechanics change.
   `hap_session_send()`** rather than placed on the wire. Because the live space
   is `1..0xFFFF`, 0 is unambiguously "no real seq".
 
-### Two-stage duplicate filter
+### Duplicate filter — exact-match ring only
 
-A received `NEEDS_ACK` frame is checked against two complementary mechanisms
-before it reaches `cfg.on_frame`:
+A received `NEEDS_ACK` frame is deduped against a single mechanism before it
+reaches `cfg.on_frame`:
 
-1. **`SEEN_RING` — 64-entry exact-match ring keyed `(seq, type)`.** Catches the
-   common case: a frame we just handled is re-sent because our ACK was lost.
-   The ring covers the recent past; a burst of >64 distinct `NEEDS_ACK` frames
-   between the original dispatch and the retransmit can evict an entry, which is
-   why mechanism (2) exists as a backstop.
-2. **High-water monotonic-seq fast-path.** The session tracks the highest seq
-   received per peer (`s_rx_high_water`, gated by a `valid` flag for cold
-   start). Any frame **`STALE_BEHIND_THRESHOLD (= WIN_SIZE)` or more behind** the
-   high-water mark is dropped as a definite stale dup, regardless of ring
-   eviction — the peer never has more than `WIN_SIZE` frames outstanding, so a
-   seq that far behind cannot be a fresh in-window frame.
+- **`SEEN_RING` — 64-entry exact-match ring keyed `(seq, type)`.** A frame is a
+  duplicate **iff** its `(seq, type)` is still in the ring. This catches the only
+  real duplicate: a frame we just handled is re-sent because our ACK was lost.
+  The ring (64 entries) comfortably exceeds the peer's `WIN_SIZE` (16) retransmit
+  window, so a retransmit arriving within the `MAX_RETRIES × ACK_TIMEOUT_MS`
+  budget is always still present to be caught.
 
-### Wrap-safe comparison (`seq_diff`)
-
-Both the high-water advance and the stale test compare seqs through
-**`seq_diff(a, b)` — an `int16_t` recentering** of `(a - b) mod 2^16` into
-`[-32768, 32767]`. Positive ⇒ `a` is ahead of `b`, negative ⇒ behind. This is
-correct across the `0xFFFF → 0x0001` boundary where a raw `<` would not be
-(e.g. `seq_diff(0x0001, 0xFFFF) = +2`).
+> **Removed (2026-07-16): the "stale-behind high-water" backstop.** A second arm
+> used to also drop any `NEEDS_ACK` frame more than `2×WIN_SIZE` seqs behind a
+> monotonic high-water. Because the seq space is a **single counter shared by all
+> frame types**, heavy `NO_ACK` bulk (e.g. a chatty Tuya sensor's attribute
+> reports) races the high-water far ahead between two `NEEDS_ACK` frames. A
+> genuinely-**fresh** reply whose first transmit was lost then arrives on
+> retransmit carrying its original, now-far-"behind" seq — the arm mis-classified
+> it as stale and dropped it **without dispatch**, wedging `device.list` /
+> `device.get` / `set-attribute` while `NO_ACK` traffic masked the link as
+> half-alive. On a shared counter no finite threshold can separate "fresh but
+> late" from "ancient dup", so the arm was unsound and is gone. The
+> (near-impossible) case it guarded — >64 distinct `NEEDS_ACK` frames evicting a
+> dup from the ring inside one retransmit window — now degrades to a harmless
+> double-dispatch (a duplicate `DEVICE_LIST` page), never a permanent wedge.
+> Removing the arm also subsumes the earlier uint16-wrap high-water fix.
 
 ### Dropped dups still re-ACK
 
-A frame dropped by either filter is **not** re-dispatched to `cfg.on_frame`,
+A frame dropped as a ring duplicate is **not** re-dispatched to `cfg.on_frame`,
 but the session **still re-sends the ACK**. The peer is retransmitting
 precisely because its previous ACK was lost; re-ACKing makes it stop, while the
 handler runs exactly once.
 
 ### Lifecycle vs `reset_link`
 
-- `hap_session_reset_link()` (re-SYNC) **preserves** the high-water mark and
-  `SEEN_RING`, and does **not** touch `s_next_seq` — so seq continuity and dedup
-  carry across a link resync.
-- Only the full `hap_session_init()` resets the dedup state: `s_next_seq → 1`,
-  `s_rx_high_water → 0`, `s_rx_high_water_valid → false`. This avoids a stale
-  high-water from a prior session (whose `s_next_seq` also reset to 1) rejecting
-  fresh low-numbered frames.
+- `hap_session_reset_link()` (re-SYNC) **preserves** the `SEEN_RING` and does
+  **not** touch `s_next_seq` — so seq continuity and dedup carry across a link
+  resync.
+- `hap_session_init()` and a received `SYNC` both clear the `SEEN_RING` (via
+  `reset_rx_dedup()`): a fresh session — or a peer that restarted and rewound its
+  seq counter to 1 — must not have its reused low seqs collide with a stale
+  `(seq, type)` still in the ring.
 
 ## Public API (`include/hap_session.h`)
 
@@ -267,3 +270,8 @@ for (;;) {
 - Sender now releases the session mutex before calling the transport, fixing
   the long-tail retransmit latency observed when SPI was slow to drain. See
   `hap_session.cpp:144-167`.
+- Receive-side dedup simplified to the exact-match `SEEN_RING` only; the
+  stale-behind high-water backstop was removed (2026-07-16). On the single
+  shared seq counter it false-dropped fresh `NEEDS_ACK` replies under heavy
+  `NO_ACK` bulk (a chatty Tuya sensor) and wedged `device.list` / `device.get` /
+  `set-attribute`. See the receive-side dedup section above.

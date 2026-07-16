@@ -79,66 +79,33 @@ static SemaphoreHandle_t  s_mutex;
 static uint8_t*           s_retx_scratch = nullptr;
 
 // Defect 3 (FINDINGS §1.3): dedup against re-dispatch of NEEDS_ACK frames on
-// peer retransmit. See README §"Receive-side dedup & sequence space" for the
-// authoritative description. Two complementary mechanisms:
+// peer retransmit — so a lost ACK (peer resends a frame we already handled)
+// never runs the handler twice (double DEVICE_DELETE / double rule-create). The
+// mechanism is a single exact-match ring of recent (seq,type) pairs: a frame is
+// a duplicate iff its (seq,type) is still in the ring. The ring holds 64 entries
+// (4 B each ⇒ 256 B) — comfortably more than the peer's WIN_SIZE(16) retransmit
+// window, so a retransmit arriving within the 5 s / 5-try budget is always still
+// present to be caught.
 //
-//  (a) Exact-match ring of recent (seq,type) pairs — catches the common case
-//      (a frame we just handled is re-sent because our ACK was lost). The ring
-//      was 16 entries; a burst of >16 distinct NEEDS_ACK frames between the
-//      original dispatch and the retransmit evicted the entry, so the stale
-//      frame slipped through and the handler ran twice (double DEVICE_DELETE /
-//      double rule-create). Enlarged 16→64 (entries are 4 B each ⇒ 256 B) so
-//      the window comfortably exceeds the peer's WIN_SIZE retransmit window.
-//
-//  (b) Monotonic high-water fast-path — a defensive backstop to (a): tracks the
-//      highest NEEDS_ACK seq seen per peer and drops a frame far enough behind
-//      it to be a definite stale dup, regardless of ring eviction. Wrap-aware:
-//      seqs are uint16 and roll 0xFFFF→0x0001, so we compare via the signed
-//      difference trick (see seq_diff), not a raw `<`. NOTE the seq space is a
-//      SINGLE monotonic counter shared by all frame types, but only NEEDS_ACK
-//      frames advance the high-water (NO_ACK / ACK / SYNC bypass the window and
-//      never mark) — so the seq-distance between two NEEDS_ACK frames is
-//      inflated by any NO_ACK / heartbeat traffic interleaved between them.
-//      That cuts both ways for the threshold below; see STALE_BEHIND_THRESHOLD.
+// A second "monotonic high-water" arm used to ALSO drop any NEEDS_ACK frame far
+// enough behind the highest seq seen — a backstop for a dup burst-evicted from
+// the ring. It was REMOVED (2026-07-16, device.list wedge): the seq space is a
+// SINGLE counter shared by all frame types, so heavy NO_ACK bulk (e.g. a chatty
+// Tuya sensor's attr reports at ~6/s) races the high-water tens of seqs ahead
+// between two NEEDS_ACK frames. A genuinely-FRESH reply whose first transmit was
+// lost then arrives on retransmit carrying its original (now-far-behind) seq —
+// the arm mis-classified it as a stale dup and dropped it WITHOUT dispatch,
+// wedging device.list / device.get / set-attribute while NO_ACK traffic masked
+// it. On a shared counter no finite threshold can separate "fresh but late" from
+// "ancient dup", so the arm was unsound. The ring alone is authoritative; the
+// (near-impossible) >64-distinct-NEEDS_ACK-frames-within-5 s eviction case now
+// degrades to a harmless double-dispatch (a duplicate DEVICE_LIST page), never a
+// permanent link wedge. Removing the arm also subsumes the earlier uint16-wrap
+// high-water fix (no stale check ⇒ nothing to wrap-mis-classify).
 struct SeenEntry { uint16_t seq; uint8_t type; };
 static constexpr size_t SEEN_RING_SIZE = 64;
 static SeenEntry s_seen_ring[SEEN_RING_SIZE] = {};
 static uint8_t   s_seen_head = 0;
-
-// Per-peer monotonic high-water of received NEEDS_ACK seqs. `valid` guards the
-// cold-start case (no frame seen yet) so seq 0-vs-uninitialised is unambiguous.
-static uint16_t s_rx_high_water = 0;
-static bool     s_rx_high_water_valid = false;
-// A frame this far (or more) behind the monotonic high-water is treated as a
-// stale dup. Choosing the threshold is a trade-off on the SHARED seq counter
-// (see (b) above), so neither bound is a hard seq-unit guarantee:
-//   Lower bound — too small false-drops a legit reordered/retransmitted
-//   in-window frame. Such a frame is <= WIN_SIZE-1 *NEEDS_ACK frames* behind,
-//   but its seq spread can EXCEED WIN_SIZE when NO_ACK frames interleave, so no
-//   finite threshold fully eliminates reorder false-drops here. 2*WIN_SIZE adds
-//   real margin over the old WIN_SIZE (which had none); the residual needs
-//   WIN_SIZE-1 reordered NEEDS_ACK frames with heavy NO_ACK interleave — rare on
-//   the largely-in-order SPI link, and pre-existing (tracked in FINDINGS §1).
-//   Upper bound — must stay < SEEN_RING_SIZE so a dup evicted from ring (a) is
-//   still caught. A ring-evicted dup is >= SEEN_RING_SIZE NEEDS_ACK frames old;
-//   interleaved gaps only WIDEN its seq-distance, so the catch is conservative
-//   (more reliable, never less). Real dups are <= WIN_SIZE NEEDS_ACK frames
-//   behind and already caught by (a) — (b) is purely a burst backstop.
-// 2*WIN_SIZE sits in (WIN_SIZE, SEEN_RING_SIZE) with margin on both sides.
-static constexpr int16_t STALE_BEHIND_THRESHOLD = 2 * WIN_SIZE;   // 32, band (16,64)
-static_assert(STALE_BEHIND_THRESHOLD > WIN_SIZE &&
-              STALE_BEHIND_THRESHOLD < static_cast<int16_t>(SEEN_RING_SIZE),
-              "high-water threshold must lie strictly between the peer window "
-              "spread (WIN_SIZE) and the exact-match ring size (SEEN_RING_SIZE)");
-
-// uint16 wrap-aware ordering. Returns a>b as a small signed delta: positive ⇒
-// a is "ahead" of b, negative ⇒ "behind". Correct across the 0xFFFF→0x0001
-// boundary because the subtraction wraps mod 2^16 and the int16_t cast
-// re-centres it into [-32768, 32767]. e.g. seq_diff(0x0001, 0xFFFF) = +2,
-// seq_diff(0xFFFF, 0x0001) = -2.
-static inline int16_t seq_diff(uint16_t a, uint16_t b) {
-    return static_cast<int16_t>(static_cast<uint16_t>(a - b));
-}
 
 static bool seen_recently(uint16_t seq, uint8_t type) {
     for (size_t i = 0; i < SEEN_RING_SIZE; i++) {
@@ -147,59 +114,20 @@ static bool seen_recently(uint16_t seq, uint8_t type) {
     return false;
 }
 
-// True ⇒ `seq` is far enough behind the monotonic high-water mark that it can
-// only be a stale retransmit (burst-evicted from the ring). Wrap-safe.
-static bool is_stale_behind_window(uint16_t seq) {
-    if (!s_rx_high_water_valid) return false;
-    return seq_diff(s_rx_high_water, seq) >= STALE_BEHIND_THRESHOLD;
-}
-
-// Advance the receive high-water (forward only, wrap-aware) to track the peer's
-// live seq. Called for EVERY inbound frame that carries a real peer seq — ACK,
-// NO_ACK data, and accepted NEEDS_ACK — NOT just NEEDS_ACK.
-//
-// Why all frames: the high-water gates is_stale_behind_window. The peer's seq
-// counter advances on every frame it sends (heartbeats, attr updates, *_RSP,
-// replies), but NEEDS_ACK replies (DEVICE_LIST/DEVICE_INFO/SET_ACK) are rare. If
-// the high-water only advanced on those rare frames, it would lag the peer's
-// live seq by the entire NO_ACK volume in between. After enough hours that lag
-// crosses 32768 (half the uint16 space); seq_diff() then wraps and reports a
-// FRESH reply (legitimately ahead) as "behind the window", so every reply is
-// silently dropped (re-ACKed, never dispatched) and — because the drop is before
-// the high-water advance — the lag never recovers. Net effect: device.list /
-// device.get / set-attribute wedge permanently while NO_ACK traffic keeps
-// flowing. Tracking all frames pins the lag to the SPI pipeline depth (~1-2
-// frames), so a fresh reply is never misclassified.
-static void note_peer_seq(uint16_t seq) {
-    if (seq == 0) return;   // 0 is the skip/uninit sentinel, never a real seq
-    if (!s_rx_high_water_valid || seq_diff(seq, s_rx_high_water) > 0) {
-        s_rx_high_water = seq;
-        s_rx_high_water_valid = true;
-    }
-}
-
 static void mark_seen(uint16_t seq, uint8_t type) {
     s_seen_ring[s_seen_head] = {seq, type};
     s_seen_head = (s_seen_head + 1) % SEEN_RING_SIZE;
-    note_peer_seq(seq);   // a freshly accepted frame also advances the high-water
 }
 
-// Reset the receive-side dedup state (high-water + seen ring). A fresh session
-// MUST clear this — both at boot (hap_session_init) and on receiving a peer
-// SYNC. A SYNC means the peer restarted its session and rewound its seq counter
-// to 1; if we keep the old high-water, every fresh low-seq NEEDS_ACK frame the
-// peer now sends is judged "far behind the window" (is_stale_behind_window) and
-// silently dropped (we still re-ACK, but never dispatch). Worse, the drop
-// happens before mark_seen, so the high-water never advances and the wedge is
-// permanent until the receiver reboots. NO_ACK traffic (heartbeats, *_RSP)
-// bypasses the gate and keeps flowing, so the link looks half-alive while
-// DEVICE_LIST/DEVICE_INFO/SET_ACK (the only P4→S3 NEEDS_ACK replies) time out
-// forever. Runs on the receive task only (same as mark_seen and the SYNC
-// handler below), so no lock is needed.
+// Reset the receive-side dedup ring. A fresh session MUST clear this — both at
+// boot (hap_session_init) and on receiving a peer SYNC. A SYNC means the peer
+// restarted its session and rewound its seq counter to 1; clearing the ring lets
+// the peer's restarted low seqs be accepted clean instead of colliding with a
+// stale (seq,type) still in the ring and being wrongly deduped. Runs on the
+// receive task only (same as mark_seen and the SYNC handler below), so no lock
+// is needed.
 static void reset_rx_dedup() {
-    s_rx_high_water       = 0;
-    s_rx_high_water_valid = false;
-    s_seen_head           = 0;
+    s_seen_head = 0;
     memset(s_seen_ring, 0, sizeof(s_seen_ring));
 }
 
@@ -233,11 +161,11 @@ void hap_session_init(const HapSessionCfg& cfg) {
     }
     s_cfg      = cfg;
     s_next_seq = 1;
-    // Fresh session: reset the receive-side dedup high-water and ring so a
-    // stale mark from a prior session (which reset s_next_seq back to 1) can't
-    // wrongly classify the first post-init frames as "behind the window".
-    // (hap_session_reset_link deliberately PRESERVES these — seq continuity is
-    // kept there; only a full re-init or a peer SYNC starts the seq space over.)
+    // Fresh session: reset the receive-side dedup ring so a stale (seq,type)
+    // mark from a prior session (which reset s_next_seq back to 1) can't wrongly
+    // dedup the first post-init frames. (hap_session_reset_link deliberately
+    // PRESERVES the ring — seq continuity is kept there; only a full re-init or a
+    // peer SYNC starts the seq space over.)
     reset_rx_dedup();
     for (int i = 0; i < WIN_SIZE; i++) {
         if (first) {
@@ -410,18 +338,16 @@ void hap_session_on_receive(const HapFrame& frame) {
                      frame.ack_seq, frame.seq);
         }
         xSemaphoreGive(s_mutex);
-        note_peer_seq(frame.seq);   // ACK carries the peer's live seq — keep high-water current
         return;
     }
 
     if (frame.type == HapMsgType::SYNC) {
         // Peer (re)started its session ⇒ its seq counter rewound to 1. Clear our
-        // receive-side dedup so the peer's restarted seq space is accepted clean
-        // instead of being silently dropped as "behind the window". Without this
-        // a P4 restart while S3 stays up wedges device.list/get/set forever
-        // (heartbeats and NO_ACK *_RSP keep flowing, masking it). SYNC is rare
-        // (connect/reconnect only) and the peer's retransmit window is reset too,
-        // so there are no genuine in-flight dups to lose by clearing here.
+        // receive-side dedup ring so the peer's restarted low seqs are accepted
+        // clean instead of colliding with a stale (seq,type) left in the ring and
+        // being wrongly deduped. SYNC is rare (connect/reconnect only) and the
+        // peer's retransmit window is reset too, so there are no genuine in-flight
+        // dups to lose by clearing here.
         reset_rx_dedup();
         if (s_cfg.on_sync) s_cfg.on_sync(frame);
         return;
@@ -431,14 +357,12 @@ void hap_session_on_receive(const HapFrame& frame) {
     //
     // Defect 3 (FINDINGS §1.3): drop-without-dispatch a duplicate NEEDS_ACK
     // frame so the handler never runs twice on a peer retransmit. A frame is a
-    // duplicate if EITHER the recent (seq,type) ring still holds it (exact
-    // recent dup) OR it is far behind the monotonic high-water mark (a dup that
-    // was burst-evicted from the ring). We still re-send the ACK — the peer is
-    // retransmitting precisely because our prior ACK was lost — but we do NOT
-    // re-dispatch to on_frame.
+    // duplicate iff the recent (seq,type) ring still holds it (a lost-ACK
+    // retransmit of a frame we already handled). We still re-send the ACK — the
+    // peer is retransmitting precisely because our prior ACK was lost — but we do
+    // NOT re-dispatch to on_frame.
     if ((frame.flags & HAP_FLAG_NEEDS_ACK) &&
-        (seen_recently(frame.seq, static_cast<uint8_t>(frame.type)) ||
-         is_stale_behind_window(frame.seq))) {
+        seen_recently(frame.seq, static_cast<uint8_t>(frame.type))) {
         HapFrame ack = hap_make_reply(frame, HapMsgType::ACK, HAP_FLAG_NO_ACK);
         ack.seq = hap_session_next_seq();
         s_cfg.send(ack);
@@ -459,12 +383,6 @@ void hap_session_on_receive(const HapFrame& frame) {
     // so building the ACK after dispatch is safe.
     if (frame.flags & HAP_FLAG_NEEDS_ACK) {
         mark_seen(frame.seq, static_cast<uint8_t>(frame.type));
-    } else {
-        // NO_ACK data (heartbeats, attr updates, *_RSP) carries the peer's live
-        // seq and MUST advance the high-water too — otherwise it lags the live
-        // seq by the whole NO_ACK volume and eventually wraps the stale check
-        // (see note_peer_seq). These frames are not deduped, so no ring entry.
-        note_peer_seq(frame.seq);
     }
 
     if (s_cfg.on_frame) s_cfg.on_frame(frame);

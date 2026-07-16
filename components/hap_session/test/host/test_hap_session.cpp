@@ -21,9 +21,10 @@
 //                    emitting a SYNC and WITHOUT restarting the seq counter.
 //   • SYNC:          a received SYNC fires on_sync and resets receive-side dedup
 //                    so a previously-seen seq is accepted again.
-//   • high-water:    NO_ACK traffic advances the monotonic high-water (the
-//                    wrap-fix), and the stale check is uint16-wrap-aware across
-//                    the 0xFFFF->0 boundary.
+//   • dedup scope:   dedup is the exact (seq,type) ring ONLY — a genuinely-fresh
+//                    NEEDS_ACK frame is dispatched even when it arrives far
+//                    "behind" recent high-seq NO_ACK bulk (regression guard for
+//                    the stale-behind false-drop wedge).
 //   • window-full:   the WIN_SIZE+1-th in-flight NEEDS_ACK send is refused;
 //                    NO_ACK still bypasses; an ACK frees a slot for a refit.
 //
@@ -303,49 +304,55 @@ int main() {
               "SYNC reset the dedup state — the previously-seen seq is accepted again");
     }
 
-    // ── Group 9a: NO_ACK traffic advances the monotonic high-water ───────────
-    // (the wrap-fix: without advancing on NO_ACK frames the high-water would lag
-    //  the peer's live seq and eventually mis-drop fresh replies.)
+    // ── Group 9: dedup is the exact (seq,type) ring ONLY — a fresh frame behind
+    //    recent bulk is still dispatched. Regression test for the stale-behind
+    //    false-drop wedge: sustained NO_ACK bulk (e.g. a chatty Tuya sensor's
+    //    attr reports) races the shared seq counter far ahead; a genuinely-fresh
+    //    NEEDS_ACK reply whose first transmit was lost then arrives (this
+    //    retransmit is its FIRST successful receipt) carrying an older, now-far-
+    //    "behind" seq. It MUST be dispatched — dropping it wedged device.list /
+    //    device.get / set-attribute. Only an exact (seq,type) ring hit is a dup.
     hap_session_init(cfg);
     reset_recorders();
     {
         hap_session_on_receive(mk(HapMsgType::CMD, 100, HAP_FLAG_NEEDS_ACK));
-        CHECK(g_on_frame_count == 1, "NEEDS_ACK seq=100 accepted (sets high-water=100)");
+        CHECK(g_on_frame_count == 1, "NEEDS_ACK seq=100 accepted (enters the dedup ring)");
 
         reset_recorders();
         hap_session_on_receive(mk(HapMsgType::DEVICE_EVENT, 200, HAP_FLAG_NO_ACK));
-        CHECK(g_on_frame_count == 1, "NO_ACK seq=200 is dispatched (not deduped) ...");
+        CHECK(g_on_frame_count == 1, "NO_ACK seq=200 bulk is dispatched (races the seq far ahead)");
 
         reset_recorders();
-        hap_session_on_receive(mk(HapMsgType::CMD, 150, HAP_FLAG_NEEDS_ACK));
-        CHECK(g_on_frame_count == 0,
-              "... and it advanced the high-water: NEEDS_ACK seq=150 is now dropped as stale");
+        // seq=150 is 50 behind the latest bulk (>= the old 2*WIN_SIZE=32 threshold)
+        // yet was never dispatched — it is FRESH and must NOT be stale-dropped.
+        hap_session_on_receive(mk(HapMsgType::DEVICE_LIST, 150, HAP_FLAG_NEEDS_ACK));
+        CHECK(g_on_frame_count == 1,
+              "a FRESH NEEDS_ACK frame far behind recent NO_ACK bulk is DISPATCHED (no stale false-drop)");
         CHECK(g_sent.size() == 1 && g_sent[0].type == HapMsgType::ACK && g_sent[0].ack_seq == 150,
-              "the stale-dropped duplicate is still re-ACKed");
+              "and the fresh frame is ACKed normally (ack_seq=150)");
+
+        // An EXACT (seq,type) repeat IS a real duplicate — deduped + re-ACKed.
+        reset_recorders();
+        hap_session_on_receive(mk(HapMsgType::DEVICE_LIST, 150, HAP_FLAG_NEEDS_ACK));
+        CHECK(g_on_frame_count == 0, "an exact (seq,type) repeat is still deduped via the ring");
+        CHECK(g_sent.size() == 1 && g_sent[0].type == HapMsgType::ACK && g_sent[0].ack_seq == 150,
+              "the exact duplicate is re-ACKed (peer lost our first ACK)");
     }
 
-    // ── Group 9b: the stale check is uint16-wrap-aware across 0xFFFF->0 ───────
+    // ── Group 9c: a fresh frame across the uint16 wrap is likewise dispatched ──
+    //    (no stale/high-water check remains to wrap-mis-classify a fresh reply).
     hap_session_init(cfg);
     reset_recorders();
     {
-        // Accept a frame near the top of the seq space, then walk the high-water
-        // across the wrap with NO_ACK frames (each < half-space ahead so it
-        // advances forward). None land on 0 (the note_peer_seq sentinel).
         hap_session_on_receive(mk(HapMsgType::CMD, 0xFFF0, HAP_FLAG_NEEDS_ACK));
-        const uint16_t walk[] = {0xFFFA, 0x0004, 0x000E, 0x0018};   // steps of 0x0A, crosses 0
+        const uint16_t walk[] = {0xFFFA, 0x0004, 0x000E, 0x0018};   // NO_ACK bulk, crosses 0
         for (uint16_t s : walk) {
             hap_session_on_receive(mk(HapMsgType::DEVICE_EVENT, s, HAP_FLAG_NO_ACK));
         }
-        // high-water is now 0x0018 having wrapped past 0xFFFF.
-        reset_recorders();
-        hap_session_on_receive(mk(HapMsgType::CMD, 0x0019, HAP_FLAG_NEEDS_ACK));
-        CHECK(g_on_frame_count == 1,
-              "post-wrap: a fresh frame just ahead of the wrapped high-water is accepted");
-
         reset_recorders();
         hap_session_on_receive(mk(HapMsgType::CMD, 0xFFD0, HAP_FLAG_NEEDS_ACK));
-        CHECK(g_on_frame_count == 0,
-              "post-wrap: a frame wrap-distance >= threshold behind is dropped as stale");
+        CHECK(g_on_frame_count == 1,
+              "post-wrap: a fresh frame far 'behind' the wrapped bulk is still dispatched");
     }
 
     // ── Group 10: sliding-window capacity (WIN_SIZE) ─────────────────────────

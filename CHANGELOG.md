@@ -31,6 +31,34 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **hap_session — remove the stale-behind high-water dedup arm that wedged
+  device.list / device.get / set-attribute under heavy sensor traffic.** The
+  receive-side duplicate filter had a second arm that dropped any `NEEDS_ACK`
+  frame more than `2×WIN_SIZE` (32) seqs behind a monotonic high-water. Because
+  the HAP seq space is a SINGLE uint16 counter shared by all frame types, a
+  chatty device's `NO_ACK` `BULK_STATE_UPDATE` reports (~6/s from a Tuya air
+  sensor) raced the high-water far ahead; a genuinely-fresh `NEEDS_ACK` reply
+  (e.g. a `DEVICE_LIST` page) whose first transmit was lost then arrived on
+  retransmit carrying its original, now-far-"behind" seq — the arm mis-classified
+  it as a stale duplicate and dropped it WITHOUT dispatch, so the S3 roundtrip
+  waiter timed out (5 s) while the P4 retransmitted the reply 5× and declared the
+  link dead. Reproduced on hardware by creating a group in the web UI (a
+  coincident device.list refresh) — groups themselves are S3-local NVS and send
+  no HAP frame, so they were not the cause. On a shared counter no finite
+  threshold separates "fresh but late" from "ancient dup", so the arm was unsound:
+  dedup is now the exact `(seq,type)` `SEEN_RING` (64 entries) ONLY, which already
+  exceeds the peer's 16-frame retransmit window. Trade-off: a duplicate evicted
+  from the ring (needs >64 distinct `NEEDS_ACK` frames inside one 5 s retransmit
+  window — unreachable for the rare reply/control types) degrades to a harmless
+  double-dispatch, never a link wedge. Removing the arm also subsumes the earlier
+  uint16-wrap high-water fix (`v2026061401`). The flaw sat in the shared,
+  type-agnostic RX path, so it affected EVERY `NEEDS_ACK` request/reply type
+  (GET_DEVICES/DEVICE_LIST, DEVICE_INFO, SET_ACK, and all S3→P4 requests) — the
+  single removal fixes them all. Host suite updated (a fresh far-behind frame is
+  now dispatched; SYNC-reset re-proved via the ring); IDF Unity cases reworked off
+  the removed high-water. **HW-test-pending** (reflash both cores; soak with a
+  chatty sensor + repeated device.list).
+
 - **zhc_adapter — stop overwriting the decoder's manufacturer-aware cluster name
   (CODEX M-01).** `decode_frame()` sets `DecodedMessage::cluster` via the
   manufacturer-aware `cluster_name(id, mfg_code, mfg_specific)`; the adapter then
