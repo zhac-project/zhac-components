@@ -929,6 +929,23 @@ static bool coordinator_start() {
 
     // Step 7: AF_REGISTER (EP=1, profile=0x0104 HA, device=0x0005)
     {
+#if CONFIG_ZHAC_SPIKE_COORD_GROUP_JOIN
+        // SPIKE (native-groups Part B): advertise the Groups (0x0004) cluster as
+        // an INPUT cluster so the ZNP may stand up a Groups server on EP1 — the
+        // prerequisite for the loopback self Add-Group (below) to actually
+        // populate the APS group table and let the coordinator receive a
+        // zone-remote's groupcasts. Default builds register 0 clusters.
+        uint8_t pl[] = {
+            0x01,         // endpoint = 1
+            0x04, 0x01,   // app_profile_id = 0x0104 HA
+            0x05, 0x00,   // app_device_id = 0x0005
+            0x00,         // app_device_version
+            0x00,         // latency
+            0x01,         // app_in_cluster_count = 1
+            0x04, 0x00,   //   cluster 0x0004 (Groups) LE
+            0x00,         // app_out_cluster_count = 0
+        };
+#else
         uint8_t pl[] = {
             0x01,         // endpoint = 1
             0x04, 0x01,   // app_profile_id = 0x0104 HA
@@ -938,6 +955,7 @@ static bool coordinator_start() {
             0x00,         // app_in_cluster_count = 0
             0x00,         // app_out_cluster_count = 0
         };
+#endif
         // AF_REGISTER: status 0x00=success, 0xB8=ZApsDuplicateEntry, 0x08=ZMemError/already-exists — all OK.
         MtFrame req{}; req.cmd0 = MT_SREQ(ZNP_AF); req.cmd1 = 0x00;
         req.payload = pl; req.payload_len = sizeof(pl);
@@ -1018,6 +1036,30 @@ static bool coordinator_start() {
     };
     if (!reg_cb(0x00CA, "JOIN")) return false;
     if (!reg_cb(0x00C9, "LEAVE")) return false;
+
+#if CONFIG_ZHAC_SPIKE_COORD_GROUP_JOIN
+    // SPIKE (native-groups Part B): try to make THIS coordinator a member of a
+    // group so it receives a hardware zone-remote's groupcasts (MiBoxer FUT089Z
+    // → 101-108). Mechanism = loopback a ZCL Add-Group to our own short address
+    // (0x0000)/EP1; it only actually joins if the ZNP runs a Groups server that
+    // calls aps_AddGroup on it. Reuses the Part A sender.
+    //
+    // HOW TO READ THE RESULT after flashing:
+    //   • Press the FUT089Z zone whose group id == CONFIG_ZHAC_SPIKE_COORD_GROUP_ID.
+    //   • JOIN WORKED  → you see a "[zhc-lib] … FUT089Z … action=… zone=…" decode
+    //     line (or an on_af_incoming_msg log with group=<gid>, i.e. non-zero).
+    //   • JOIN FAILED  → nothing arrives for that press (APS still filtered it),
+    //     OR only a single loopback echo of our own Add-Group appears at boot.
+    {
+        const uint16_t gid = (uint16_t)CONFIG_ZHAC_SPIKE_COORD_GROUP_ID;
+        ESP_LOGW(TAG, "SPIKE coord-group-join: loopback ZCL Add-Group gid=%u -> self "
+                      "(0x0000/EP1)", gid);
+        zigbee_zcl_group_add(0x0000, 1, gid);
+        ESP_LOGW(TAG, "SPIKE coord-group-join: sent. Press remote zone for gid=%u and "
+                      "watch for a FUT089Z decode / AF_INCOMING group=0x%04x (non-zero "
+                      "= JOIN WORKED)", gid, gid);
+    }
+#endif
 
     s_init_done = true;
     ESP_LOGI(TAG, "ZNP coordinator ready");

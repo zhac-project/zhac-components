@@ -1,0 +1,34 @@
+# zigbee_mgr component options.
+
+menu "ZHAC zigbee_mgr"
+
+config ZHAC_SPIKE_COORD_GROUP_JOIN
+    bool "SPIKE: coordinator joins an APS group (native-groups Part B experiment)"
+    default n
+    help
+      EXPERIMENTAL — leave OFF for production. Tests whether this radio's ZNP
+      will let the coordinator RECEIVE groupcast frames that a hardware
+      zone-remote (MiBoxer FUT089Z, groups 101-108) sends, so the remote's
+      button presses reach the ZHAC rule engine.
+
+      When enabled it (1) advertises the ZCL Groups (0x0004) cluster as an INPUT
+      cluster on coordinator endpoint 1 (so the ZNP may instantiate a Groups
+      server there), and (2) after init, loopback-sends a ZCL Add-Group command
+      to the coordinator's own short address (0x0000) endpoint 1, attempting to
+      join CONFIG_ZHAC_SPIKE_COORD_GROUP_ID.
+
+      On a stock TI ZNP the ZCL layer runs on the host, so the loopback may only
+      be delivered back as an AF_INCOMING frame rather than joining the group —
+      that negative result is exactly what the spike measures. See
+      extra/docs/NATIVE_ZCL_GROUPS_DESIGN.md (Part B).
+
+config ZHAC_SPIKE_COORD_GROUP_ID
+    int "SPIKE: group id the coordinator tries to join"
+    depends on ZHAC_SPIKE_COORD_GROUP_JOIN
+    default 101
+    range 1 65535
+    help
+      MiBoxer FUT089Z maps zone 1 to group 101 by default. Set this to the group
+      id of the zone button you will press during the test.
+
+endmenu
