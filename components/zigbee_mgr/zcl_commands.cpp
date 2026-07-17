@@ -152,6 +152,50 @@ bool zigbee_zcl_on_off(uint16_t nwk_addr, uint8_t ep, uint8_t cmd) {
     return true;
 }
 
+// ZCL Groups cluster (0x0004): add/remove a device endpoint's group membership.
+// Groups is a DEVICE-SIDE table — a light that is a member of group N obeys any
+// command sent to group N, including the groupcasts a hardware zone-remote
+// emits (MiBoxer FUT089Z: zones 1-8 = groups 101-108). This is native ZCL
+// membership, distinct from ZHAC's synthetic (gateway fan-out) groups. We gate
+// on the APS delivery confirm only; the device's ZCL Group (Add/Remove) Response
+// status is not parsed here — authoritative state comes from Get Group
+// Membership (the "refresh from device" path).
+bool zigbee_zcl_group_add(uint16_t nwk_addr, uint8_t ep, uint16_t group_id) {
+    const uint8_t seq = zcl_seq_next();
+    // FC 0x01 (cluster-specific, C→S), seq, cmd 0x00 (Add Group),
+    // payload = group_id (2 B LE) + name length 0x00 (no name).
+    const uint8_t zcl_frame[6] = {
+        0x01, seq, 0x00,
+        static_cast<uint8_t>(group_id & 0xFF),
+        static_cast<uint8_t>((group_id >> 8) & 0xFF),
+        0x00,
+    };
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL Group Add"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0004, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
+        return false;
+    ESP_LOGI(TAG, "ZCL Group Add gid=%u → nwk=0x%04x ep=%d", group_id, nwk_addr, ep);
+    return true;
+}
+
+bool zigbee_zcl_group_remove(uint16_t nwk_addr, uint8_t ep, uint16_t group_id) {
+    const uint8_t seq = zcl_seq_next();
+    // FC 0x01, seq, cmd 0x03 (Remove Group), payload = group_id (2 B LE).
+    const uint8_t zcl_frame[5] = {
+        0x01, seq, 0x03,
+        static_cast<uint8_t>(group_id & 0xFF),
+        static_cast<uint8_t>((group_id >> 8) & 0xFF),
+    };
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL Group Remove"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0004, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
+        return false;
+    ESP_LOGI(TAG, "ZCL Group Remove gid=%u → nwk=0x%04x ep=%d", group_id, nwk_addr, ep);
+    return true;
+}
+
 bool zigbee_permit_join(uint8_t duration_s) {
     // ZDO_MGMT_PERMIT_JOIN_REQ payload:
     //   AddrMode(1) + DstAddr(2 LE) + Duration(1) + TCSignificance(1) = 5 bytes

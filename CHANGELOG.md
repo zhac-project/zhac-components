@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **zigbee_mgr — ZCL Groups (0x0004) membership send: `zigbee_zcl_group_add` /
+  `zigbee_zcl_group_remove`.** Add/remove a device endpoint's native ZCL group
+  membership (Add Group cmd 0x00 / Remove Group cmd 0x03) via the existing
+  `af_data_request` builder. A device that is a member of group N obeys any
+  command sent to N — including the groupcasts a hardware zone-remote emits
+  (MiBoxer FUT089Z: zones 1-8 = groups 101-108), so lights respond to the remote
+  directly, gateway-independent. Delivery-confirmed only; authoritative state
+  (Get Group Membership) is a later increment. Part A of the native-groups
+  design (`extra/docs/NATIVE_ZCL_GROUPS_DESIGN.md`). **HW-test-pending.**
+
 - **simple_rules — value expressions in rule actions (Tier 2).** The `<value>` of
   `zigbee.set` and the `<payload>` of `publish` now accept an integer expression
   over `%value%` — `!%value%` (invert), `%value%/100` (scale), `(%value%*10)/3+5`

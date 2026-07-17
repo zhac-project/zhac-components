@@ -16,6 +16,12 @@ bool zigbee_permit_join(uint8_t duration_s);
 // cluster must be 0x0006. cmd: 0x00=Off, 0x01=On, 0x02=Toggle.
 bool zigbee_zcl_on_off(uint16_t nwk_addr, uint8_t ep, uint8_t cmd);
 
+// Add / remove a device endpoint's ZCL Groups (0x0004) membership. A member of
+// group N obeys commands (incl. hardware zone-remote groupcasts) sent to N.
+// Delivery-confirmed only; authoritative state via Get Group Membership.
+bool zigbee_zcl_group_add(uint16_t nwk_addr, uint8_t ep, uint16_t group_id);
+bool zigbee_zcl_group_remove(uint16_t nwk_addr, uint8_t ep, uint16_t group_id);
+
 // Send ZCL MoveToLevel (cluster 0x0008, cmd 0x04) to a device endpoint.
 // level: 0–254. transition_tenths: transition time in 1/10 s (0 = immediate).
 bool zigbee_zcl_level(uint16_t nwk_addr, uint8_t ep, uint8_t level,
