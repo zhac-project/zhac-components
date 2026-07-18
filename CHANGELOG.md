@@ -9,6 +9,14 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **ZCL Get Group Membership readback (native-groups inc 2b).**
+  `zigbee_zcl_get_group_membership` reads a device's ACTUAL ZCL group table
+  (Groups cmd 0x02) via a single-shot AF_INCOMING waiter keyed on src_nwk +
+  cluster 0x0004 + the ZCL tsn — mirroring the interview genBasic read; the
+  interceptor is wired into `on_af_incoming_msg`. New HAP message types
+  `GROUP_MEMBER_QUERY` / `GROUP_MEMBER_LIST` (0x16/0x17) + `hap_json_decode_group_query`
+  carry the S3↔P4 request/response.
+
 - **zigbee_mgr — `zigbee_zcl_identify` (Identify cluster 0x0003 cmd 0x00).** Sends
   a ZCL Identify with a duration so a device blinks/beeps; used by the Collections
   command fan-out's Identify button.
