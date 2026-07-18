@@ -22,6 +22,9 @@ bool zigbee_zcl_on_off(uint16_t nwk_addr, uint8_t ep, uint8_t cmd);
 bool zigbee_zcl_group_add(uint16_t nwk_addr, uint8_t ep, uint16_t group_id);
 bool zigbee_zcl_group_remove(uint16_t nwk_addr, uint8_t ep, uint16_t group_id);
 
+// Send ZCL Identify (0x0003 cmd 0x00): the device blinks/beeps for `seconds`.
+bool zigbee_zcl_identify(uint16_t nwk_addr, uint8_t ep, uint16_t seconds);
+
 // Send ZCL MoveToLevel (cluster 0x0008, cmd 0x04) to a device endpoint.
 // level: 0–254. transition_tenths: transition time in 1/10 s (0 = immediate).
 bool zigbee_zcl_level(uint16_t nwk_addr, uint8_t ep, uint8_t level,

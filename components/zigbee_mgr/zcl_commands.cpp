@@ -196,6 +196,24 @@ bool zigbee_zcl_group_remove(uint16_t nwk_addr, uint8_t ep, uint16_t group_id) {
     return true;
 }
 
+bool zigbee_zcl_identify(uint16_t nwk_addr, uint8_t ep, uint16_t seconds) {
+    const uint8_t seq = zcl_seq_next();
+    // ZCL Identify (0x0003) cmd 0x00 (Identify): FC 0x01, seq, cmd, then the
+    // IdentifyTime attribute value (u16 LE, seconds the device blinks/beeps).
+    const uint8_t zcl_frame[5] = {
+        0x01, seq, 0x00,
+        static_cast<uint8_t>(seconds & 0xFF),
+        static_cast<uint8_t>((seconds >> 8) & 0xFF),
+    };
+    const AfReqOpts opts{2000, 1, /*idempotent=*/false, /*confirm=*/2000,
+                         ESP_LOG_ERROR, "ZCL Identify"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0003, seq,
+                         zcl_frame, sizeof(zcl_frame), opts))
+        return false;
+    ESP_LOGI(TAG, "ZCL Identify %us → nwk=0x%04x ep=%d", seconds, nwk_addr, ep);
+    return true;
+}
+
 bool zigbee_permit_join(uint8_t duration_s) {
     // ZDO_MGMT_PERMIT_JOIN_REQ payload:
     //   AddrMode(1) + DstAddr(2 LE) + Duration(1) + TCSignificance(1) = 5 bytes

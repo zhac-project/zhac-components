@@ -9,6 +9,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **zigbee_mgr — `zigbee_zcl_identify` (Identify cluster 0x0003 cmd 0x00).** Sends
+  a ZCL Identify with a duration so a device blinks/beeps; used by the Collections
+  command fan-out's Identify button.
+
 - **zigbee_mgr — ZCL Groups (0x0004) membership send: `zigbee_zcl_group_add` /
   `zigbee_zcl_group_remove`.** Add/remove a device endpoint's native ZCL group
   membership (Add Group cmd 0x00 / Remove Group cmd 0x03) via the existing
