@@ -15,6 +15,7 @@
 #include <cstring>
 #include "task_stacks.h"
 #include "metrics/metrics_macros.h"
+#include "zap_store.h"   // RainMaker bridge Phase 2: zhac_uplink_get()/ZHAC_UPLINK_*
 
 static const char* TAG = "mqtt_gw_s3";
 
@@ -134,6 +135,22 @@ static void restart_client_locked() {
         esp_mqtt_client_stop(s_client);
         esp_mqtt_client_destroy(s_client);
         s_client = nullptr;
+    }
+    // RainMaker bridge Phase 2: this is the SOLE place that ever calls
+    // esp_mqtt_client_init/start (every lifecycle entry — mqtt_gw_start,
+    // the STA-up deferred start, the auto-disable cooldown re-arm,
+    // set_broker_url, set_client_id — routes through here, same reasoning
+    // as the "no separate locking wrapper" note above). Gating it here is
+    // therefore equivalent to gating every start path individually, without
+    // duplicating the check. An absent NVS key (pre-selector devices)
+    // resolves to ZHAC_UPLINK_CUSTOM_MQTT in zap_store, so this is a no-op
+    // for default/existing configurations. The teardown above still runs
+    // first so a runtime selector flip away from custom_mqtt — observed by
+    // a stale caller re-entering here before mqtt_gw_stop() is invoked —
+    // can't leave a stray client running.
+    if (zhac_uplink_get() != ZHAC_UPLINK_CUSTOM_MQTT) {
+        ESP_LOGI(TAG, "uplink != custom_mqtt — mqtt_gw disabled");
+        return;
     }
     // F-09: refuse to start the client without an explicit broker URL.
     // The Kconfig fallback used to silently connect to whatever URL the
