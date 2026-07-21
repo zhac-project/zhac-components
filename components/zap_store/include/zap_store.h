@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include <stdbool.h>
+#include "esp_err.h"
 #include "zap_common.h"
 
 // ── Schema migration & namespace contract ────────────────────────────────
@@ -105,3 +106,26 @@ void zap_store_flush_now();
 // was pending); false if the NVS write failed or an in-flight write did
 // not settle within the bounded wait.
 bool zap_store_flush_device(uint64_t ieee);
+
+// ── Uplink selector ──────────────────────────────────────────────────────
+//
+// Runtime choice of which cloud uplink connects: an existing configured
+// custom MQTT broker, no cloud uplink at all, or the RainMaker bridge.
+// Persisted as a single `u8` under key "uplink" in this component's
+// existing namespace — deliberately NOT a new namespace for one byte (see
+// the schema-migration contract above). An absent key (devices that
+// predate this selector) or an out-of-range stored value both resolve to
+// ZHAC_UPLINK_CUSTOM_MQTT: already-deployed devices with a configured
+// broker keep working, and devices with no broker configured lose nothing
+// (mqtt_gw already no-ops on an empty URL).
+typedef enum { ZHAC_UPLINK_CUSTOM_MQTT = 0,   // default when NVS key absent (backward compat)
+               ZHAC_UPLINK_NONE       = 1,
+               ZHAC_UPLINK_RAINMAKER  = 2 } zhac_uplink_t;
+
+// Read the persisted uplink selection. Falls back to ZHAC_UPLINK_CUSTOM_MQTT
+// when the key is absent or holds a value outside the enum's range.
+zhac_uplink_t zhac_uplink_get(void);
+
+// Persist the uplink selection. Returns the underlying NVS error code
+// (ESP_OK on success).
+esp_err_t zhac_uplink_set(zhac_uplink_t u);
