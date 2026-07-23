@@ -504,6 +504,9 @@ static void on_af_incoming_msg(const MtFrame& f) {
     // Let the interview interceptor check for Basic cluster responses
     zigbee_interview_on_af_incoming(f.payload, f.payload_len);
 
+    // ZCL Get Group Membership Response interceptor (device.groups.refresh).
+    zigbee_zcl_groups_on_af_incoming(f.payload, f.payload_len);
+
     // Late-identity enrichment: any Basic-cluster frame (report or
     // read-attr response) promotes IDENTITY_PENDING devices and triggers
     // re-match. Non-Basic frames are filtered cheaply inside the helper.

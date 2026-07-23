@@ -66,6 +66,8 @@ enum class HapMsgType : uint8_t {
     GET_DEVICES       = 0x10, DEVICE_LIST       = 0x11,
     GET_DEVICE_BY_ID  = 0x12, DEVICE_INFO       = 0x13,
     SET_ATTRIBUTE     = 0x14, SET_ACK           = 0x15,
+    GROUP_MEMBER_QUERY = 0x16,  // S3→P4: {"ieee","ep"} — read device ZCL group membership
+    GROUP_MEMBER_LIST  = 0x17,  // P4→S3: {"ok":bool,"gids":[...]} (Get Group Membership readback)
     DEVICE_EVENT      = 0x20, DEVICE_JOIN       = 0x21,
     DEVICE_LEAVE      = 0x22, ALERT             = 0x23,
     DEVICE_SET_NAME   = 0x24,

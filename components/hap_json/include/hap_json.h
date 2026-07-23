@@ -146,6 +146,10 @@ bool hap_json_encode_device_set_name(uint8_t* buf, size_t cap, uint16_t* out_len
 bool hap_json_decode_device_set_name(const uint8_t* payload, uint16_t len,
                                       uint64_t* ieee_out, char* name_out, size_t name_max);
 
+// ── GROUP_MEMBER_QUERY (0x16): {"ieee","ep"} ────────────────────────────────
+bool hap_json_decode_group_query(const uint8_t* payload, uint16_t len,
+                                 uint64_t* ieee_out, uint8_t* ep_out);
+
 // ── DEVICE_JOIN (0x21) / DEVICE_LEAVE (0x22) ─────────────────────────────
 // Payload: {"ieee":"0xXXXXXXXXXXXXXXXX"}
 bool hap_json_encode_device_join(uint8_t* buf, size_t cap, uint16_t* out_len,

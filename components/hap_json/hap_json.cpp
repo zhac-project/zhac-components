@@ -462,6 +462,18 @@ bool hap_json_decode_device_set_name(const uint8_t* payload, uint16_t len,
     return true;
 }
 
+// ── GROUP_MEMBER_QUERY: {"ieee","ep"} ───────────────────────────────────────
+bool hap_json_decode_group_query(const uint8_t* payload, uint16_t len,
+                                 uint64_t* ieee_out, uint8_t* ep_out) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, len) != DeserializationError::Ok) return false;
+    const char* s = doc["ieee"] | "";
+    if (s[0] == '\0') return false;
+    *ieee_out = parse_ieee(s);
+    *ep_out = doc["ep"] | (uint8_t)1;
+    return true;
+}
+
 // ── DEVICE_JOIN / DEVICE_LEAVE ────────────────────────────────────────────
 bool hap_json_encode_device_join(uint8_t* buf, size_t cap, uint16_t* out_len,
                                   uint64_t ieee) {

@@ -25,6 +25,15 @@ bool zigbee_zcl_group_remove(uint16_t nwk_addr, uint8_t ep, uint16_t group_id);
 // Send ZCL Identify (0x0003 cmd 0x00): the device blinks/beeps for `seconds`.
 bool zigbee_zcl_identify(uint16_t nwk_addr, uint8_t ep, uint16_t seconds);
 
+// Read a device's actual ZCL group membership (Get Group Membership, cmd 0x02).
+// Blocks up to 5 s for the device's response; fills out_gids (≤ max) + out_count.
+// Returns true iff a response was received (out_count may be 0).
+bool zigbee_zcl_get_group_membership(uint16_t nwk_addr, uint8_t ep,
+                                     uint16_t* out_gids, uint8_t max, uint8_t* out_count);
+// AF_INCOMING interceptor for the Get Group Membership Response — call from
+// on_af_incoming_msg (UART RX task) with the raw MT payload.
+void zigbee_zcl_groups_on_af_incoming(const uint8_t* payload, uint8_t payload_len);
+
 // Send ZCL MoveToLevel (cluster 0x0008, cmd 0x04) to a device endpoint.
 // level: 0–254. transition_tenths: transition time in 1/10 s (0 = immediate).
 bool zigbee_zcl_level(uint16_t nwk_addr, uint8_t ep, uint8_t level,

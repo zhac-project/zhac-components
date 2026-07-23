@@ -8,8 +8,11 @@
 #include "zcl_seq.h"   // zcl_seq_next()
 #include "zhc_adapter.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <ctime>
+#include <atomic>
 
 static const char* TAG = "zcl_commands";
 
@@ -211,6 +214,83 @@ bool zigbee_zcl_identify(uint16_t nwk_addr, uint8_t ep, uint16_t seconds) {
                          zcl_frame, sizeof(zcl_frame), opts))
         return false;
     ESP_LOGI(TAG, "ZCL Identify %us → nwk=0x%04x ep=%d", seconds, nwk_addr, ep);
+    return true;
+}
+
+// ── ZCL Get Group Membership (refresh-from-device, native-groups inc 2b) ─────
+// Reads a device's actual ZCL group table. Mirrors the interview genBasic read:
+// arm a single-shot waiter keyed on src_nwk + cluster 0x0004 + cmd 0x02 + the
+// ZCL tsn we sent, fire the request, block on a semaphore until the RX task's
+// interceptor delivers the Get Group Membership Response.
+static SemaphoreHandle_t     s_grp_sem = nullptr;
+static uint8_t               s_grp_buf[128];   // raw ZCL frame of the response
+static uint8_t               s_grp_len = 0;
+static std::atomic<uint16_t> s_grp_expect_nwk{0xFFFF};   // 0xFFFF = not waiting
+static std::atomic<uint8_t>  s_grp_expect_tsn{0};        // ZCL seq we sent
+
+// Called from on_af_incoming_msg (UART RX task), pre-queue. `payload` is the raw
+// AF_INCOMING_MSG MT payload: [group2][cluster2][src_nwk2][src_ep1]…[len@16][zcl@17].
+void zigbee_zcl_groups_on_af_incoming(const uint8_t* payload, uint8_t payload_len) {
+    uint16_t want = s_grp_expect_nwk.load(std::memory_order_acquire);
+    if (want == 0xFFFF) return;                 // not waiting
+    if (payload_len < 17) return;
+    const uint16_t cluster = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint16_t src_nwk = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+    if (cluster != 0x0004 || src_nwk != want) return;
+    uint8_t data_len = payload[16];
+    if (17u + data_len > payload_len || data_len < 3) return;
+    const uint8_t* zcl = payload + 17;
+    const bool mfg = (zcl[0] & 0x04) != 0;
+    uint8_t tsn = zcl[mfg ? 3 : 1];
+    uint8_t cmd = zcl[mfg ? 4 : 2];
+    if (cmd != 0x02) return;                    // not a Get Group Membership Rsp
+    if (tsn != s_grp_expect_tsn.load(std::memory_order_acquire)) return;
+    if (!s_grp_expect_nwk.compare_exchange_strong(want, 0xFFFF, std::memory_order_acq_rel))
+        return;                                 // another delivery claimed it
+    s_grp_len = (data_len < sizeof(s_grp_buf)) ? data_len : sizeof(s_grp_buf);
+    memcpy(s_grp_buf, zcl, s_grp_len);
+    if (s_grp_sem) xSemaphoreGive(s_grp_sem);
+}
+
+bool zigbee_zcl_get_group_membership(uint16_t nwk_addr, uint8_t ep,
+                                     uint16_t* out_gids, uint8_t max, uint8_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!s_grp_sem) s_grp_sem = xSemaphoreCreateBinary();
+    if (!s_grp_sem) return false;
+    const uint8_t seq = zcl_seq_next();
+    // FC 0x01 (cluster-specific C→S), seq, cmd 0x02, group_count 0x00 (= all).
+    const uint8_t zcl_frame[4] = { 0x01, seq, 0x02, 0x00 };
+    xSemaphoreTake(s_grp_sem, 0);   // flush stale give
+    s_grp_len = 0;
+    s_grp_expect_tsn.store(seq, std::memory_order_release);
+    s_grp_expect_nwk.store(nwk_addr, std::memory_order_release);
+    // Idempotent read; wait on the ZCL response, not the AF confirm.
+    const AfReqOpts opts{2000, 2, /*idempotent=*/true, /*confirm=*/0,
+                         ESP_LOG_WARN, "ZCL GetGroupMembership"};
+    if (!af_data_request(nwk_addr, ep, 0x01, 0x0004, seq, zcl_frame, sizeof(zcl_frame), opts)) {
+        s_grp_expect_nwk.store(0xFFFF, std::memory_order_release);
+        return false;
+    }
+    if (xSemaphoreTake(s_grp_sem, pdMS_TO_TICKS(5000)) != pdTRUE || s_grp_len < 3) {
+        s_grp_expect_nwk.store(0xFFFF, std::memory_order_release);
+        ESP_LOGW(TAG, "GetGroupMembership: no response nwk=0x%04x ep=%d", nwk_addr, ep);
+        return false;
+    }
+    // Response frame: [FC, tsn, cmd 0x02, capacity, count, count× gid u16 LE].
+    const bool mfg = (s_grp_buf[0] & 0x04) != 0;
+    uint8_t p = mfg ? 3 : 1;    // skip FC(+mfg2); step to tsn
+    p += 2;                     // skip tsn + cmd → capacity index
+    if (s_grp_len < (uint8_t)(p + 2)) { if (out_count) *out_count = 0; return true; }  // 0 groups
+    uint8_t count = s_grp_buf[p + 1];
+    p += 2;                     // step past capacity + count → gid list
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < count && n < max; i++) {
+        if ((uint8_t)(p + 1) >= s_grp_len) break;
+        out_gids[n++] = (uint16_t)s_grp_buf[p] | ((uint16_t)s_grp_buf[p + 1] << 8);
+        p += 2;
+    }
+    if (out_count) *out_count = n;
+    ESP_LOGI(TAG, "GetGroupMembership nwk=0x%04x ep=%d → %u group(s)", nwk_addr, ep, n);
     return true;
 }
 
