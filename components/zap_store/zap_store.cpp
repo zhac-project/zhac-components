@@ -394,3 +394,39 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
     return loaded;
 }
 
+// ── Uplink selector ───────────────────────────────────────────────────────
+// Task 9 (RainMaker bridge plan): persistent accessor pair backing the
+// runtime uplink choice (custom_mqtt | none | rainmaker). One byte in the
+// existing device-pool namespace (NVS_NS) — deliberately not a new
+// namespace for a single flag. Consumed by later tasks that decide which
+// cloud uplink connects at boot.
+
+zhac_uplink_t zhac_uplink_get(void) {
+    uint8_t v = (uint8_t)ZHAC_UPLINK_CUSTOM_MQTT;
+    nvs_handle_t h = open_ns(NVS_READONLY);
+    if (h) {
+        // Absent key: ESP-IDF leaves `v` untouched on ESP_ERR_NVS_NOT_FOUND,
+        // so it keeps the preset default above — same ignore-the-return-value
+        // idiom this file already uses for "cnt" in index_build_locked() /
+        // zap_store_save_device() / zap_store_load_devices().
+        nvs_get_u8(h, "uplink", &v);
+        nvs_close(h);
+    }
+    // Out-of-range (e.g. a downgrade after a future enum value shipped, or a
+    // corrupted byte) falls back to the same backward-compat default as an
+    // absent key.
+    if (v > (uint8_t)ZHAC_UPLINK_RAINMAKER) v = (uint8_t)ZHAC_UPLINK_CUSTOM_MQTT;
+    return (zhac_uplink_t)v;
+}
+
+esp_err_t zhac_uplink_set(zhac_uplink_t u) {
+    nvs_handle_t h = open_ns(NVS_READWRITE);
+    if (!h) return ESP_FAIL;   // open_ns() already logged the specific NVS error
+
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u8(h, "uplink", (uint8_t)u), TAG, "set_u8 uplink");
+    nvs_seq(&acc, nvs_commit(h),                        TAG, "commit uplink");
+    nvs_close(h);
+    return acc;
+}
+

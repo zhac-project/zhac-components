@@ -21,6 +21,8 @@
 //   • writeback: deferred queue drained by flush_now    mark_dirty / flush_now
 //   • writeback: flush_device (targeted + clean no-op)  flush_device
 //   • writeback: dropped when snapshot reports gone     flush_now + snapshot cb
+//   • uplink selector: absent-key default, round-trip,
+//     out-of-range fallback                             zhac_uplink_get / zhac_uplink_set
 //
 // Characterization only — asserts the component's ACTUAL behavior; it never
 // modifies zap_store. A failing CHECK here means a prediction was wrong (fix
@@ -307,6 +309,40 @@ int main() {
         ZapDevice pool[4]{};
         CHECK(zap_store_load_devices(pool, 4) == 0,
               "flush drops the dirty entry when snapshot reports the device gone");
+    }
+
+    // ── G13: uplink selector — absent key, round-trip, OOR fallback ────────
+    {
+        fresh_store();
+        CHECK(zhac_uplink_get() == ZHAC_UPLINK_CUSTOM_MQTT,
+              "absent uplink key defaults to CUSTOM_MQTT");
+
+        CHECK(zhac_uplink_set(ZHAC_UPLINK_RAINMAKER) == ESP_OK,
+              "set(RAINMAKER) returns ESP_OK");
+        CHECK(zhac_uplink_get() == ZHAC_UPLINK_RAINMAKER,
+              "get() reflects RAINMAKER after set");
+
+        CHECK(zhac_uplink_set(ZHAC_UPLINK_NONE) == ESP_OK,
+              "set(NONE) returns ESP_OK");
+        CHECK(zhac_uplink_get() == ZHAC_UPLINK_NONE,
+              "get() reflects NONE after set");
+
+        CHECK(zhac_uplink_set(ZHAC_UPLINK_CUSTOM_MQTT) == ESP_OK,
+              "set(CUSTOM_MQTT) returns ESP_OK");
+        CHECK(zhac_uplink_get() == ZHAC_UPLINK_CUSTOM_MQTT,
+              "get() reflects CUSTOM_MQTT after set");
+
+        // Out-of-range stored byte (e.g. a downgrade after a future enum
+        // value shipped) — write directly through the stub's raw NVS API,
+        // bypassing zhac_uplink_set (which can only ever write a valid enum
+        // value) to simulate a value this build doesn't know about.
+        nvs_handle_t h;
+        (void)nvs_open("zap_v0", NVS_READWRITE, &h);
+        (void)nvs_set_u8(h, "uplink", 99);
+        (void)nvs_commit(h);
+        nvs_close(h);
+        CHECK(zhac_uplink_get() == ZHAC_UPLINK_CUSTOM_MQTT,
+              "out-of-range stored value falls back to CUSTOM_MQTT");
     }
 
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);

@@ -25,6 +25,7 @@
 // ── In-memory store (one namespace; the tests use only zap_store's) ─────────
 static std::map<std::string, std::vector<uint8_t>> g_blobs;
 static std::map<std::string, uint16_t>             g_u16;
+static std::map<std::string, uint8_t>              g_u8;
 
 esp_err_t nvs_open(const char*, nvs_open_mode_t, nvs_handle_t* out) { *out = 1; return ESP_OK; }
 esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
@@ -50,14 +51,20 @@ esp_err_t nvs_get_u16(nvs_handle_t, const char* key, uint16_t* out) {
     if (it == g_u16.end()) return ESP_ERR_NVS_NOT_FOUND;
     *out = it->second; return ESP_OK;
 }
+esp_err_t nvs_set_u8(nvs_handle_t, const char* key, uint8_t v) { g_u8[key] = v; return ESP_OK; }
+esp_err_t nvs_get_u8(nvs_handle_t, const char* key, uint8_t* out) {
+    auto it = g_u8.find(key);
+    if (it == g_u8.end()) return ESP_ERR_NVS_NOT_FOUND;
+    *out = it->second; return ESP_OK;
+}
 esp_err_t nvs_erase_key(nvs_handle_t, const char* key) {
     auto it = g_blobs.find(key);
     if (it == g_blobs.end()) return ESP_ERR_NVS_NOT_FOUND;
     g_blobs.erase(it); return ESP_OK;
 }
-esp_err_t nvs_erase_all(nvs_handle_t) { g_blobs.clear(); g_u16.clear(); return ESP_OK; }
+esp_err_t nvs_erase_all(nvs_handle_t) { g_blobs.clear(); g_u16.clear(); g_u8.clear(); return ESP_OK; }
 esp_err_t nvs_flash_init(void)  { return ESP_OK; }
-esp_err_t nvs_flash_erase(void) { g_blobs.clear(); g_u16.clear(); return ESP_OK; }
+esp_err_t nvs_flash_erase(void) { g_blobs.clear(); g_u16.clear(); g_u8.clear(); return ESP_OK; }
 
 // ── Iterator: snapshot of blob keys at find() time ─────────────────────────
 struct StubIter { std::vector<std::string> keys; size_t pos; };
@@ -98,5 +105,5 @@ BaseType_t xTaskCreate(void (*)(void*), const char*, uint32_t, void*, UBaseType_
 void vTaskDelay(TickType_t) {}
 
 // ── Test helpers ───────────────────────────────────────────────────────────
-extern "C" void nvs_stub_reset(void)            { g_blobs.clear(); g_u16.clear(); }
+extern "C" void nvs_stub_reset(void)            { g_blobs.clear(); g_u16.clear(); g_u8.clear(); }
 extern "C" void nvs_stub_set_schema(uint16_t v) { g_u16["schema_ver"] = v; }

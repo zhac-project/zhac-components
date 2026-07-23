@@ -10,7 +10,7 @@ zigbee_mgr / device_backend
         ▼
    ┌──────────┐
    │ zap_store │ ── NVS namespace "zap_v0"
-   └──────────┘     keys: d0000…dXXXX (BLOB), cnt (U16), schema_ver (U16)
+   └──────────┘     keys: d0000…dXXXX (BLOB), cnt (U16), schema_ver (U16), uplink (U8)
         │ flush task (1 s tick, prio 3)
         ▼
    esp_partition (NVS)
@@ -59,6 +59,26 @@ bool zap_store_flush_device(uint64_t ieee);    // force one entry — blocking
 re-marked HIGH. Without an installed snapshot callback, `mark_dirty` falls
 back to an immediate `save_device` using the caller's pointer.
 
+### Uplink selector
+
+```cpp
+typedef enum { ZHAC_UPLINK_CUSTOM_MQTT = 0,   // default when NVS key absent (backward compat)
+               ZHAC_UPLINK_NONE       = 1,
+               ZHAC_UPLINK_RAINMAKER  = 2 } zhac_uplink_t;
+
+zhac_uplink_t zhac_uplink_get(void);          // absent/out-of-range → CUSTOM_MQTT
+esp_err_t     zhac_uplink_set(zhac_uplink_t); // returns the NVS error code (ESP_OK on success)
+```
+
+Runtime choice of which cloud uplink connects (a configured custom MQTT
+broker, no uplink, or the RainMaker bridge). One `u8` in the existing
+`zap_v0` namespace — not a new namespace for a single flag. Backward
+compat is load-bearing: an absent key (pre-selector devices) or an
+out-of-range stored value both resolve to `ZHAC_UPLINK_CUSTOM_MQTT`, so
+already-deployed devices with a configured broker keep working, and
+devices with no broker configured lose nothing (`mqtt_gw` already no-ops
+on an empty URL).
+
 ## Storage layout
 
 NVS namespace **`zap_v0`**:
@@ -68,6 +88,7 @@ NVS namespace **`zap_v0`**:
 | `d0000` … `dXXXX` | BLOB (522 B) | One `ZapDevice` per slot, 0-based dense indexing |
 | `cnt`             | U16         | Number of stored devices |
 | `schema_ver`      | U16         | Current value: **6** (`ZAP_STORE_SCHEMA_VERSION`) |
+| `uplink`          | U8          | Cloud uplink selection (`zhac_uplink_t`); absent/out-of-range → `ZHAC_UPLINK_CUSTOM_MQTT` |
 
 On `zap_store_init`, a stored `schema_ver` mismatch triggers a full
 `nvs_erase_all` of the namespace. v4→v5 added the CRC32 field; v5→v6
