@@ -45,6 +45,8 @@
 #include "zigbee_configure_queue.h"
 #include "zap_common.h"
 #include "zap_store.h"
+#include "zhc_adapter.h"   // zhac_shadow_update_fn_t (G12 battery mirroring)
+#include "device_shadow.h"  // device_shadow_init (G12)
 #include "znp_stub.h"      // includes znp_driver.h (MtFrame, MT_SREQ/AREQ, ZNP_*)
 
 #include <cstdio>
@@ -105,6 +107,11 @@ static bool init_responder(const ZnpRecordedReq& req, MtFrame& srsp) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Captured by the zhc_adapter stub when zhc_shadow_bridge_register() runs;
+// lets the test drive the real bridge callback.
+extern zhac_shadow_update_fn_t g_stub_shadow_fn;
+extern "C" void zhc_shadow_bridge_register(void);
+
 int main() {
     printf("test_zigbee_mgr (coordinator mgr + ZCL builders + pool + state machine)\n");
 
@@ -632,6 +639,55 @@ int main() {
         zigbee_configure_enqueue(kJoinIeee);
         CHECK(true, "configure_init idempotent + enqueue callable "
                     "(worker drain/dedup not host-run — integration-shaped)");
+    }
+
+
+    // ── G12: battery_pct mirroring (zhc_shadow_bridge) ──────────────────
+    // ZapDevice::battery_pct is read by hap_json's device list and by both
+    // firmwares' ws_bridge, and used to be written by nothing at all — every
+    // device reported 0% forever. These lock in the three things that were
+    // easy to get wrong: the float ×100 scaling, the write-only-on-change
+    // rule, and not reacting to unrelated keys.
+    {
+        printf("\nG12 battery_pct mirroring\n");
+        pool_clear();
+        // The bridge calls device_shadow_process(); nothing else in this
+        // harness exercised that path, so the shadow was never initialised and
+        // driving the callback segfaulted.
+        device_shadow_init();
+        zhc_shadow_bridge_register();
+        CHECK(g_stub_shadow_fn != nullptr, "shadow bridge registers its callback");
+
+        const uint64_t kBatIeee = 0x2222000000000009ULL;
+        ZapDevice* d = pool_add();
+        d->ieee_addr   = kBatIeee;
+        d->nwk_addr    = 0x2009;
+        d->battery_pct = 0;
+
+        // Uint decode: percent lands verbatim.
+        g_stub_shadow_fn(kBatIeee, "battery", 2 /*Uint*/, 0, 87, 0.0f, false, nullptr);
+        CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 87,
+              "uint battery=87 mirrors to battery_pct");
+
+        // Float decode: the bridge stores value × 100, so it must divide back.
+        g_stub_shadow_fn(kBatIeee, "battery", 4 /*Float*/, 0, 0, 42.0f, false, nullptr);
+        CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 42,
+              "float battery=42.0 unscales (NOT 4200)");
+
+        // An unrelated key must not touch it.
+        g_stub_shadow_fn(kBatIeee, "voltage", 2 /*Uint*/, 0, 3000, 0.0f, false, nullptr);
+        CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 42,
+              "unrelated key leaves battery_pct alone");
+
+        // Out-of-range input clamps rather than wrapping the uint16.
+        g_stub_shadow_fn(kBatIeee, "battery", 2 /*Uint*/, 0, 250, 0.0f, false, nullptr);
+        CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
+              "out-of-range battery clamps to 100");
+
+        // Unknown device: must not crash or invent a pool entry.
+        const uint16_t before = pool_count();
+        g_stub_shadow_fn(0xFEEDFACEULL, "battery", 2 /*Uint*/, 0, 50, 0.0f, false, nullptr);
+        CHECK(pool_count() == before, "battery for an unknown device adds no pool entry");
     }
 
     printf("\n%s (failures=%d)\n", s_failures ? "FAILED" : "OK", s_failures);

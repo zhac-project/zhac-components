@@ -27,6 +27,48 @@ constexpr uint8_t kValueKindInt    = 3;
 constexpr uint8_t kValueKindFloat  = 4;
 constexpr uint8_t kValueKindString = 5;
 
+// Mirror a decoded `battery` percentage into ZapDevice::battery_pct.
+//
+// That field is read by hap_json (`bat_pct`, the device list the SPA renders)
+// and by both firmwares' ws_bridge — and was written by NOTHING, on any core.
+// Every device reported 0% battery forever while the real value sat one layer
+// away in the shadow as the `battery` key. It is mirrored here rather than in a
+// firmware because this is the one place every core's decode output passes
+// through.
+//
+// Scaling matters: a float arrives already multiplied by 100 (see the
+// kValueKindFloat case), so a device reporting 87.5% lands as 8750 and would
+// otherwise be stored as a nonsense percentage.
+//
+// Written only on change. Battery moves in single-percent steps over days, but
+// a chatty sensor re-reports the SAME value every few seconds — persisting each
+// one would turn a cosmetic field into a steady NVS write stream.
+void mirror_battery_pct(uint64_t ieee, const ZclAttribute& attr) {
+    if (std::strcmp(attr.key, "battery") != 0) return;
+    if (attr.val_type != VAL_INT && attr.val_type != VAL_FLOAT) return;
+
+    int32_t pct = attr.int_val;
+    if (attr.val_type == VAL_FLOAT) pct /= 100;   // stored as value × 100
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    struct Ctx { uint16_t pct; bool changed; ZapDevice snap; } ctx{
+        static_cast<uint16_t>(pct), false, {} };
+
+    zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+        auto* x = static_cast<Ctx*>(c);
+        if (d->battery_pct == x->pct) return;     // no change, no write
+        d->battery_pct = x->pct;
+        x->changed     = true;
+        x->snap        = *d;
+    }, &ctx);
+
+    // Persist OUTSIDE the visitor: zap_store_mark_dirty can write flash
+    // synchronously when the dirty table is full, and that must never run
+    // under the pool mutex.
+    if (ctx.changed) zap_store_mark_dirty(&ctx.snap, ZAP_PERSIST_LOW);
+}
+
 extern "C" void zhc_shadow_update_cb(uint64_t ieee,
                                       const char* key,
                                       uint8_t value_kind,
@@ -93,6 +135,7 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
     }
 
     device_shadow_process(&snap, &attr, 1);
+    mirror_battery_pct(ieee, attr);
 }
 
 }  // namespace

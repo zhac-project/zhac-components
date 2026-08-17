@@ -27,7 +27,11 @@ void     zhac_stub_reset() { g_last_invalidated_ieee = 0; g_invalidate_count = 0
 // ── lifecycle / registration hooks (no-ops) ─────────────────────────────
 void zhac_adapter_init(void) {}
 void zhac_adapter_register_send(zhac_af_send_fn_t) {}
-void zhac_adapter_register_shadow(zhac_shadow_update_fn_t) {}
+// Captured rather than discarded so a test can drive the REAL
+// zhc_shadow_bridge callback (which lives in an anonymous namespace and is
+// otherwise unreachable) exactly the way zhc_adapter would.
+zhac_shadow_update_fn_t g_stub_shadow_fn = nullptr;
+void zhac_adapter_register_shadow(zhac_shadow_update_fn_t fn) { g_stub_shadow_fn = fn; }
 void zhac_adapter_register_configure(zhac_configure_bind_fn_t,
                                      zhac_configure_report_fn_t) {}
 void zhac_adapter_register_configure_ex(zhac_configure_cmd_fn_t,
