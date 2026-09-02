@@ -7,6 +7,15 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed
+
+- **`event_bus_subscribe()` before `event_bus_init()` is now refused.** It used
+  to "succeed" — `bus_lock()` tolerates the not-yet-created mutex — and the
+  subscription was then wiped by `event_bus_init()`, leaking the queue and
+  silently orphaning the handler. That is exactly how the P4's Lua event bridge
+  went dead (see zhac-main-core). The call now logs an error and returns
+  `EVENT_SUB_INVALID`; the host test asserts it. (Review 2026-09, MC-01.)
+
 ### Added
 
 - **ZCL Get Group Membership readback (native-groups inc 2b).**

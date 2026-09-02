@@ -146,6 +146,13 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
         ESP_LOGE(TAG, "invalid event type %d", idx);
         return EVENT_SUB_INVALID;
     }
+    if (!s_inited) {
+        // Review 2026-09 MC-01: a subscribe before event_bus_init() used to
+        // "succeed" (bus_lock tolerates the absent mutex) and then be wiped by
+        // init, leaking the queue and silently orphaning the handler. Refuse.
+        ESP_LOGE(TAG, "subscribe(type %d) before event_bus_init -- refused", idx);
+        return EVENT_SUB_INVALID;
+    }
 
     bus_lock();
     reap_locked();   // a DYING slot whose last user just left frees up here
