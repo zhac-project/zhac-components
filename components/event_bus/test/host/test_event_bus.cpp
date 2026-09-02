@@ -45,6 +45,14 @@ static Event make_event(EventType t, uint8_t tag) {
 }
 
 int main() {
+    // Review 2026-09 MC-01: a subscribe before init must be refused loudly,
+    // not accepted and then wiped by event_bus_init().
+    {
+        EventSubHandle early = event_bus_subscribe(
+            EventType::DEVICE_JOIN, [](const Event&) {});
+        CHECK(early == EVENT_SUB_INVALID, "subscribe before init is refused");
+    }
+
     event_bus_init();
 
     // ── 1. subscribe → publish → drain_handle roundtrip ───────────────────
