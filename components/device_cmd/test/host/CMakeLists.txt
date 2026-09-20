@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Host contract suite for device_cmd: every transport calls this one function,
-# so this is where bool / integer / decimal / string / missing / invalid values
-# are pinned once -- results, adapter calls and shadow writes.
+# Host contract suite for device_cmd: every transport calls these functions,
+# so this is where attribute values, rename validation, the permit-join clamp
+# and the soft/hard remove sweeps are pinned once.
 cmake_minimum_required(VERSION 3.16)
 project(device_cmd_host_tests CXX)
 set(CMAKE_CXX_STANDARD 20)
@@ -15,6 +15,7 @@ add_executable(device_cmd_host_test
     test_device_cmd.cpp
     stubs/host_stubs.cpp
     ${DEVICE_CMD_DIR}/device_cmd.cpp
+    ${DEVICE_CMD_DIR}/device_cmd_ops.cpp
     ${DEVICE_CMD_DIR}/device_cmd_json.cpp
 )
 target_include_directories(device_cmd_host_test PRIVATE
@@ -25,6 +26,8 @@ target_include_directories(device_cmd_host_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/zap_store/include
+    ${COMPONENTS_DIR}/device_backend/include
     ${COMPONENTS_DIR}/arduinojson/src
 )
 target_compile_options(device_cmd_host_test PRIVATE -Wall -Wextra -Werror)

@@ -5,6 +5,8 @@
 #include <cstring>
 #include "device_cmd.h"
 #include "device_cmd_json.h"
+#include "esp_timer.h"
+#include "zap_store.h"
 #include "zcl_attribute.h"
 #include "test_stubs.h"
 
@@ -96,6 +98,85 @@ int main() {
           std::strcmp(device_cmd_result_str(DEVCMD_NO_CONVERTER), "no zhc converter") == 0 &&
           std::strcmp(device_cmd_result_str(DEVCMD_BAD_VALUE), "value must be bool / number / string") == 0,
           "result words are the ones the UI and docs know");
+
+    // ── rename ──
+    device_cmd_set_changed_hook([](uint64_t ieee) { g_store.changed_calls++; g_store.changed_ieee = ieee; });
+    arm();
+    CHECK(device_cmd_rename(IEEE, "Kitchen light") == DEVCMD_OK, "rename -> OK");
+    CHECK(g_store.dirty_marks == 1 && g_store.dirty_pri == ZAP_PERSIST_HIGH && std::strcmp(g_store.dirty_name, "Kitchen light") == 0,
+          "rename persists the new name at HIGH priority");
+    CHECK(g_store.changed_calls == 1 && g_store.changed_ieee == IEEE, "rename calls the changed hook once with the ieee");
+    CHECK(g_send.lock_depth == 0, "rename leaves the pool lock balanced");
+    arm();
+    CHECK(device_cmd_rename(IEEE, "") == DEVCMD_BAD_NAME && device_cmd_rename(IEEE, "a\"b") == DEVCMD_BAD_NAME &&
+          device_cmd_rename(IEEE, "a\\b") == DEVCMD_BAD_NAME && device_cmd_rename(IEEE, "a\tb") == DEVCMD_BAD_NAME,
+          "rename refuses empty, quote, backslash, control character");
+    CHECK(device_cmd_rename(IEEE, "123456789012345678901234567890") == DEVCMD_BAD_NAME &&
+          device_cmd_rename(IEEE, "12345678901234567890123456789") == DEVCMD_OK,
+          "rename refuses 30 bytes, accepts 29 (friendly_name is 30 with the terminator)");
+    CHECK(g_store.dirty_marks == 1 && g_store.changed_calls == 1, "refused names touch neither store nor hook");
+    stub_reset(); stub_pool_clear();
+    CHECK(device_cmd_rename(IEEE, "x") == DEVCMD_NOT_FOUND && g_store.dirty_marks == 0, "rename of an unknown device -> not found, nothing persisted");
+    CHECK(device_cmd_rename(0, "x") == DEVCMD_BAD_ARGS && device_cmd_rename(IEEE, nullptr) == DEVCMD_BAD_ARGS, "rename with no ieee / no name -> bad args");
+    device_cmd_set_changed_hook(nullptr);
+    arm();
+    CHECK(device_cmd_rename(IEEE, "y") == DEVCMD_OK, "rename works with no hook registered");
+
+    // ── permit join ──
+    stub_reset(); g_fake_time_us = 1000000;
+    CHECK(device_cmd_permit_join(255) == DEVCMD_OK && g_store.permit_secs == 254, "255 (permanent) is clamped to 254");
+    bool open = false; int rem = 0;
+    device_cmd_permit_join_status(&open, &rem);
+    CHECK(open && rem == 254, "window open for 254 s right after the call");
+    g_fake_time_us += 253500000;
+    device_cmd_permit_join_status(&open, &rem);
+    CHECK(open && rem == 1, "remaining rounds up (0.5 s left -> 1)");
+    g_fake_time_us += 1000000;
+    device_cmd_permit_join_status(&open, &rem);
+    CHECK(!open && rem == 0, "window closed once the deadline passes");
+    CHECK(device_cmd_permit_join(60) == DEVCMD_OK && g_store.permit_secs == 60, "60 s passes through");
+    g_radio_result = false;
+    CHECK(device_cmd_permit_join(30) == DEVCMD_RADIO, "radio refusal -> DEVCMD_RADIO");
+    device_cmd_permit_join_status(&open, &rem);
+    CHECK(open && rem == 60, "a failed open leaves the earlier window's deadline alone");
+    g_radio_result = true;
+    CHECK(device_cmd_permit_join(0) == DEVCMD_OK && g_store.permit_secs == 0, "0 closes");
+    device_cmd_permit_join_status(&open, &rem);
+    CHECK(!open && rem == 0, "closed after 0");
+
+    // ── remove, soft ──
+    arm();
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_OK, "soft remove -> OK");
+    CHECK(stub_pool_has_device() && stub_pool_removed_flag(), "soft remove tombstones the pool entry, keeps the slot");
+    CHECK(g_store.leave_reqs == 1 && g_store.leave_nwk == 0x3F1A && g_store.leave_ieee == IEEE, "soft remove asks the device to leave");
+    CHECK(g_store.dirty_marks == 1 && g_store.dirty_pri == ZAP_PERSIST_LOW && (g_store.dirty_flags & ZAP_DEV_REMOVED),
+          "soft remove persists the tombstone at LOW priority");
+    CHECK(g_store.deletes == 0 && g_store.shadow_removes == 0 && g_store.pool_removes == 0, "soft remove wipes nothing");
+    CHECK(g_send.lock_depth == 0, "soft remove leaves the pool lock balanced");
+    stub_reset(); stub_pool_clear();
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_NOT_FOUND && g_store.leave_reqs == 0, "soft remove of an unknown device -> not found");
+
+    // ── remove, hard: no backend ──
+    arm();
+    CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK, "hard remove -> OK");
+    CHECK(g_store.leave_reqs == 1, "hard remove asks the device to leave");
+    CHECK(!stub_pool_has_device() && g_store.pool_removes == 1, "hard remove frees the pool slot");
+    CHECK(g_store.deletes == 1 && g_store.shadow_removes == 1 && g_store.def_cache_invalidates == 1 && g_store.fallback_clears == 1,
+          "hard remove wipes stored row, shadow, def cache and fallback data");
+    CHECK(g_store.dirty_marks == 0, "hard remove does not re-persist the row it deletes");
+    // ── remove, hard: backend owns the leave ──
+    arm(); g_have_backend = true;
+    CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_store.backend_removes == 1 && g_store.leave_reqs == 0,
+          "with a backend, hard remove goes through backend->remove_device (no direct leave)");
+    CHECK(!stub_pool_has_device() && g_store.deletes == 1 && g_store.shadow_removes == 1, "sweep still runs after the backend (idempotent)");
+    // ── remove, hard: unknown ieee still cleans leftovers ──
+    stub_reset(); stub_pool_clear();
+    CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_store.leave_reqs == 0 && g_store.deletes == 1 && g_store.shadow_removes == 1,
+          "hard remove of an unknown device -> OK, leftovers wiped, no leave sent");
+    CHECK(device_cmd_remove(0, true) == DEVCMD_BAD_ARGS, "remove with ieee 0 -> bad args");
+    // soft remove of a device whose nwk is unknown (0) sends no leave to the coordinator
+    arm(); stub_pool_set(IEEE, 0, 1, "m", "n");
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_OK && g_store.leave_reqs == 0, "no leave request to nwk 0 (that is the coordinator)");
 
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("device_cmd contract: all checks passed\n");

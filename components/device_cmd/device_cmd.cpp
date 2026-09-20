@@ -19,6 +19,8 @@ const char* device_cmd_result_str(DevCmdResult r) {
         case DEVCMD_BAD_VALUE:    return "value must be bool / number / string";
         case DEVCMD_NOT_FOUND:    return "device not found";
         case DEVCMD_NO_CONVERTER: return "no zhc converter";
+        case DEVCMD_BAD_NAME:     return "name must be 1-29 characters without quotes, backslashes or control characters";
+        case DEVCMD_RADIO:        return "radio refused";
     }
     return "failed";
 }
@@ -87,3 +89,4 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
     }
     return DEVCMD_OK;
 }
+

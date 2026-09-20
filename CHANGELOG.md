@@ -19,6 +19,20 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   `zigbee.set` / `zigbee.toggle` go through it; so do wired and mono REST, WebSocket, MQTT and
   collection fan-out, and the P4's HAP handler and Lua. Architecture review A7, first cut.
 
+- **`device_cmd`, second cut: rename, permit join, remove.** `device_cmd_rename` validates
+  once for every door (1–29 bytes, no quotes, backslashes or control characters: `device.list`
+  rows are built with `snprintf`, so one quote used to blank the Devices page), persists at
+  HIGH priority and calls a hook the firmware registers at boot (rules re-resolve names; the
+  wired build also tells Home Assistant). Before, only the wired WebSocket validated and only
+  the P4 reloaded the rules. `device_cmd_permit_join` clamps 255 (open forever) to 254 on every
+  core and keeps the one deadline that `zigbee.permit_join.status` reads, so REST and WebSocket
+  agree. `device_cmd_remove` is one contract: soft = ask the device to leave and tombstone it
+  (hidden from lists, name kept for a rejoin, persisted); hard = leave, then wipe the pool slot,
+  shadow, converter caches and the stored row, every step idempotent. Before, the wired and mono
+  soft delete only dropped the pool entry (the device stayed joined and came back on the next
+  report or reboot) and neither told it to leave. The ops live in `device_cmd_ops.cpp` so the
+  rule engine's host suite links only the attribute path. Host contract suite: 64 checks.
+
 - **`ntp_cfg` takes the router's time server.** With no server named, `ntp_cfg_init()` (called
   before the first DHCP lease) lets lwIP ask for one (DHCP option 42, slot 0) and keeps
   `pool.ntp.org` as the fallback in slot 1; a server the owner names switches the router's
