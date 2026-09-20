@@ -3,5 +3,5 @@
 idf_component_register(
     SRCS "dsl_parser.cpp" "simple_rules.cpp" "expr_eval.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES zap_common rule_store event_bus zhc_adapter mqtt_gw zigbee_mgr freertos cron_parser
+    REQUIRES zap_common rule_store event_bus zhc_adapter mqtt_gw zigbee_mgr freertos cron_parser device_cmd
 )

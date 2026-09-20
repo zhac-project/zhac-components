@@ -276,6 +276,21 @@ bool zhac_adapter_send_float(uint64_t ieee, const char* model_id,
     return s_send_result;
 }
 
+bool zhac_adapter_send_bool(uint64_t ieee, const char* model_id, const char* manufacturer_name,
+                            uint16_t nwk_addr, uint8_t dst_endpoint, const char* key, bool value) {
+    (void)ieee; (void)model_id; (void)manufacturer_name; (void)nwk_addr; (void)dst_endpoint; (void)key; (void)value;
+    return s_send_result;
+}
+bool zhac_adapter_send_string(uint64_t ieee, const char* model_id, const char* manufacturer_name,
+                              uint16_t nwk_addr, uint8_t dst_endpoint, const char* key, const char* value) {
+    (void)ieee; (void)model_id; (void)manufacturer_name; (void)nwk_addr; (void)dst_endpoint; (void)key; (void)value;
+    return s_send_result;
+}
+bool zhac_adapter_send_number(uint64_t ieee, const char* model_id, const char* manufacturer_name,
+                              uint16_t nwk_addr, uint8_t dst_endpoint, const char* key, double value) {
+    (void)ieee; (void)model_id; (void)manufacturer_name; (void)nwk_addr; (void)dst_endpoint; (void)key; (void)value;
+    return s_send_result;
+}
 bool zhac_adapter_send_uint(uint64_t ieee, const char* model_id,
                             const char* manufacturer_name,
                             uint16_t nwk_addr, uint8_t dst_endpoint,

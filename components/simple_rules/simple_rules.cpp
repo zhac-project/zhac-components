@@ -11,6 +11,7 @@
 #include "device_shadow.h"
 #include "cron_parser.h"
 #include "esp_log.h"
+#include "device_cmd.h"
 #include <cerrno>    // strtol range check in resolve_action_value
 #include <cstdlib>
 #include "freertos/FreeRTOS.h"
@@ -365,40 +366,15 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                 break;
             }
             // `21.5` is a decimal write (the converter scales it); anything
-            // else is the integer it always was.
+            // else is the integer it always was. device_cmd does the send and
+            // the optimistic shadow mirror, the same as every other transport.
             const bool decimal = strchr(val_buf, '.') != nullptr;
-            const double dbl_val = decimal ? strtod(val_buf, nullptr) : 0.0;
-            int32_t int_val = decimal ? (int32_t)lround(dbl_val)
-                                      : (int32_t)strtol(val_buf, nullptr, 10);
-            uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
-            const bool sent = decimal
-                ? zhac_adapter_send_float(snap.ieee_addr, snap.model_id,
-                                          snap.manufacturer_name,
-                                          snap.nwk_addr, ep, a.arg1, dbl_val)
-                : zhac_adapter_send_uint(snap.ieee_addr, snap.model_id,
-                                         snap.manufacturer_name,
-                                         snap.nwk_addr, ep, a.arg1,
-                                         static_cast<uint64_t>(int_val));
-            if (!sent) {
-                ESP_LOGW(TAG, "zigbee.set: no tz converter for '%s' key='%s'",
-                         a.arg0, a.arg1);
-                break;
-            }
-            // Optimistic shadow update — mirrors the webui SET_ATTRIBUTE path
-            // (hap_dispatch.cpp). Many devices (esp. Tuya LED drivers) send no
-            // attribute report after a command-driven change, so without this a
-            // rule-issued zigbee.set never reflects in the shadow: the SPA
-            // reverts to the last-known value and the rule looks dead even
-            // though the device obeyed the (identical) command. A real report
-            // from the device later overrides this value. No-op unless the
-            // device's shadow config has optimistic==true.
-            if (a.arg1[0] != '\0') {
-                // Shadow keeps decimals as VAL_FLOAT ×100 (zcl_attribute.h).
-                const uint8_t vt = decimal ? VAL_FLOAT
-                                 : (strcmp(a.arg1, "state") == 0) ? VAL_BOOL : VAL_INT;
-                device_shadow_update_optimistic(snap.ieee_addr, a.arg1, vt,
-                                                 decimal ? (int32_t)lround(dbl_val * 100.0)
-                                                         : int_val);
+            const DevCmdValue val = decimal ? device_cmd_float(strtod(val_buf, nullptr))
+                                            : device_cmd_int((int32_t)strtol(val_buf, nullptr, 10));
+            const DevCmdResult r = device_cmd_set_attr(snap.ieee_addr, 0, a.arg1, &val);
+            if (r != DEVCMD_OK) {
+                ESP_LOGW(TAG, "zigbee.set: %s for '%s' key='%s'",
+                         device_cmd_result_str(r), a.arg0, a.arg1);
             }
             break;
         }
@@ -448,16 +424,14 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                          a.arg1, a.arg0, (long)cur_int);
                 break;
             }
-            int32_t next_int = cur_int ? 0 : 1;
-            uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
-            if (!zhac_adapter_send_uint(snap.ieee_addr,
-                                         snap.model_id,
-                                         snap.manufacturer_name,
-                                         snap.nwk_addr, ep,
-                                         a.arg1,
-                                         static_cast<uint64_t>(next_int))) {
-                ESP_LOGW(TAG, "zigbee.toggle: no tz converter for '%s' key='%s'",
-                         a.arg0, a.arg1);
+            // The inverse, through the one attribute-set path (which mirrors it
+            // into the shadow; a toggle used to leave the shadow stale).
+            const DevCmdValue val = is_bool ? device_cmd_bool(cur_int == 0)
+                                            : device_cmd_int(cur_int ? 0 : 1);
+            const DevCmdResult r = device_cmd_set_attr(snap.ieee_addr, 0, a.arg1, &val);
+            if (r != DEVCMD_OK) {
+                ESP_LOGW(TAG, "zigbee.toggle: %s for '%s' key='%s'",
+                         device_cmd_result_str(r), a.arg0, a.arg1);
             }
             break;
         }

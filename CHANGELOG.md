@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **`device_cmd`: the one attribute-set path.** `device_cmd_set_attr(ieee, ep, key, value)`
+  does what every transport used to do on its own and slightly differently: copy the device's
+  identity under the pool lock and release it before the radio, send bool / integer / decimal /
+  string to the converter as such, mirror the result into the shadow (`state` → VAL_BOOL,
+  integers → VAL_INT, decimals → VAL_FLOAT ×100, strings → nothing), and answer with one of
+  four results whose words the UI already knows. `device_cmd_value_from_json` parses the JSON
+  `value` the way all transports must. Host contract suite pins 28 checks. The rule engine's
+  `zigbee.set` / `zigbee.toggle` go through it; so do wired and mono REST, WebSocket, MQTT and
+  collection fan-out, and the P4's HAP handler and Lua. Architecture review A7, first cut.
+
 - **`ntp_cfg` takes the router's time server.** With no server named, `ntp_cfg_init()` (called
   before the first DHCP lease) lets lwIP ask for one (DHCP option 42, slot 0) and keeps
   `pool.ntp.org` as the fallback in slot 1; a server the owner names switches the router's

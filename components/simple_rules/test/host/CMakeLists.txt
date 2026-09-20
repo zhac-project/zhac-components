@@ -19,6 +19,7 @@ add_executable(simple_rules_event_loop_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -31,6 +32,7 @@ target_include_directories(simple_rules_event_loop_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -44,6 +46,7 @@ add_executable(simple_rules_integrity_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -56,6 +59,7 @@ target_include_directories(simple_rules_integrity_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -69,6 +73,7 @@ add_executable(simple_rules_bool_match_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -81,6 +86,7 @@ target_include_directories(simple_rules_bool_match_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -94,6 +100,7 @@ add_executable(simple_rules_action_shadow_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -106,6 +113,7 @@ target_include_directories(simple_rules_action_shadow_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -119,6 +127,7 @@ add_executable(simple_rules_update_persist_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -131,6 +140,7 @@ target_include_directories(simple_rules_update_persist_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -144,6 +154,7 @@ add_executable(simple_rules_condition_matrix_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -156,6 +167,7 @@ target_include_directories(simple_rules_condition_matrix_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -170,6 +182,7 @@ add_executable(simple_rules_action_matrix_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -182,6 +195,7 @@ target_include_directories(simple_rules_action_matrix_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
@@ -196,6 +210,7 @@ add_executable(simple_rules_dsl_structure_test
     ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
     ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
     ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp
 )
 
@@ -208,6 +223,7 @@ target_include_directories(simple_rules_dsl_structure_test PRIVATE
     ${COMPONENTS_DIR}/zigbee_mgr/include
     ${COMPONENTS_DIR}/device_shadow/include
     ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
     ${COMPONENTS_DIR}/mqtt_gw/include
     ${COMPONENTS_DIR}/cron_parser/include
 )
