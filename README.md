@@ -23,6 +23,8 @@ Per-component `LICENSE` files and SPDX headers are authoritative.
 | `device_backend`| Backend abstraction — unifies `zigbee_backend` + future backends. | AGPL-3.0-or-later |
 | `zap_store`     | NVS key/value store used by shadow + rule store. | AGPL-3.0-or-later |
 | `zhc_adapter`   | One-way bridge from the `embedded-zhc` library into firmware components. | AGPL-3.0-or-later |
+| `ntp_cfg`       | The hub's time server: the configured host (NVS `sys_cfg/ntp_server`) or the public default, and starting or restarting SNTP with it. | AGPL-3.0-or-later |
+| `ha_bridge`     | Home Assistant MQTT discovery: discovery configs from device exposes, per-attribute state topics, `…/set` commands. Pure builder host-tested. | AGPL-3.0-or-later |
 | `arduinojson`   | Vendored MIT header-only JSON library — upstream bblanchon/ArduinoJson. Used by `hap_json`. | MIT (vendored) |
 
 ## Consuming these components

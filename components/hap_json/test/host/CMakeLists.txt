@@ -38,3 +38,19 @@ target_compile_options(hap_devlist_host_test PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
 add_test(NAME hap_devlist_host COMMAND hap_devlist_host_test)
+
+# SET_ATTRIBUTE optional string value ("sval"): round trip + unchanged wire
+# format when absent.
+add_executable(hap_set_attr_sval_host_test
+    test_set_attr_sval.cpp
+    ${HAP_JSON_DIR}/hap_json.cpp
+)
+target_include_directories(hap_set_attr_sval_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${HAP_JSON_DIR}/include
+    ${COMPONENTS_DIR}/zap_common/include
+    ${COMPONENTS_DIR}/hap_protocol/include
+    ${COMPONENTS_DIR}/arduinojson/src
+)
+target_compile_options(hap_set_attr_sval_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME hap_set_attr_sval_host COMMAND hap_set_attr_sval_host_test)

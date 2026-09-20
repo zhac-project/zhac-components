@@ -14,8 +14,12 @@ void mqtt_gw_init();
  * past the end walks uninitialised memory (and stalls the outbox when
  * the spurious length is huge). Pass strlen(payload) yourself for
  * NUL-terminated strings. */
-void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
-                      int qos, bool retain);
+/* Returns true when the message was handed on (queued for the broker on the
+ * S3 / local-client build, sent over HAP on the P4 shim); false when it was
+ * dropped — no client, bad topic, or the publish queue is full. Callers that
+ * burst (ha_bridge's discovery) use it for back-pressure; others ignore it. */
+bool mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
+                     int qos, bool retain);
 /* Reconfigure broker URL and restart client; no-op on P4 */
 void mqtt_gw_set_broker_url(const char* url);
 

@@ -274,6 +274,23 @@ bool zhac_adapter_send_string(uint64_t ieee,
                                const char* manufacturer_name,
                                uint16_t nwk_addr, uint8_t dst_endpoint,
                                const char* key, const char* value);
+// A decimal write (a 21.5 °C setpoint, a 0.5 s delay). Reaches the
+// converter as zhc::ValueType::Float, which scales it itself (a Tuya DP with
+// divisor 10 sends 215; a ZCL setpoint sends 2150); raw attribute writes round
+// it. Converters that only take integers refuse it, and the caller reports
+// that, instead of anyone truncating 21.5 to 21 on the way.
+bool zhac_adapter_send_float(uint64_t ieee,
+                              const char* model_id,
+                              const char* manufacturer_name,
+                              uint16_t nwk_addr, uint8_t dst_endpoint,
+                              const char* key, double value);
+// Any JSON / Lua number: an integral value goes the integer way it always
+// did (Uint, or Int when negative), anything with a fraction as Float.
+bool zhac_adapter_send_number(uint64_t ieee,
+                               const char* model_id,
+                               const char* manufacturer_name,
+                               uint16_t nwk_addr, uint8_t dst_endpoint,
+                               const char* key, double value);
 
 #ifdef __cplusplus
 }  // extern "C"

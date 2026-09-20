@@ -262,6 +262,20 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
 static bool s_send_result = true;
 void stub_adapter_send_set_result(bool r) { s_send_result = r; }
 
+static double s_last_float = 0.0;
+static int    s_float_sends = 0;
+double stub_adapter_last_float() { return s_last_float; }
+int    stub_adapter_float_sends() { return s_float_sends; }
+bool zhac_adapter_send_float(uint64_t ieee, const char* model_id,
+                             const char* manufacturer_name,
+                             uint16_t nwk_addr, uint8_t dst_endpoint,
+                             const char* key, double value) {
+    (void)ieee; (void)model_id; (void)manufacturer_name;
+    (void)nwk_addr; (void)dst_endpoint; (void)key;
+    s_last_float = value; s_float_sends++;
+    return s_send_result;
+}
+
 bool zhac_adapter_send_uint(uint64_t ieee, const char* model_id,
                             const char* manufacturer_name,
                             uint16_t nwk_addr, uint8_t dst_endpoint,
@@ -271,9 +285,10 @@ bool zhac_adapter_send_uint(uint64_t ieee, const char* model_id,
     return s_send_result;
 }
 
-void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
+bool mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
                      int qos, bool retain) {
     (void)topic; (void)payload; (void)payload_len; (void)qos; (void)retain;
+    return true;
 }
 
 // ── cron_parser: nothing ever matches ────────────────────────────────────

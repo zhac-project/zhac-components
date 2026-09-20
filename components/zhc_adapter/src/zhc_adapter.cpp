@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <span>
 
@@ -1610,6 +1611,36 @@ extern "C" bool zhac_adapter_send_uint(uint64_t ieee,
     zhc::Value v{}; v.type = zhc::ValueType::Uint; v.u = value;
     return dispatch_and_send(ieee, model_id, manu_name, nwk_addr, dst_ep,
                               key, v);
+}
+
+extern "C" bool zhac_adapter_send_float(uint64_t ieee,
+                                         const char* model_id,
+                                         const char* manu_name,
+                                         uint16_t nwk_addr, uint8_t dst_ep,
+                                         const char* key, double value) {
+    if (value != value) return false;   // NaN never reaches a converter
+    zhc::Value v{}; v.type = zhc::ValueType::Float; v.f = static_cast<float>(value);
+    return dispatch_and_send(ieee, model_id, manu_name, nwk_addr, dst_ep,
+                              key, v);
+}
+
+extern "C" bool zhac_adapter_send_number(uint64_t ieee,
+                                          const char* model_id,
+                                          const char* manu_name,
+                                          uint16_t nwk_addr, uint8_t dst_ep,
+                                          const char* key, double value) {
+    if (value != value) return false;
+    const double whole = std::floor(value);
+    if (whole == value && value >= 0.0 && value <= 18446744073709551615.0) {
+        return zhac_adapter_send_uint(ieee, model_id, manu_name, nwk_addr, dst_ep,
+                                       key, static_cast<uint64_t>(value));
+    }
+    if (whole == value && value < 0.0 && value >= -9223372036854775808.0) {
+        zhc::Value v{}; v.type = zhc::ValueType::Int; v.i = static_cast<int64_t>(value);
+        return dispatch_and_send(ieee, model_id, manu_name, nwk_addr, dst_ep, key, v);
+    }
+    return zhac_adapter_send_float(ieee, model_id, manu_name, nwk_addr, dst_ep,
+                                    key, value);
 }
 
 extern "C" bool zhac_adapter_send_string(uint64_t ieee,

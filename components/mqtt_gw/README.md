@@ -41,7 +41,7 @@ The CMake file branches on `IDF_TARGET` (`mqtt_gw/CMakeLists.txt:3-11`):
 
 | Build  | SRCS                | REQUIRES                                         |
 |--------|---------------------|--------------------------------------------------|
-| S3     | `mqtt_gw_s3.cpp`    | `mqtt freertos`                                  |
+| S3, or `ZHAC_MQTT_GW_LOCAL_CLIENT` set | `mqtt_gw_s3.cpp` | `mqtt freertos zap_common metrics zap_store` |
 | P4     | `mqtt_gw_p4.cpp`    | `hap_slave hap_session hap_json hap_protocol freertos` |
 
 `mqtt_gw.cpp` is a 6-line stub. NVS is read by the firmware boot path
@@ -81,8 +81,10 @@ z2m-compatible. The root prefix is configurable (default `"zhac"`); operator
 can run two controllers on one broker by giving each a unique root.
 
 ```
-<root>/devices/<ieee>/attributes/<key>   device attribute updates
-<root>/devices/<ieee>/availability       online / offline
+<root>/devices/<IEEE>/state              dual-chip: every update as one JSON object
+<root>/devices/<IEEE>/<key>              one retained value per attribute (ha_bridge, when on)
+<root>/devices/<IEEE>/<key>/set          commands in (ha_bridge, when on)
+<root>/availability                      online / offline (retained, Last Will)
 <root>/bridge/config                     bridge configuration
 <root>/bridge/request                    inbound requests
 <root>/bridge/response                   outbound responses

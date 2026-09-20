@@ -50,6 +50,7 @@ inline constexpr uint32_t kWifi         = 4096;
 inline constexpr uint32_t kHapS3        = 8192;
 inline constexpr uint32_t kHttp         = 8192;
 inline constexpr uint32_t kTimeSync     = 4096;
+inline constexpr uint32_t kImprov       = 4096;   // Improv Wi-Fi serial: NVS write + esp_wifi calls
 inline constexpr uint32_t kOta          = 8192;
 inline constexpr uint32_t kP4Ota        = 8192;
 inline constexpr uint32_t kStackMonS3   = 3072;
@@ -100,6 +101,7 @@ inline constexpr Entry kTable[] = {
     {"TaskHAP",       kHapS3},
     {"TaskHTTP",      kHttp},
     {"TaskTimeSync",  kTimeSync},
+    {"TaskImprov",    kImprov},
     {"TaskOTA",       kOta},
     {"TaskP4OTA",     kP4Ota},
     {"TaskStackMon",  kStackMonS3},

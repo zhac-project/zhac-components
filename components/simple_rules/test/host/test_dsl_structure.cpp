@@ -7,11 +7,11 @@
 //   • every top-level ParseResult path (NO_ON / NO_DO / NO_ENDON / BAD_TRIGGER
 //     / OK) incl. the "ON " and " DO " spacing rules and leading-ws tolerance;
 //   • field-length limits — attr_key (max 27), string value (max 47), trigger
-//     secondary key (max 19) reject on overflow; action args truncate;
+//     secondary key (max 63) reject on overflow; action args truncate;
 //   • trigger-type structural parse (DEVICE_ATTR / System#Boot / Time#Cron= /
 //     Event# / Rules#Timer= / Mqtt#) inspected on the public ParsedRule;
 //   • friendly-name → IEEE resolution (resolved name filters by device; an
-//     unresolved name stays a wildcard).
+//     unresolved name is inert; names use the full friendly_name width).
 #include "simple_rules.h"
 #include "event_bus.h"
 #include "zigbee_pool.h"
@@ -84,16 +84,53 @@ int main() {
           "string value of 47 chars accepted");
     CHECK(pr(("ON dev#action=\"" + std::string(48, 's') + "\" DO log m ENDON").c_str()) != ParseResult::OK,
           "string value of 48 chars (>max 47) rejected");
-    CHECK(pr(("ON Event#" + std::string(19, 'e') + " DO log m ENDON").c_str()) == ParseResult::OK,
-          "trigger key of 19 chars accepted");
-    CHECK(pr(("ON Event#" + std::string(20, 'e') + " DO log m ENDON").c_str()) != ParseResult::OK,
-          "trigger key of 20 chars (>max 19) rejected");
+    CHECK(pr(("ON Event#" + std::string(63, 'e') + " DO log m ENDON").c_str()) == ParseResult::OK,
+          "trigger key of 63 chars accepted");
+    CHECK(pr(("ON Event#" + std::string(64, 'e') + " DO log m ENDON").c_str()) != ParseResult::OK,
+          "trigger key of 64 chars (>max 63) rejected");
+    // Action fields: a 31-char attr key fits; 32 is refused with a message
+    // instead of being cut so its tail becomes the value (the old silent
+    // mis-parse of `zigbee.set valve current_heating_setpoint 21.5`).
+    CHECK(pr("ON dev#a=1 DO zigbee.set lamp current_heating_setpoint 21.5 ENDON") == ParseResult::OK,
+          "zigbee.set with a 24-char key parses");
+    CHECK(pr(("ON dev#a=1 DO zigbee.set lamp " + std::string(31, 'k') + " 1 ENDON").c_str()) == ParseResult::OK,
+          "zigbee.set attr key of 31 chars accepted");
+    CHECK(pr(("ON dev#a=1 DO zigbee.set lamp " + std::string(32, 'k') + " 1 ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "zigbee.set attr key of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO zigbee.toggle " + std::string(32, 'd') + " state ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "zigbee.toggle device ref of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO zigbee.set lamp state " + std::string(19, '9') + " ENDON").c_str()) == ParseResult::OK,
+          "zigbee.set value of 19 chars accepted");
+    CHECK(pr(("ON dev#a=1 DO zigbee.set lamp state " + std::string(20, '9') + " ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "zigbee.set value of 20 chars (>max 19) rejected");
+    CHECK(pr(("ON dev#a=1 DO publish " + std::string(31, 't') + " on ENDON").c_str()) == ParseResult::OK,
+          "publish topic of 31 chars accepted");
+    CHECK(pr(("ON dev#a=1 DO publish " + std::string(32, 't') + " on ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "publish topic of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO publish home/x " + std::string(32, 'p') + " ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "publish payload of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO event " + std::string(32, 'e') + " ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "event name of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO script.run " + std::string(32, 's') + " ENDON").c_str()) == ParseResult::ERR_BAD_ACTION,
+          "script.run name of 32 chars (>max 31) rejected");
+    CHECK(pr(("ON dev#a=1 DO script.run \"" + std::string(31, 's') + "\" ENDON").c_str()) == ParseResult::OK,
+          "quoted script name of 31 chars accepted");
+    CHECK(pr(("ON dev#a=1 DO log " + std::string(60, 'm') + " ENDON").c_str()) == ParseResult::OK,
+          "a long log message still parses (cut, not refused: display only)");
+
+    // The key holds MQTT topics too; real ones are long (the old 19-char cap
+    // rejected every "<root>/devices/..." topic the cookbook showed).
+    CHECK(pr("ON Mqtt#zhac/bedroom_light/brightness/set DO zigbee.set lamp brightness %value% ENDON")
+              == ParseResult::OK,
+          "a 36-char MQTT topic trigger is accepted");
     {
-        // Action arg0 is 32 B: copy_token truncates a longer device name to 31.
+        // Action arg0 is 32 B. A longer device name used to be cut to 31
+        // silently -- naming some other or no device; it is refused now.
         ParsedRule r{};
         std::string dsl = "ON x#a=1 DO zigbee.set " + std::string(40, 'A') + " state 1 ENDON";
-        CHECK(dsl_parse(dsl.c_str(), 1, &r) == ParseResult::OK && std::strlen(r.actions[0].arg0) == 31u,
-              "over-long action arg is truncated to the buffer (31 chars), not rejected");
+        CHECK(dsl_parse(dsl.c_str(), 1, &r) == ParseResult::ERR_BAD_ACTION &&
+              std::strstr(dsl_last_error(), "too long") != nullptr,
+              "over-long action device ref is rejected with 'too long'");
     }
 
     // ── C. Trigger-type structural parse (inspect the public ParsedRule) ─
@@ -156,6 +193,25 @@ int main() {
         publish_attr_ieee(kOther, "state", VAL_INT, 1); drain_attr();
         CHECK(stub_shadow_opt_count() == 0, "unresolved friendly name is inert (not a wildcard)");
         simple_rules_delete(id);
+
+        // A friendly name may use the whole ZapDevice::friendly_name (29 chars).
+        // The trigger used to keep only 19, so "Living room ceiling light one"
+        // never resolved and the rule sat inert with no error.
+        ZapDevice longdev{};
+        longdev.ieee_addr = kOther;
+        longdev.nwk_addr  = 0x2201;
+        longdev.endpoints[0] = 1; longdev.endpoint_count = 1;
+        std::snprintf(longdev.friendly_name, sizeof(longdev.friendly_name), "%s",
+                      "Living room ceiling light one");
+        stub_pool_seed(&longdev);
+        id = add("d3", "ON Living room ceiling light one#state=1 DO zigbee.set lamp brightness 9 ENDON");
+        stub_shadow_opt_reset();
+        publish_attr_ieee(kOther, "state", VAL_INT, 1); drain_attr();
+        CHECK(id != 0 && stub_shadow_opt_count() == 1, "29-char friendly name in a trigger resolves and fires");
+        simple_rules_delete(id);
+        // One longer can never match a device, so it is an error, not a dead rule.
+        CHECK(pr(("ON " + std::string(30, 'n') + "#state=1 DO log m ENDON").c_str()) != ParseResult::OK,
+              "trigger friendly name longer than a device name (30) rejected");
     }
 
     // ── E. Tier-2 value expressions (parse level) ─────────────────────────

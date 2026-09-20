@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "mqtt_gw.h"
+#include "sdkconfig.h"
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h"   // F10: verify broker cert for mqtts://
 #include "esp_log.h"
@@ -9,6 +10,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"   // xTaskCreateWithCaps (non-S3 targets)
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <cstdio>
 #include <cstdlib>
@@ -119,7 +122,11 @@ static bool mqtt_topic_ok(const char* t) {
 static void ensure_default_client_id() {
     if (s_client_id[0]) return;
     uint8_t mac[6] = {};
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+    // The Wi-Fi STA MAC keeps the id S3 hubs have always used; chips with no
+    // Wi-Fi (the wired P4/S31 builds) fall back to the base MAC so two hubs
+    // on one broker still get distinct ids instead of both becoming "zhac".
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK ||
+        esp_read_mac(mac, ESP_MAC_BASE) == ESP_OK) {
         snprintf(s_client_id, sizeof(s_client_id), "zhac-%02x%02x",
                  mac[4], mac[5]);
     } else {
@@ -420,8 +427,21 @@ void mqtt_gw_init() {
     if (!s_pubq) {
         s_pubq = xQueueCreate(MQTT_PUBQ_DEPTH, sizeof(PubItem*));
         if (s_pubq) {
+#if CONFIG_IDF_TARGET_ESP32S3
             xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
                          tskIDLE_PRIORITY + 3, nullptr);
+#else
+            // Single-chip builds on other targets (wired P4/S31) link this
+            // client too; their internal RAM is tighter, so the stack goes to
+            // PSRAM (the worker only publishes -- no flash writes). The S3
+            // keeps its measured, hardware-proven internal stack.
+            if (xTaskCreateWithCaps(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
+                                    tskIDLE_PRIORITY + 3, nullptr,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+                xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
+                            tskIDLE_PRIORITY + 3, nullptr);
+            }
+#endif
         }
     }
     // Do NOT start the MQTT client here. mqtt_gw_init runs unconditionally
@@ -624,9 +644,9 @@ void mqtt_gw_subscribe(const char* topic_filter, int qos) {
     xSemaphoreGive(s_client_mtx);
 }
 
-void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
-                      int qos, bool retain) {
-    if (!s_client || !s_pubq || !topic || !payload) return;
+bool mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
+                     int qos, bool retain) {
+    if (!s_client || !s_pubq || !topic || !payload) return false;
 
     // Topic prefixing rules:
     //   - Leading '/' → absolute (skip root prefix; strip leading '/').
@@ -655,7 +675,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
                 // misconfigured; publishing it bare is worse than not
                 // publishing.
                 _METRIC_COUNTER_INC(METRIC_MQTT_DROPPED_MSGS, 1);
-                return;
+                return false;
             }
         }
     }
@@ -667,7 +687,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     // effective (post-prefix) name and drop on failure.
     if (!mqtt_topic_ok(eff)) {
         _METRIC_COUNTER_INC(METRIC_MQTT_DROPPED_MSGS, 1);
-        return;
+        return false;
     }
 
     // Copy topic + payload into a heap-allocated item so the caller can
@@ -675,7 +695,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     // failure or queue full — no logging here, otherwise the log-path
     // caller would recurse into us (or spam during broker stalls).
     PubItem* item = (PubItem*)calloc(1, sizeof(PubItem));
-    if (!item) return;
+    if (!item) return false;
     item->topic        = strdup(eff);
     item->payload_len  = payload_len;
     item->payload      = (char*)malloc(payload_len + 1);
@@ -688,7 +708,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
         if (item->topic)   free(item->topic);
         if (item->payload) free(item->payload);
         free(item);
-        return;
+        return false;
     }
     memcpy(item->payload, payload, payload_len);
     item->payload[payload_len] = '\0';
@@ -701,5 +721,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
         free(item->topic);
         free(item->payload);
         free(item);
+        return false;
     }
+    return true;
 }

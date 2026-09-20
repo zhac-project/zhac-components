@@ -165,6 +165,14 @@ struct HapSetAttrReq {
     uint16_t attr;
     int32_t  val;
     char     key[24];   // friendly attribute name (e.g. "state", "brightness")
+    // A string value — an enum option such as "restore". Only the converter's
+    // lookup knows its raw encoding, so it travels as text; empty = use `val`.
+    // Optional on the wire ("sval"): a P4 without it ignores the key.
+    char     sval[32];
+    // A decimal value ("fval", optional). `val` still carries the rounded
+    // integer, so a P4 that predates fval writes that, as it always did.
+    float    fval;
+    bool     has_fval;
 };
 bool hap_json_encode_set_attr(uint8_t* buf, size_t cap, uint16_t* out_len,
                                const HapSetAttrReq& req);

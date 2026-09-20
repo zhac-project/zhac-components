@@ -22,6 +22,8 @@
 extern void        stub_pool_seed(const ZapDevice* dev);
 extern void        stub_shadow_opt_reset(void);
 extern int         stub_shadow_opt_count(void);
+extern double      stub_adapter_last_float(void);
+extern int         stub_adapter_float_sends(void);
 extern uint64_t    stub_shadow_opt_ieee(void);
 extern const char* stub_shadow_opt_key(void);
 extern uint8_t     stub_shadow_opt_vt(void);
@@ -110,6 +112,22 @@ int main() {
           stub_shadow_opt_vt() == VAL_INT &&
           stub_shadow_opt_val() == 128,
           "zigbee.set brightness 128 writes (brightness, VAL_INT, 128)");
+
+    // ── a decimal literal → float send, VAL_FLOAT ×100 in the shadow ────
+    stub_shadow_opt_reset();
+    CHECK(simple_rules_add("r_setp",
+            "ON lamp#illuminance=2 DO zigbee.set lamp current_heating_setpoint 21.5 ENDON", &id),
+          "install decimal setpoint rule");
+    publish_attr("illuminance", VAL_INT, 2);
+    drain();
+    CHECK(stub_adapter_float_sends() == 1 && stub_adapter_last_float() > 21.49 &&
+          stub_adapter_last_float() < 21.51,
+          "zigbee.set ... 21.5 goes out as a float 21.5");
+    CHECK(stub_shadow_opt_count() == 1 &&
+          strcmp(stub_shadow_opt_key(), "current_heating_setpoint") == 0 &&
+          stub_shadow_opt_vt() == VAL_FLOAT &&
+          stub_shadow_opt_val() == 2150,
+          "zigbee.set ... 21.5 writes (current_heating_setpoint, VAL_FLOAT, 2150)");
 
     // ── failed send → NO shadow write (never lie about a command that
     //    didn't go out) ───────────────────────────────────────────────────

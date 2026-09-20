@@ -7,8 +7,79 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Added
+
+- **`ntp_cfg` takes the router's time server.** With no server named, `ntp_cfg_init()` (called
+  before the first DHCP lease) lets lwIP ask for one (DHCP option 42, slot 0) and keeps
+  `pool.ntp.org` as the fallback in slot 1; a server the owner names switches the router's
+  offer off. `ntp_cfg_dhcp_server()` reports the offer in use, and every lease re-applies the
+  list (a lease rewrites it). A hub on a network without internet access now keeps its clock
+  across power cuts with no configuration at all, when the router serves time.
+- **`device.list` rows carry `model_id` and `known`.** `known` says whether a definition
+  matched; the web UI's "Add a device" panel reads it instead of guessing from `model`, which
+  falls back to the raw id.
+- **`zigbee.set` / `zigbee.toggle` / `publish` / `event` / `script.run`: an argument that does
+  not fit its field is refused with a message** ("attr key too long", "topic too long", …)
+  instead of being cut so its tail became the next argument. `log` text alone is still cut,
+  so rules saved on older builds keep loading.
+
+- **A float in the send API.** `zhac_adapter_send_float(double)` hands a decimal to the
+  device's converter as `zhc::ValueType::Float`, which scales it itself; `zhac_adapter_send_number`
+  sends an integral value the integer way it always did and a fraction as a float. The HAP
+  `SET_ATTRIBUTE` frame carries a decimal as `fval` next to the rounded `val` (a P4 without it
+  writes the integer, as before). The rule engine's `zigbee.set` accepts a decimal literal
+  (`21.5`) and mirrors it into the shadow as `VAL_FLOAT` ×100. Ends the dual-chip truncation
+  of a 21.5 setpoint to 21 and the wired/mono refusal of any decimal.
+
+- **`zap_common/zap_setup_window.h`**: the ten-minute first-claim window after power-on
+  (`kZapSetupWindowS`, `zap_setup_secs_left()`), shared by the wired and dual-chip auth
+  paths so they close set-up at the same moment.
+
+- **`ntp_cfg`**: which time server SNTP asks, and starting it. A hub on a network without
+  internet access can be pointed at a local server, which is the only way its clock comes back
+  after a power cut without someone opening the web UI. The host is validated by `zap_clock.h`,
+  persisted in NVS `sys_cfg/ntp_server` and applied without a reboot; all three firmwares use it
+  instead of their own SNTP start.
+- **`zap_common/zap_clock.h`**: when the clock counts as set (2020 or later) and which times a
+  client may supply. The cron guard and every firmware's `time.set` use it, so they agree.
+- **`ha_bridge` — Home Assistant MQTT discovery.** Off by default; on from Settings. Builds a
+  retained discovery config per entity from a device's exposes (dimmable lights, switches,
+  binary sensors with device classes — `contact` inverted to HA's door semantics — numbers,
+  selects, sensors with unit/device/state class), keeps a retained per-attribute state topic,
+  and turns `<root>/devices/<IEEE>/<key>/set` into attribute writes. Remembers what it
+  published so removed devices, and turning discovery off, retract their entities. The
+  builder (`ha_discovery.cpp`) is pure and host-tested.
+- **`mqtt_gw`: the real client on non-S3 single-chip builds.** A project sets the build
+  property `ZHAC_MQTT_GW_LOCAL_CLIENT`; the wired P4/S31 build used to link the HAP shim,
+  so MQTT silently did nothing there.
+- **`mqtt_gw_publish` returns whether the message was queued**, so bursts can back off.
+- **`HapSetAttrReq::sval`** — an optional string value on `SET_ATTRIBUTE` (`"sval"` in the
+  JSON; older peers ignore it) so enum options reach the P4's converter as text.
+
 ### Fixed
 
+- **`zigbee.set` with an attribute key of 20 or more characters mis-parsed silently.** The key
+  field held 19 characters, so `zigbee.set valve current_heating_setpoint 21.5` kept
+  `current_heating_set` as the key and `point` as the value, and the rule saved without a word.
+  The field now holds 31 characters (every registered key fits) and a longer key, or a device
+  ref over 31, is refused at save time with a message.
+
+- **Scheduled rules fired at the wrong time on a hub whose clock was not set.** No ZHAC
+  board has a battery-backed clock, so until SNTP (or the S3's TIME_SYNC, on the P4) sets it
+  the time counts from 1970 at power-on, and `Time#Cron=0 0 7 * * *` fired seven hours after
+  boot. `simple_rules` now holds cron rules and Lua cron handlers until the clock reads 2020
+  or later, and logs when it starts and stops waiting.
+- **`Mqtt#` rule triggers were capped at 19 characters** (and cron expressions, event names
+  and timer refs with them): the trigger's secondary key was 20 bytes, so every
+  `<root>/devices/...` topic the cookbook's MQTT section uses was rejected with "mqtt topic
+  too long". Now 64, the size of an inbound MQTT event topic. `ParsedRule` stays in PSRAM,
+  well under its 2048-byte assert; the boundary test moved to 63/64.
+- **`mqtt_gw` client id on chips without Wi-Fi** fell back to the fixed `zhac`, so two
+  wired hubs on one broker kicked each other off; it now falls back to the base MAC.
+- **Rules never fired for devices named with 20 to 29 characters.** A trigger kept only the
+  first 19 characters of a friendly name, so "Living room ceiling light" never matched its
+  device and the rule stayed inert with no error. The trigger now holds the full 29, and a
+  longer name, which no device can have, is a parse error.
 - **`event_bus_subscribe()` before `event_bus_init()` is now refused.** It used
   to "succeed" — `bus_lock()` tolerates the not-yet-created mutex — and the
   subscription was then wiped by `event_bus_init()`, leaking the queue and

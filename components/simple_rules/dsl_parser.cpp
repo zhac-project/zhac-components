@@ -153,10 +153,14 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
         t->ieee = parsed;
     } else {
         t->ieee = 0; // will be resolved by simple_rules_resolve_names
-        const size_t cap = sizeof(t->device_name) - 1;
-        const size_t n   = strnlen(ref, cap);
-        memcpy(t->device_name, ref, n);
-        t->device_name[n] = '\0';
+        // A longer name can never equal a device's friendly_name, so fail the
+        // parse instead of storing a rule that silently never fires.
+        if (ref_len >= sizeof(t->device_name)) {
+            dsl_set_err("device name too long (max %u)", (unsigned)(sizeof(t->device_name) - 1));
+            return ParseResult::ERR_BAD_TRIGGER;
+        }
+        memcpy(t->device_name, ref, ref_len);
+        t->device_name[ref_len] = '\0';
     }
 
     if (!hash) {
@@ -256,6 +260,11 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
 // allowed inside — see expr_eval.h); otherwise the FIRST token is copied into
 // `dst` with the legacy copy_token semantics, so existing literal / bare
 // %value% rules stay byte-identical.
+// copy_token stops silently at its buffer: a 24-char attribute key in a
+// 20-byte field used to leave "point 21.5" as the NEXT token, so the value
+// became the key's tail and nothing said so. True when a token did not fit.
+static bool token_overflowed(const char* after) { return *after != '\0' && *after != ' '; }
+
 static ParseResult parse_value_arg(const char* s, RuleAction* a,
                                    char* dst, size_t dst_cap) {
     s = skip_ws(s);
@@ -282,11 +291,20 @@ static ParseResult parse_value_arg(const char* s, RuleAction* a,
             return ParseResult::ERR_BAD_ACTION;
         }
         a->has_expr = true;
-        strncpy(dst, tail, dst_cap - 1);   // truncated copy for display/debug
-        dst[dst_cap - 1] = '\0';
+        // Truncated copy for display/debug (the compiled expression is what
+        // runs). Bounded memcpy: the truncation is the point, and both
+        // strncpy and snprintf make -Werror=*-truncation call it a bug.
+        const size_t tl = strlen(tail);
+        const size_t n  = tl < dst_cap - 1 ? tl : dst_cap - 1;
+        memcpy(dst, tail, n);
+        dst[n] = '\0';
         return ParseResult::OK;
     }
-    copy_token(s, ' ', dst, dst_cap);
+    const char* after = copy_token(s, ' ', dst, dst_cap);
+    if (token_overflowed(after)) {
+        dsl_set_err("value too long (max %u)", (unsigned)(dst_cap - 1));
+        return ParseResult::ERR_BAD_ACTION;
+    }
     return ParseResult::OK;
 }
 
@@ -304,16 +322,32 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         a->type = ActionType::ZIGBEE_SET;
         s += 11; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
+        if (token_overflowed(s)) {
+            dsl_set_err("device ref too long (max %u)", (unsigned)(sizeof(a->arg0) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         s = skip_ws(s);
         s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
+        if (token_overflowed(s)) {
+            dsl_set_err("attr key too long (max %u)", (unsigned)(sizeof(a->arg1) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         return parse_value_arg(s, a, a->arg2, sizeof(a->arg2));
     }
     if (strncmp(s, "zigbee.toggle ", 14) == 0) {
         a->type = ActionType::ZIGBEE_TOGGLE;
         s += 14; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
+        if (token_overflowed(s)) {
+            dsl_set_err("device ref too long (max %u)", (unsigned)(sizeof(a->arg0) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         s = skip_ws(s);
         s = copy_token(s, ' ', a->arg1, sizeof(a->arg1));
+        if (token_overflowed(s)) {
+            dsl_set_err("attr key too long (max %u)", (unsigned)(sizeof(a->arg1) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         if (a->arg0[0] == '\0' || a->arg1[0] == '\0') return ParseResult::ERR_BAD_ACTION;
         return ParseResult::OK;
     }
@@ -321,25 +355,38 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         a->type = ActionType::PUBLISH;
         s += 8; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
+        if (token_overflowed(s)) {
+            dsl_set_err("topic too long (max %u)", (unsigned)(sizeof(a->arg0) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         return parse_value_arg(s, a, a->arg1, sizeof(a->arg1));
     }
     if (strncmp(s, "event ", 6) == 0) {
         a->type = ActionType::EVENT;
         s += 6; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0));
+        if (token_overflowed(s)) {
+            dsl_set_err("event name too long (max %u)", (unsigned)(sizeof(a->arg0) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         return ParseResult::OK;
     }
     if (strncmp(s, "timer ", 6) == 0) {
         a->type = ActionType::TIMER;
         s += 6; s = skip_ws(s);
         s = copy_token(s, ' ', a->arg0, sizeof(a->arg0)); // index
+        if (token_overflowed(s)) { dsl_set_err("timer index too long"); return ParseResult::ERR_BAD_ACTION; }
         s = skip_ws(s);
         s = copy_token(s, ' ', a->arg1, sizeof(a->arg1)); // ms
+        if (token_overflowed(s)) { dsl_set_err("timer duration too long"); return ParseResult::ERR_BAD_ACTION; }
         return ParseResult::OK;
     }
     if (strncmp(s, "log ", 4) == 0) {
         // log message is the only multi-word tail; keep rest-of-string
         // semantics but strip the trailing space inserted before ENDON.
+        // The ONE place a long token is still cut rather than refused: the
+        // text only reaches the log, so a rule saved on an older build must
+        // keep loading at boot instead of vanishing over a long message.
         a->type = ActionType::LOG;
         strncpy(a->arg0, skip_ws(s + 4), sizeof(a->arg0) - 1);
         a->arg0[sizeof(a->arg0) - 1] = '\0';
@@ -367,6 +414,11 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         }
         a->arg0[i] = '\0';
         if (i == 0) return ParseResult::ERR_BAD_ACTION;
+        // A name that did not fit would run some other (or no) script.
+        if (*s != '\0' && *s != '"' && *s != ' ' && *s != '\t') {
+            dsl_set_err("script name too long (max %u)", (unsigned)(sizeof(a->arg0) - 1));
+            return ParseResult::ERR_BAD_ACTION;
+        }
         return ParseResult::OK;
     }
     return ParseResult::ERR_BAD_ACTION;

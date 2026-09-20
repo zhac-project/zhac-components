@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "simple_rules.h"
+#include "zap_clock.h"
 #include "rule_store.h"
 #include "esp_heap_caps.h"
 #include "event_bus.h"
@@ -18,6 +19,7 @@
 #include "freertos/task.h"
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include "task_stacks.h"
@@ -362,14 +364,22 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
                 ESP_LOGW(TAG, "zigbee.set: device '%s' not found", a.arg0);
                 break;
             }
-            int32_t int_val = (int32_t)strtol(val_buf, nullptr, 10);
+            // `21.5` is a decimal write (the converter scales it); anything
+            // else is the integer it always was.
+            const bool decimal = strchr(val_buf, '.') != nullptr;
+            const double dbl_val = decimal ? strtod(val_buf, nullptr) : 0.0;
+            int32_t int_val = decimal ? (int32_t)lround(dbl_val)
+                                      : (int32_t)strtol(val_buf, nullptr, 10);
             uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
-            if (!zhac_adapter_send_uint(snap.ieee_addr,
-                                         snap.model_id,
+            const bool sent = decimal
+                ? zhac_adapter_send_float(snap.ieee_addr, snap.model_id,
+                                          snap.manufacturer_name,
+                                          snap.nwk_addr, ep, a.arg1, dbl_val)
+                : zhac_adapter_send_uint(snap.ieee_addr, snap.model_id,
                                          snap.manufacturer_name,
-                                         snap.nwk_addr, ep,
-                                         a.arg1,
-                                         static_cast<uint64_t>(int_val))) {
+                                         snap.nwk_addr, ep, a.arg1,
+                                         static_cast<uint64_t>(int_val));
+            if (!sent) {
                 ESP_LOGW(TAG, "zigbee.set: no tz converter for '%s' key='%s'",
                          a.arg0, a.arg1);
                 break;
@@ -383,10 +393,12 @@ static void execute_rule(const ParsedRule& rule, const char* event_val,
             // from the device later overrides this value. No-op unless the
             // device's shadow config has optimistic==true.
             if (a.arg1[0] != '\0') {
-                const uint8_t vt = (strcmp(a.arg1, "state") == 0) ? VAL_BOOL
-                                                                  : VAL_INT;
+                // Shadow keeps decimals as VAL_FLOAT ×100 (zcl_attribute.h).
+                const uint8_t vt = decimal ? VAL_FLOAT
+                                 : (strcmp(a.arg1, "state") == 0) ? VAL_BOOL : VAL_INT;
                 device_shadow_update_optimistic(snap.ieee_addr, a.arg1, vt,
-                                                 int_val);
+                                                 decimal ? (int32_t)lround(dbl_val * 100.0)
+                                                         : int_val);
             }
             break;
         }
@@ -606,6 +618,10 @@ static void dispatch_event(const Event& ev) {
 
 // ── Cron task ─────────────────────────────────────────────────────────────
 
+// No ZHAC board has an RTC (see zap_clock.h). A schedule matched against the
+// 1970 power-on clock fires at the wrong time -- "0 7 * * *" seven hours after
+// boot -- so cron rules and Lua cron handlers wait until the clock is set.
+
 static void task_cron(void*) {
     // The parser now accepts an optional 6th field (seconds), so the
     // firing loop ticks once per second instead of once per minute.
@@ -613,9 +629,22 @@ static void task_cron(void*) {
     // matched minute because cron_parse sets second_bits = bit 0 for
     // that form. The match check is a handful of bit-ANDs per rule.
     time_t last_evaluated = 0;  // dedupe so wall-clock skew can't fire a rule twice in one second
+    bool   waiting_for_clock = false;
 
     for (;;) {
         time_t now = time(nullptr);
+        if (!zap_clock_is_set(now)) {
+            if (!waiting_for_clock) {
+                ESP_LOGW(TAG, "cron: clock not set yet -- scheduled rules wait for it");
+                waiting_for_clock = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (waiting_for_clock) {
+            ESP_LOGI(TAG, "cron: clock set -- scheduled rules running");
+            waiting_for_clock = false;
+        }
         if (now == last_evaluated) {
             // Sub-second drift landed us in the same wall-clock second
             // we already evaluated. Sleep a fraction and retry rather

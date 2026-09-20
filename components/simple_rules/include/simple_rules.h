@@ -20,7 +20,11 @@ struct RuleTrigger {
     // non-attr triggers (EVENT/CRON/TIMER/MQTT) this doubles as the
     // event name, cron expression, timer index string, or MQTT topic.
     char        attr_key[ATTR_KEY_MAX];
-    char        key[20];         // non-attr secondary key slot (kept for ABI)
+    // Non-attr trigger key: cron expression, event name, timer index or MQTT
+    // topic. 64 = MqttMsgEvent::topic, so any topic the bus can deliver can be
+    // matched (it was 20, which capped Mqtt# topics at 19 characters and broke
+    // every <root>/... topic). ParsedRule lives in PSRAM; see the size assert.
+    char        key[64];
     CondOp      op;
     // DEVICE_ATTR comparison value (parsed at DSL time):
     //   match_val_type == VAL_INT/BOOL: int_val holds the raw parsed int.
@@ -30,7 +34,10 @@ struct RuleTrigger {
     int32_t     int_val;         // parsed int value
     char        str_val[ATTR_STR_MAX]; // parsed string value (STR type)
     char        value[20];       // original DSL literal text
-    char        device_name[20]; // friendly name before resolution; empty if ieee literal
+    // Friendly name before resolution; empty if ieee literal. As wide as the
+    // name it is compared with -- it was 20, so any device named with 20-29
+    // characters could never be matched and its rules stayed inert.
+    char        device_name[sizeof(ZapDevice::friendly_name)];
 };
 
 enum class ActionType : uint8_t {
@@ -69,7 +76,7 @@ void simple_rules_set_script_hook(simple_rules_script_hook_t hook);
 struct RuleAction {
     ActionType type;
     char       arg0[32];  // device ref / topic / event name / message
-    char       arg1[20];  // attr key / payload / timer index
+    char       arg1[32];  // attr key (ATTR_KEY_MAX 28 fits) / payload / timer index
     char       arg2[20];  // attr value
     // Tier-2 value expression (extra/docs/2026-07-08-simple-rules-expr-tier2-plan.md):
     // when the VALUE argument of zigbee.set / publish uses %value% beyond the

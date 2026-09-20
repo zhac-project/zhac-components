@@ -186,6 +186,12 @@ static void devlist_add_one(JsonArray& arr, const ZapDevice& d,
     o["model"]  = model_buf[0]
                    ? (const char*)model_buf
                    : (const char*)d.model_id;
+    // What the device itself reports (Basic 0x0005) and whether a definition
+    // matched it: the web UI's "Add a device" panel tells "ready" from "no
+    // definition for what it reports" by `known`, never by guessing from
+    // `model`, which falls back to the raw id above.
+    o["model_id"]     = d.model_id;
+    o["known"]        = model_buf[0] != '\0';
     o["lqi"]          = d.link_quality;
     o["last_seen"]    = d.last_seen;
     o["ps"]           = d.power_source;
@@ -510,6 +516,8 @@ bool hap_json_encode_set_attr(uint8_t* buf, size_t cap, uint16_t* out_len,
     doc["at"]   = req.attr;
     doc["val"]  = req.val;
     if (req.key[0]) doc["key"] = req.key;
+    if (req.sval[0]) doc["sval"] = req.sval;
+    if (req.has_fval) doc["fval"] = req.fval;
     size_t n = serializeJson(doc, reinterpret_cast<char*>(buf), cap);
     if (doc.overflowed() || n == 0 || n >= cap) {
         ESP_LOGE(TAG, "encode_set_attr overflow");
@@ -531,6 +539,11 @@ bool hap_json_decode_set_attr(const uint8_t* payload, uint16_t len, HapSetAttrRe
     const char* k = doc["key"] | "";
     strncpy(out.key, k, sizeof(out.key) - 1);
     out.key[sizeof(out.key) - 1] = '\0';
+    const char* sv = doc["sval"] | "";
+    strncpy(out.sval, sv, sizeof(out.sval) - 1);
+    out.sval[sizeof(out.sval) - 1] = '\0';
+    out.has_fval = doc["fval"].is<float>();
+    out.fval     = out.has_fval ? doc["fval"].as<float>() : 0.0f;
     return true;
 }
 

@@ -30,9 +30,9 @@ void mqtt_gw_stop()  {}
 void mqtt_gw_configure(const char*, const char*, const char*) {}
 void mqtt_gw_on_sta_up() {}
 
-void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
-                      int qos, bool retain) {
-    if (!topic || !payload) return;
+bool mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
+                     int qos, bool retain) {
+    if (!topic || !payload) return false;
 
     // Static buffers + mutex. Earlier we used `std::make_unique` to
     // move these off-stack (hap_slave low-stack canary trip), but
@@ -47,7 +47,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     static uint8_t           s_buf[kBufSz];
     if (!s_pub_mutex || xSemaphoreTake(s_pub_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "mqtt_publish: mutex contention — drop topic=%s", topic);
-        return;
+        return false;
     }
 
     std::memset(&s_msg, 0, sizeof(s_msg));
@@ -75,7 +75,7 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     if (!hap_json_encode_mqtt_publish(s_buf, kBufSz, &len, s_msg)) {
         xSemaphoreGive(s_pub_mutex);
         ESP_LOGE(TAG, "mqtt_publish encode failed topic=%s", topic);
-        return;
+        return false;
     }
 
     HapFrame f{};
@@ -84,9 +84,10 @@ void mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
     f.flags       = 0;
     f.payload     = s_buf;
     f.payload_len = len;
-    hap_session_send(f);
+    const bool sent = hap_session_send(f);
     xSemaphoreGive(s_pub_mutex);
     ESP_LOGD(TAG, "MQTT_PUBLISH forwarded topic=%s qos=%d retain=%d", topic, qos, retain);
+    return sent;
 }
 
 bool mqtt_gw_is_connected()                    { return false; }  // N/A on P4

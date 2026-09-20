@@ -1,8 +1,15 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 idf_build_get_property(target IDF_TARGET)
+# A single-chip firmware on a non-S3 target (zhac-wired-core: P4/S31) has no
+# S3 to forward to, so it needs the real client too. It says so from its
+# project CMakeLists, before project():
+#   idf_build_set_property(ZHAC_MQTT_GW_LOCAL_CLIENT 1)
+# A build property, not Kconfig: it must be readable in IDF's early
+# component-expansion pass, where CONFIG_* symbols do not exist yet.
+idf_build_get_property(local_client ZHAC_MQTT_GW_LOCAL_CLIENT)
 
-if(target STREQUAL "esp32s3")
+if(target STREQUAL "esp32s3" OR local_client)
     set(MQTT_GW_SRCS "mqtt_gw_s3.cpp")
     # `metrics` carries METRIC_MQTT_DROPPED_MSGS (F-07).
     # `zap_store` carries the uplink selector (zhac_uplink_get, RainMaker
