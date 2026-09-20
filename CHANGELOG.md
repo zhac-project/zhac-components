@@ -33,6 +33,13 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   report or reboot) and neither told it to leave. The ops live in `device_cmd_ops.cpp` so the
   rule engine's host suite links only the attribute path. Host contract suite: 64 checks.
 
+- **`RULE_CHANGED` event.** `simple_rules_add` / `_update` / `_enable` / `_delete` publish
+  `EventType::RULE_CHANGED` (`RuleChangedEvent { rule_id, change }`) on success, whichever
+  door called them. The wired and mono WebSocket bridges build their `rule.added` /
+  `rule.updated` / `rule.deleted` pushes from that one event instead of pushing by hand in each
+  WebSocket handler, so a rule edited over REST (or restored from a backup) now reaches open
+  tabs and the cloud relay too. Architecture review A7, last cut.
+
 - **`ntp_cfg` takes the router's time server.** With no server named, `ntp_cfg_init()` (called
   before the first DHCP lease) lets lwIP ask for one (DHCP option 42, slot 0) and keeps
   `pool.ntp.org` as the fallback in slot 1; a server the owner names switches the router's

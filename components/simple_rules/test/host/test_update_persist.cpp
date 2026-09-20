@@ -55,5 +55,25 @@ int main() {
     CHECK(stub_rule_store_count() == before,
           "update of an unknown rule_id persists no orphan");
 
+    // RULE_CHANGED: every mutation publishes once, whichever door called it
+    {
+        static uint8_t  kinds[8]; static uint16_t ids[8]; static int n = 0;
+        n = 0;
+        event_bus_subscribe(EventType::RULE_CHANGED, [](const Event& e) {
+            RuleChangedEvent c{}; memcpy(&c, e.data, sizeof(c));
+            if (n < 8) { kinds[n] = c.change; ids[n] = c.rule_id; n++; }
+        });
+        uint16_t rid = 0;
+        simple_rules_add("r9", "ON Event#go DO log z ENDON", &rid);
+        simple_rules_enable(rid, false);
+        simple_rules_update(rid, "r9", "ON Event#go DO log zz ENDON");
+        simple_rules_delete(rid);
+        event_bus_drain(EventType::RULE_CHANGED, 0);
+        CHECK(n == 4 && kinds[0] == RULE_CHANGE_ADDED && kinds[1] == RULE_CHANGE_UPDATED &&
+              kinds[2] == RULE_CHANGE_UPDATED && kinds[3] == RULE_CHANGE_DELETED,
+              "add / enable / update / delete publish RULE_CHANGED added, updated, updated, deleted");
+        CHECK(ids[0] == rid && ids[3] == rid, "RULE_CHANGED carries the rule id");
+        CHECK(!simple_rules_enable(9999, true) && n == 4, "a failed mutation publishes nothing");
+    }
     return s_failures ? 1 : 0;
 }

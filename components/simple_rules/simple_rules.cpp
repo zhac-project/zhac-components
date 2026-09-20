@@ -706,6 +706,14 @@ void simple_rules_init() {
     xTaskCreate(task_cron, "rule_cron", zhac::stack::kRuleCron, nullptr, 2, nullptr);
 }
 
+static void publish_changed(uint16_t rule_id, uint8_t change) {
+    Event ev{};
+    ev.type = EventType::RULE_CHANGED;
+    const RuleChangedEvent p{rule_id, change};
+    memcpy(ev.data, &p, sizeof(p));
+    event_bus_publish(ev);
+}
+
 void simple_rules_reload() {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     reload_locked();
@@ -762,6 +770,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     cron_cache_invalidate();   // F27
     if (out_rule_id) *out_rule_id = id;
     xSemaphoreGiveRecursive(s_mutex);
+    publish_changed(id, RULE_CHANGE_ADDED);
     return true;
 }
 
@@ -822,6 +831,7 @@ bool simple_rules_update(uint16_t rule_id,
         cron_cache_invalidate();   // F27
     }
     xSemaphoreGiveRecursive(s_mutex);
+    publish_changed(rule_id, RULE_CHANGE_UPDATED);
     return true;
 }
 
@@ -845,6 +855,7 @@ bool simple_rules_delete(uint16_t rule_id) {
         if (!rule_store_load(rule_id, &tmp)) return false;
     }
     rule_store_mark_delete(rule_id);  // deferred NVS commit
+    publish_changed(rule_id, RULE_CHANGE_DELETED);
     return true;
 }
 
@@ -870,6 +881,7 @@ bool simple_rules_enable(uint16_t rule_id, bool enabled) {
         }
     }
     xSemaphoreGiveRecursive(s_mutex);
+    publish_changed(rule_id, RULE_CHANGE_UPDATED);
     return true;
 }
 

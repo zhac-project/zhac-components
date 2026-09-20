@@ -25,6 +25,10 @@ enum class EventType : uint8_t {
     // no-report devices (Tuya LED drivers) that otherwise never reflect a
     // command past the P4 cache.
     SHADOW_OPTIMISTIC = 11,
+    // A rule was added, updated (incl. enable/disable) or deleted, whichever
+    // door did it (WebSocket, REST, restore, HAP). Emitted by simple_rules so
+    // the "rule.*" pushes have one source instead of one per transport.
+    RULE_CHANGED     = 12,
 
     // Sentinel — one past the highest valid type. Sizes the subscriber
     // table (event_bus.cpp); NOT a publishable type. Keep last. Source-only
@@ -81,6 +85,13 @@ struct RuleEventPayload {
     uint8_t hop;
 };
 static_assert(sizeof(RuleEventPayload) == 96);
+
+// ── RULE_CHANGED payload ──────────────────────────────────────────────────
+enum : uint8_t { RULE_CHANGE_ADDED = 0, RULE_CHANGE_UPDATED = 1, RULE_CHANGE_DELETED = 2 };
+struct RuleChangedEvent {
+    uint16_t rule_id;
+    uint8_t  change;   // RULE_CHANGE_*
+};
 
 // ── RULE_TIMER_FIRE payload ───────────────────────────────────────────────
 struct RuleTimerPayload {
