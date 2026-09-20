@@ -58,9 +58,8 @@ void ntp_cfg_init(void) {
     load_once();
 #if CONFIG_LWIP_DHCP_GET_NTP_SRV
     esp_sntp_servermode_dhcp(!custom());
-    ESP_LOGI(TAG, custom() ? "time server %s (router offers ignored)"
-                           : "asking the router for a time server; %s as fallback",
-             ntp_cfg_server());
+    if (custom()) ESP_LOGI(TAG, "time server %s (router offers ignored)", ntp_cfg_server());
+    else          ESP_LOGI(TAG, "asking the router for a time server; %s as fallback", ntp_cfg_server());
 #endif
 }
 
