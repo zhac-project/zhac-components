@@ -21,8 +21,10 @@
 #include "metrics/metrics_macros.h"
 
 #include "zhc/runtime/expose_range.hpp"
+#include <memory>
 
 #include "definitions/lumi/_shared.hpp"
+#include "definitions/tuya/_shared.hpp"   // exposes_from_dp_map
 #include "zhc/devices/lumi_registry.hpp"
 #include "zhc/devices/efekta_registry.hpp"
 #include "zhc/devices/adeo_registry.hpp"
@@ -1142,12 +1144,34 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
         resolve_supplement(ieee, model_id, manufacturer_name, def);
     const bool have_primary    = def  && def->exposes  && def->exposes_count > 0;
     const bool have_supplement = supp && supp->exposes && supp->exposes_count > 0;
+    // Generated Tuya definitions ship a datapoint map and no expose table;
+    // derive one so the web UI and Home Assistant see the device.
+    std::unique_ptr<zhc::Expose[]> synth;
+    std::unique_ptr<const char*[]> synth_labels;
+    std::size_t synth_n = 0;
     if (!have_primary && !have_supplement) {
-        // Still emit a valid empty array so the UI has a consistent
-        // shape (`[]`) instead of `undefined`.
-        if (cap < 3) return 0;
-        buf[0] = '['; buf[1] = ']'; buf[2] = '\0';
-        return 2;
+        const zhc::tuya::TuyaDatapointMap* map = nullptr;
+        for (std::uint8_t i = 0; def && i < def->from_zigbee_count && !map; i++) {
+            const zhc::FzConverter* fz = def->from_zigbee[i];
+            if (fz && fz->family == zhc::FrameFamily::TuyaDp && fz->user_config &&
+                fz->fn.tuya_fn == &zhc::tuya::fz_tuya_datapoints)
+                map = static_cast<const zhc::tuya::TuyaDatapointMap*>(fz->user_config);
+        }
+        if (map) {
+            constexpr std::size_t kMaxSynth = 64, kMaxLabels = 192;
+            synth.reset(new (std::nothrow) zhc::Expose[kMaxSynth]);
+            synth_labels.reset(new (std::nothrow) const char*[kMaxLabels]);
+            if (synth && synth_labels)
+                synth_n = zhc::tuya::exposes_from_dp_map(*map, synth.get(), kMaxSynth,
+                                                         synth_labels.get(), kMaxLabels);
+        }
+        if (!synth_n) {
+            // Still emit a valid empty array so the UI has a consistent
+            // shape (`[]`) instead of `undefined`.
+            if (cap < 3) return 0;
+            buf[0] = '['; buf[1] = ']'; buf[2] = '\0';
+            return 2;
+        }
     }
     auto type_str = [](zhc::ExposeType t) -> const char* {
         switch (t) {
@@ -1258,6 +1282,7 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
             emit_one(def->exposes[i]);
         }
     }
+    for (std::size_t i = 0; i < synth_n; i++) emit_one(synth[i]);
     if (have_supplement) {
         // Drop names already emitted by the primary def so the UI
         // doesn't show duplicate "state"/"battery"/etc. rows when a

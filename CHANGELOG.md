@@ -9,6 +9,12 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **Devices with only a Tuya datapoint map get exposes.** `zhac_adapter_build_exposes_json`
+  used to answer `[]` for the 666 generated Tuya / Moes definitions that ship no expose table,
+  so the web UI showed no controls and Home Assistant no entities. It now derives the table
+  from the datapoint map (`tuya::exposes_from_dp_map` in embedded-zhc): types and enum labels
+  are exact, access and units are a guess by key name.
+
 - **Home Assistant: climate, cover, lock, fan and event entities; battery devices go
   unavailable.** `ha_discovery` composes a **climate** entity from `local_temperature` + a
   writable heating setpoint (modes filtered to Home Assistant's hvac words, presets, a
