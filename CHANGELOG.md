@@ -9,6 +9,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **`sys_tasks.h`: per-task CPU share, core, priority and stack headroom** (zap_common,
+  header-only). Measured between two calls, wrap-safe on the 32-bit run-time counters; behind
+  the new `diag.tasks` WebSocket command on the wired and single-chip builds.
+
 - **`mqtt_gw_cfg`: the local MQTT client's settings in one place.** NVS-backed
   (`mqtt_cfg`: enabled, broker URL, root topic, client id): `mqtt_gw_cfg_boot()` loads and arms
   at boot, `mqtt_gw_cfg_apply()` persists and applies a Settings write, `mqtt_gw_cfg_fill_status()`
