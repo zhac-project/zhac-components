@@ -14,6 +14,8 @@
 //   <root>/devices/<IEEE>/<key>                      state, retained, raw value
 //   <root>/devices/<IEEE>/<key>/set                  commands from Home Assistant
 //   <root>/availability                              "online" / "offline" (LWT)
+//   <root>/devices/<IEEE>/availability               battery devices only: "offline"
+//                                                    after a day of silence (ha_bridge)
 // <ieee> is 16 lower-case hex digits, <IEEE> the same upper-case, as the
 // existing <root>/devices/<IEEE>/state topic already uses.
 #pragma once
@@ -28,6 +30,7 @@ struct Device {
     const char* vendor;    // matched definition's vendor, else raw manufacturer
     const char* model;     // matched definition's model, else raw model id
     const char* exposes;   // JSON array of {name,type,access,unit?,category?,values?,value_min?,...}
+    bool        battery_powered;   // from the device's power source; a `battery` expose also counts
 };
 
 struct Context {
@@ -41,8 +44,23 @@ using EmitFn = void (*)(const char* component, const char* topic,
                         const char* payload, void* user);
 
 // Emit every discovery config for one device. Returns the entity count, or -1
-// when `exposes` is not a JSON array.
-int build_device(const Device& d, const Context& c, EmitFn emit, void* user);
+// when `exposes` is not a JSON array. `passive_out`, when given, says whether
+// the device got the per-device availability topic (battery devices do).
+//
+// Compositions, in this order, each consuming the exposes it uses:
+//   local_temperature + a writable heating setpoint   -> climate (+ system_mode, preset,
+//                                                        running_state, fan_mode)
+//   writable state + brightness (+ color_temp)         -> light
+//   writable position and/or state enum OPEN/CLOSE     -> cover (+ tilt)
+//   writable lock_state on/off                          -> lock
+//   fan_state, or a fan_mode with "off"                 -> fan (+ preset modes)
+//   read-only enum "action" with a value list           -> event
+// Everything else becomes the single entity its type implies.
+int build_device(const Device& d, const Context& c, EmitFn emit, void* user,
+                 bool* passive_out = nullptr);
+
+// <root>/devices/<IEEE>/availability. Returns length, or -1 if it does not fit.
+int device_availability_topic(char* out, size_t cap, const char* root, uint64_t ieee);
 
 // Emit the hub's own entity (a connectivity sensor on <root>/availability).
 // Every device names the hub as its `via_device`, which needs it to exist.

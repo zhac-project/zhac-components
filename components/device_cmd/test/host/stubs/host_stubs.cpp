@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include "device_backend.h"
+#include "event_bus.h"
 #include "device_shadow.h"
 #include "esp_timer.h"
 #include "zap_common.h"
@@ -101,4 +102,7 @@ DeviceBackend* device_backend_find(NcpProtocol) {
     if (!g_have_backend) return nullptr;
     s_backend.remove_device = fake_backend_remove;
     return &s_backend;
+}
+void event_bus_publish(const Event& e) {
+    if (e.type == EventType::DEVICE_LEAVE) { g_store.leave_events++; std::memcpy(&g_store.leave_event_ieee, e.data, sizeof(uint64_t)); }
 }

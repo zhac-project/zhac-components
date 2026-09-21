@@ -13,6 +13,7 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/idf_additions.h"   // xTaskCreateWithCaps
@@ -29,6 +30,11 @@ constexpr size_t      kPrefixCap    = 32;
 constexpr size_t      kMaxDevices   = 256;
 constexpr int         kQueueDepth   = 24;
 constexpr uint32_t    kTaskStack    = 8192;
+// A battery device that has said nothing for this long is reported offline
+// (zigbee2mqtt's default for passive devices). Mains devices are never timed
+// out here: they only report on change, so silence proves nothing.
+// ponytail: a ZCL read "ping" would let mains devices go offline too.
+constexpr uint32_t    kPassiveSilenceS = 25 * 3600;
 
 enum class Op : uint8_t { RepublishAll, Device, Removed, Command, RetractAll };
 struct Msg {
@@ -44,6 +50,9 @@ struct Msg {
 struct Published {
     uint64_t ieee;
     char*    topics;
+    bool     passive;         // has the per-device availability topic
+    bool     offline;         // what we last told the broker
+    volatile uint32_t last_seen_s;   // written from the state publisher's task; 32-bit, atomic
 };
 
 const HaBridgePlatform* s_plat = nullptr;
@@ -130,9 +139,15 @@ void retract_device(uint64_t ieee) {
     Published* s = slot_for(ieee, false);
     if (!s) return;
     retract_topics(s->topics);
+    if (s->passive) {
+        // Clear the retained availability too, or HA keeps a stale value
+        // should the device ever be re-added under this address.
+        char topic[96];
+        if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), s->ieee) >= 0)
+            publish(topic, "", 1, true);
+    }
     free(s->topics);
-    s->topics = nullptr;
-    s->ieee = 0;
+    *s = Published{};
 }
 
 // Collects a device's config topics while ha::build_device emits them.
@@ -155,6 +170,14 @@ void emit_config(const char*, const char* topic, const char* payload, void* user
 
 void publish_attrs(uint64_t ieee, const char* attrs_json);
 
+uint32_t now_s() { return static_cast<uint32_t>(esp_timer_get_time() / 1000000); }
+
+void publish_availability(uint64_t ieee, bool online) {
+    char topic[96];
+    if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee) < 0) return;
+    publish(topic, online ? "online" : "offline", 1, true);
+}
+
 void publish_device(const HaDeviceSnapshot& d, void*) {
     if (!s_enabled || !d.ieee) return;
     char bid[kPrefixCap];
@@ -163,15 +186,41 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
     auto* col = static_cast<Collect*>(ext_alloc(sizeof(Collect)));
     if (!col) return;
     new (col) Collect();
-    const int n = ha::build_device({d.ieee, d.name, d.vendor, d.model, d.exposes}, ctx,
-                                   emit_config, col);
+    bool passive = false;
+    const int n = ha::build_device({d.ieee, d.name, d.vendor, d.model, d.exposes, d.battery_powered},
+                                   ctx, emit_config, col, &passive);
     if (n < 0) ESP_LOGW(TAG, "0x%016llx: exposes are not a JSON array", (unsigned long long)d.ieee);
     if (Published* s = slot_for(d.ieee, true)) {
         free(s->topics);
-        s->topics = col->len ? dup_str(col->buf) : nullptr;
+        s->topics  = col->len ? dup_str(col->buf) : nullptr;
+        s->passive = passive;
+        if (passive) {
+            // Assume alive on (re)publish; the silence clock starts now. A
+            // device already timed out stays offline until it reports.
+            if (!s->last_seen_s) s->last_seen_s = now_s();
+            s->offline = (now_s() - s->last_seen_s) > kPassiveSilenceS;
+            publish_availability(d.ieee, !s->offline);
+        }
     }
     free(col);
     publish_attrs(d.ieee, d.attrs);   // HA shows the current values right away
+}
+
+// Battery devices silent for too long go offline; the first report brings
+// them back. Runs on the bridge task once a second.
+void tick_availability() {
+    if (!s_enabled || !s_pub || !mqtt_gw_is_connected()) return;
+    const uint32_t now = now_s();
+    for (size_t i = 0; i < kMaxDevices; i++) {
+        Published& p = s_pub[i];
+        if (!p.ieee || !p.passive) continue;
+        const bool silent = (now - p.last_seen_s) > kPassiveSilenceS;
+        if (silent != p.offline) {
+            p.offline = silent;
+            publish_availability(p.ieee, !silent);
+            ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)p.ieee, silent ? "silent for a day: offline" : "back: online");
+        }
+    }
 }
 
 void publish_bridge() {
@@ -232,6 +281,7 @@ void task(void*) {
         const bool connected = mqtt_gw_is_connected();
         if (connected && !was_connected) republish_all();
         was_connected = connected;
+        tick_availability();
     }
 }
 
@@ -245,13 +295,15 @@ bool post(Op op, uint64_t ieee = 0, const char* key = nullptr, const char* value
     return xQueueSend(s_q, &m, 0) == pdTRUE;
 }
 
-// Values arrive as JSON text; publish them as HA matches them.
+// Values arrive as JSON text; publish them as HA matches them. "action" (a
+// button press, an HA event entity) goes without retain: a retained press
+// would fire again on every Home Assistant restart.
 void publish_value(uint64_t ieee, const char* key, const char* value_json) {
     char topic[128];
     char payload[64];
     if (ha::state_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee, key) < 0) return;
     if (!ha::state_payload(value_json, payload, sizeof(payload))) return;
-    mqtt_gw_publish(topic, payload, strlen(payload), 0, true);
+    mqtt_gw_publish(topic, payload, strlen(payload), 0, strcmp(key, "action") != 0);
 }
 
 void publish_attrs(uint64_t ieee, const char* attrs_json) {
@@ -345,6 +397,8 @@ void ha_bridge_device_removed(uint64_t ieee) {
 
 void ha_bridge_publish_state(uint64_t ieee, const char* key, const char* value_json) {
     if (!s_enabled || !key || !value_json || key[0] == '_' || !mqtt_gw_is_connected()) return;
+    // Heard from: the bridge task notices a timed-out device is back.
+    if (Published* s = slot_for(ieee, false)) s->last_seen_s = now_s();
     publish_value(ieee, key, value_json);
 }
 

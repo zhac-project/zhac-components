@@ -8,5 +8,5 @@
 idf_component_register(
     SRCS "device_cmd.cpp" "device_cmd_ops.cpp" "device_cmd_json.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES zap_common zap_store zigbee_mgr zhc_adapter device_shadow device_backend arduinojson esp_timer
+    REQUIRES zap_common zap_store zigbee_mgr zhc_adapter device_shadow device_backend event_bus arduinojson esp_timer
 )

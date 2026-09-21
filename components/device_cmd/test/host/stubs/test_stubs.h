@@ -13,6 +13,7 @@ struct StubStore {
     int pool_removes = 0; int leave_reqs = 0; uint16_t leave_nwk = 0; uint64_t leave_ieee = 0;
     int permit_calls = 0; uint8_t permit_secs = 0; int backend_removes = 0;
     int changed_calls = 0; uint64_t changed_ieee = 0;
+    int leave_events = 0; uint64_t leave_event_ieee = 0;
 };
 extern StubSend g_send; extern StubShadow g_shadow; extern StubStore g_store;
 extern bool g_send_result; extern bool g_radio_result; extern bool g_have_backend;

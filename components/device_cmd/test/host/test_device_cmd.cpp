@@ -152,9 +152,10 @@ int main() {
     CHECK(g_store.dirty_marks == 1 && g_store.dirty_pri == ZAP_PERSIST_LOW && (g_store.dirty_flags & ZAP_DEV_REMOVED),
           "soft remove persists the tombstone at LOW priority");
     CHECK(g_store.deletes == 0 && g_store.shadow_removes == 0 && g_store.pool_removes == 0, "soft remove wipes nothing");
+    CHECK(g_store.leave_events == 1 && g_store.leave_event_ieee == IEEE, "soft remove publishes DEVICE_LEAVE (UI row, HA entities, rules)");
     CHECK(g_send.lock_depth == 0, "soft remove leaves the pool lock balanced");
     stub_reset(); stub_pool_clear();
-    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_NOT_FOUND && g_store.leave_reqs == 0, "soft remove of an unknown device -> not found");
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_NOT_FOUND && g_store.leave_reqs == 0 && g_store.leave_events == 0, "soft remove of an unknown device -> not found, no event");
 
     // ── remove, hard: no backend ──
     arm();
@@ -164,6 +165,7 @@ int main() {
     CHECK(g_store.deletes == 1 && g_store.shadow_removes == 1 && g_store.def_cache_invalidates == 1 && g_store.fallback_clears == 1,
           "hard remove wipes stored row, shadow, def cache and fallback data");
     CHECK(g_store.dirty_marks == 0, "hard remove does not re-persist the row it deletes");
+    CHECK(g_store.leave_events == 1, "hard remove publishes DEVICE_LEAVE");
     // ── remove, hard: backend owns the leave ──
     arm(); g_have_backend = true;
     CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_store.backend_removes == 1 && g_store.leave_reqs == 0,

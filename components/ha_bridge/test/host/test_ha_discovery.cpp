@@ -29,10 +29,15 @@ static void collect(const char* component, const char* topic, const char* payloa
 
 static const ha::Context kCtx{"homeassistant", "zhac", "zhac"};
 
+static bool g_passive = false;
 static int build(const char* name, const char* vendor, const char* model, const char* exposes,
-                 uint64_t ieee = 0x00158D0007A1B2C3ULL) {
+                 uint64_t ieee = 0x00158D0007A1B2C3ULL, bool battery = false) {
     g_out.clear();
-    return ha::build_device({ieee, name, vendor, model, exposes}, kCtx, collect, nullptr);
+    return ha::build_device({ieee, name, vendor, model, exposes, battery}, kCtx, collect, nullptr, &g_passive);
+}
+static bool has(JsonArrayConst a, const char* v) {
+    for (JsonVariantConst x : a) if (x.is<const char*>() && std::string(x.as<const char*>()) == v) return true;
+    return false;
 }
 
 static const Entity* get(const char* uid) {
@@ -56,7 +61,12 @@ static void test_sensors_and_binary() {
     CHECK(occ && std::string(occ->cfg["state_topic"]) == "zhac/devices/00158D0007A1B2C3/occupancy");
     CHECK(occ && std::string(occ->cfg["device_class"]) == "occupancy");
     CHECK(occ && std::string(occ->cfg["payload_on"]) == "1");
-    CHECK(occ && std::string(occ->cfg["availability_topic"]) == "zhac/availability");
+    // has a battery expose: hub topic AND its own availability topic
+    CHECK(g_passive);
+    CHECK(occ && occ->cfg["availability_topic"].isNull());
+    CHECK(occ && std::string(occ->cfg["availability"][0]["topic"]) == "zhac/availability");
+    CHECK(occ && std::string(occ->cfg["availability"][1]["topic"]) == "zhac/devices/00158D0007A1B2C3/availability");
+    CHECK(occ && std::string(occ->cfg["availability_mode"]) == "all");
     CHECK(occ && std::string(occ->cfg["name"]) == "Occupancy");
     CHECK(occ && !occ->cfg["command_topic"].is<const char*>());
     CHECK(occ && std::string(occ->cfg["device"]["identifiers"][0]) == "zhac_00158d0007a1b2c3");
@@ -148,7 +158,13 @@ static void test_plug_select_number_and_skips() {
     CHECK(cal && cal->cfg["min"].as<int>() == -1000000);
 
     const Entity* act = get("zhac_00158d0007a1b2c3_action");
-    CHECK(act && act->component == "sensor");
+    CHECK(act && act->component == "event");
+    CHECK(act && act->cfg["event_types"].size() == 2 && has(act->cfg["event_types"], "double"));
+    CHECK(act && std::string(act->cfg["value_template"]) == "{\"event_type\":\"{{ value }}\"}");
+    // mains device: one hub availability topic, no per-device one
+    CHECK(sw && std::string(sw->cfg["availability_topic"]) == "zhac/availability");
+    CHECK(sw && sw->cfg["availability"].isNull());
+    CHECK(!g_passive);
     CHECK(!get("zhac_00158d0007a1b2c3_identify"));
 
     const Entity* cl = get("zhac_00158d0007a1b2c3_child_lock");
@@ -234,8 +250,134 @@ static void test_topics_and_payloads() {
     CHECK(ha::state_topic(topic, 10, "zhac", 1, "power") == -1);
 }
 
+static void test_climate() {
+    const char* exposes = R"([
+        {"name":"local_temperature","type":"numeric","access":1,"unit":"°C"},
+        {"name":"current_heating_setpoint","type":"numeric","access":3,"unit":"°C","value_min":5,"value_max":35,"value_step":1},
+        {"name":"system_mode","type":"enum","access":3,"values":["off","heat","auto","emergency_heating"]},
+        {"name":"preset","type":"enum","access":3,"values":["none","manual","schedule"]},
+        {"name":"running_state","type":"enum","access":1,"values":["idle","heat"]},
+        {"name":"fan_mode","type":"enum","access":3,"values":["low","high","auto"]},
+        {"name":"local_temperature_calibration","type":"numeric","access":3,"category":"config","value_min":-5,"value_max":5},
+        {"name":"child_lock","type":"binary","access":3,"category":"config"},
+        {"name":"battery","type":"numeric","access":1,"unit":"%","category":"diagnostic"}
+    ])";
+    // climate + calibration + child_lock + battery; the six climate parts are consumed
+    CHECK(build("bedroom_trv", "Tuya", "TS0601_thermostat", exposes) == 4);
+    const Entity* c = get("zhac_00158d0007a1b2c3_climate");
+    CHECK(c && c->component == "climate");
+    CHECK(c && c->cfg["name"].isNull());
+    CHECK(c && std::string(c->cfg["temperature_command_topic"]) == "zhac/devices/00158D0007A1B2C3/current_heating_setpoint/set");
+    CHECK(c && std::string(c->cfg["current_temperature_topic"]) == "zhac/devices/00158D0007A1B2C3/local_temperature");
+    CHECK(c && std::string(c->cfg["temperature_unit"]) == "C");
+    CHECK(c && c->cfg["min_temp"].as<int>() == 5 && c->cfg["max_temp"].as<int>() == 35 && c->cfg["temp_step"].as<int>() == 1);
+    CHECK(c && c->cfg["modes"].size() == 3 && has(c->cfg["modes"], "off") && has(c->cfg["modes"], "heat") && has(c->cfg["modes"], "auto"));
+    CHECK(c && !has(c->cfg["modes"], "emergency_heating"));   // not a Home Assistant hvac mode
+    CHECK(c && std::string(c->cfg["mode_command_topic"]) == "zhac/devices/00158D0007A1B2C3/system_mode/set");
+    CHECK(c && c->cfg["preset_modes"].size() == 2 && !has(c->cfg["preset_modes"], "none"));
+    CHECK(c && std::string(c->cfg["preset_mode_state_topic"]) == "zhac/devices/00158D0007A1B2C3/preset");
+    CHECK(c && std::string(c->cfg["action_topic"]) == "zhac/devices/00158D0007A1B2C3/running_state");
+    CHECK(c && std::string(c->cfg["action_template"]).find("'heat':'heating'") != std::string::npos);
+    CHECK(c && c->cfg["fan_modes"].size() == 3 && std::string(c->cfg["fan_mode_command_topic"]) == "zhac/devices/00158D0007A1B2C3/fan_mode/set");
+    // battery device: hub topic AND its own availability topic, both required
+    CHECK(g_passive);
+    CHECK(c && c->cfg["availability"].size() == 2 && std::string(c->cfg["availability_mode"]) == "all");
+    CHECK(c && std::string(c->cfg["availability"][1]["topic"]) == "zhac/devices/00158D0007A1B2C3/availability");
+    CHECK(c && c->cfg["availability_topic"].isNull());
+    CHECK(!get("zhac_00158d0007a1b2c3_system_mode") && !get("zhac_00158d0007a1b2c3_fan_mode"));
+    CHECK(get("zhac_00158d0007a1b2c3_local_temperature_calibration") && get("zhac_00158d0007a1b2c3_child_lock"));
+
+    // no mode switch, binary running_state, setpoint in Fahrenheit
+    const char* heater = R"([
+        {"name":"local_temperature","type":"numeric","access":1},
+        {"name":"occupied_heating_setpoint","type":"numeric","access":3,"unit":"°F"},
+        {"name":"running_state","type":"binary","access":1}
+    ])";
+    CHECK(build("heater", "", "", heater) == 1);
+    c = get("zhac_00158d0007a1b2c3_climate");
+    CHECK(c && c->cfg["modes"].size() == 1 && has(c->cfg["modes"], "heat") && c->cfg["mode_command_topic"].isNull());
+    CHECK(c && std::string(c->cfg["temperature_unit"]) == "F");
+    CHECK(c && std::string(c->cfg["action_template"]).find("'1':'heating'") != std::string::npos);
+    CHECK(!g_passive);
+}
+
+static void test_cover_lock_fan() {
+    const char* cover = R"([
+        {"name":"state","type":"enum","access":3,"values":["OPEN","CLOSE","STOP"]},
+        {"name":"position","type":"numeric","access":3,"unit":"%","value_min":0,"value_max":100},
+        {"name":"tilt","type":"numeric","access":3,"value_min":0,"value_max":100},
+        {"name":"moving","type":"enum","access":1,"values":["UP","DOWN","STOP"]}
+    ])";
+    CHECK(build("blind", "", "", cover) == 2);   // cover + moving sensor
+    const Entity* cv = get("zhac_00158d0007a1b2c3_cover");
+    CHECK(cv && cv->component == "cover");
+    CHECK(cv && std::string(cv->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/state/set");
+    CHECK(cv && std::string(cv->cfg["payload_stop"]) == "STOP" && std::string(cv->cfg["state_closed"]) == "CLOSE");
+    CHECK(cv && std::string(cv->cfg["set_position_topic"]) == "zhac/devices/00158D0007A1B2C3/position/set");
+    CHECK(cv && cv->cfg["position_open"].as<int>() == 100 && cv->cfg["position_closed"].as<int>() == 0);
+    CHECK(cv && std::string(cv->cfg["tilt_command_topic"]) == "zhac/devices/00158D0007A1B2C3/tilt/set");
+    CHECK(get("zhac_00158d0007a1b2c3_moving") && get("zhac_00158d0007a1b2c3_moving")->component == "sensor");
+    // position only, and a state enum without STOP
+    CHECK(build("blind", "", "", R"([{"name":"position","type":"numeric","access":3,"unit":"%"}])") == 1);
+    cv = get("zhac_00158d0007a1b2c3_cover");
+    CHECK(cv && cv->cfg["command_topic"].isNull() && cv->cfg["position_topic"].is<const char*>());
+    CHECK(build("blind", "", "", R"([{"name":"state","type":"enum","access":3,"values":["OPEN","CLOSE"]}])") == 1);
+    cv = get("zhac_00158d0007a1b2c3_cover");
+    CHECK(cv && cv->cfg["payload_stop"].isNull() && std::string(cv->cfg["payload_open"]) == "OPEN");
+    // a select named state that is not a cover stays a select
+    CHECK(build("x", "", "", R"([{"name":"state","type":"enum","access":3,"values":["a","b"]}])") == 1);
+    CHECK(get("zhac_00158d0007a1b2c3_state") && get("zhac_00158d0007a1b2c3_state")->component == "select");
+
+    const char* lock = R"([
+        {"name":"lock_state","type":"binary","access":3},
+        {"name":"battery","type":"numeric","access":1,"unit":"%"}
+    ])";
+    CHECK(build("front_door", "Yale", "YRD426", lock, 0x00158D0007A1B2C3ULL, true) == 2);
+    const Entity* lk = get("zhac_00158d0007a1b2c3_lock");
+    CHECK(lk && lk->component == "lock");
+    CHECK(lk && std::string(lk->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/lock_state/set");
+    CHECK(lk && std::string(lk->cfg["payload_lock"]) == "1" && std::string(lk->cfg["state_unlocked"]) == "0");
+    CHECK(g_passive && lk->cfg["availability"].size() == 2);
+    // an enum lock_state without a value list is left as a sensor
+    CHECK(build("x", "", "", R"([{"name":"lock_state","type":"enum","access":3}])") == 1);
+    CHECK(get("zhac_00158d0007a1b2c3_lock_state") && get("zhac_00158d0007a1b2c3_lock_state")->component == "sensor");
+
+    // fan with its own on/off and a speed list
+    const char* fan1 = R"([
+        {"name":"fan_state","type":"binary","access":3},
+        {"name":"fan_mode","type":"enum","access":3,"values":["low","medium","high","auto"]}
+    ])";
+    CHECK(build("ceiling_fan", "", "", fan1) == 1);
+    const Entity* f = get("zhac_00158d0007a1b2c3_fan");
+    CHECK(f && f->component == "fan");
+    CHECK(f && std::string(f->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/fan_state/set" && std::string(f->cfg["payload_on"]) == "1");
+    CHECK(f && f->cfg["preset_modes"].size() == 4 && std::string(f->cfg["preset_mode_command_topic"]) == "zhac/devices/00158D0007A1B2C3/fan_mode/set");
+    CHECK(f && f->cfg["state_value_template"].isNull());
+    // the mode word carries the power: "off" and "on"
+    const char* fan2 = R"([{"name":"fan_mode","type":"enum","access":3,"values":["off","low","medium","high","on"]}])";
+    CHECK(build("fan", "", "", fan2) == 1);
+    f = get("zhac_00158d0007a1b2c3_fan");
+    CHECK(f && std::string(f->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/fan_mode/set");
+    CHECK(f && std::string(f->cfg["payload_on"]) == "on" && std::string(f->cfg["payload_off"]) == "off");
+    CHECK(f && std::string(f->cfg["state_value_template"]) == "{{ 'off' if value == 'off' else 'on' }}");
+    CHECK(f && f->cfg["preset_modes"].size() == 3 && !has(f->cfg["preset_modes"], "on"));
+    // no "off" word and no on/off expose: not a fan, stays a select
+    CHECK(build("x", "", "", R"([{"name":"fan_mode","type":"enum","access":3,"values":["low","high"]}])") == 1);
+    CHECK(get("zhac_00158d0007a1b2c3_fan_mode") && get("zhac_00158d0007a1b2c3_fan_mode")->component == "select");
+    // a binary fan_mode is the switch
+    CHECK(build("x", "", "", R"([{"name":"fan_mode","type":"binary","access":3}])") == 1);
+    f = get("zhac_00158d0007a1b2c3_fan");
+    CHECK(f && std::string(f->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/fan_mode/set");
+
+    char t[96];
+    CHECK(ha::device_availability_topic(t, sizeof(t), "zhac", 0xA4C138F3E2D10B77ULL) > 0 &&
+          std::string(t) == "zhac/devices/A4C138F3E2D10B77/availability");
+}
+
 int main() {
     test_sensors_and_binary();
+    test_climate();
+    test_cover_lock_fan();
     test_light();
     test_plug_select_number_and_skips();
     test_bad_input_and_bridge();

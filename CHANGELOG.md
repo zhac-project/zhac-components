@@ -9,6 +9,21 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **Home Assistant: climate, cover, lock, fan and event entities; battery devices go
+  unavailable.** `ha_discovery` composes a **climate** entity from `local_temperature` + a
+  writable heating setpoint (modes filtered to Home Assistant's hvac words, presets, a
+  heating/idle action from `running_state`, fan speeds), a **cover** from `position` and/or an
+  `OPEN`/`CLOSE`/`STOP` state (+ tilt), a **lock** from a writable on/off `lock_state`, a **fan**
+  from `fan_state` or a `fan_mode` list with `off` (other speeds as presets), and an **event**
+  from `action` (fires on every press; `ha_bridge` publishes that key without retain so a
+  restart does not replay the last press). Battery devices (ZCL power source, or a `battery`
+  expose) get a second availability topic `<root>/devices/<IEEE>/availability` with
+  `availability_mode: all`; `ha_bridge` flips it to `offline` after 25 hours of silence and
+  back on the next report. `HaDeviceSnapshot` gained `battery_powered`. Host suite: 167 checks.
+
+- **`device.get` carries the power source** (`ps`, as `device.list` already did), so the
+  dual-chip S3's Home Assistant glue can tell battery devices apart.
+
 - **`device_cmd`: the one attribute-set path.** `device_cmd_set_attr(ieee, ep, key, value)`
   does what every transport used to do on its own and slightly differently: copy the device's
   identity under the pool lock and release it before the radio, send bool / integer / decimal /
@@ -28,7 +43,8 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
   core and keeps the one deadline that `zigbee.permit_join.status` reads, so REST and WebSocket
   agree. `device_cmd_remove` is one contract: soft = ask the device to leave and tombstone it
   (hidden from lists, name kept for a rejoin, persisted); hard = leave, then wipe the pool slot,
-  shadow, converter caches and the stored row, every step idempotent. Before, the wired and mono
+  shadow, converter caches and the stored row, every step idempotent, and both publish `DEVICE_LEAVE` so the web UI drops the row,
+  Home Assistant retracts the entities and the rules re-resolve. Before, the wired and mono
   soft delete only dropped the pool entry (the device stayed joined and came back on the next
   report or reboot) and neither told it to leave. The ops live in `device_cmd_ops.cpp` so the
   rule engine's host suite links only the attribute path. Host contract suite: 64 checks.

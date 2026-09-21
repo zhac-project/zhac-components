@@ -25,8 +25,13 @@ struct HaDeviceSnapshot {
     const char* model;
     const char* exposes;   // JSON array, as zhac_adapter_build_exposes_json emits
     const char* attrs;     // JSON object of current values ({"temperature":21.4}), or null
+    bool        battery_powered;   // ZCL power source "battery"; such devices get their own
+                                   // availability topic and go "offline" after a day of silence
 };
 using HaDeviceCb = void (*)(const HaDeviceSnapshot& dev, void* ctx);
+
+// ZCL Basic PowerSource: 0x03 = battery; bit 7 flags a battery backup.
+static inline bool ha_battery_powered(uint8_t zcl_power_source) { return (zcl_power_source & 0x7F) == 0x03; }
 
 struct HaBridgePlatform {
     const char* hub_model;   // shown on the hub's HA device, e.g. "ESP32-P4 wired"

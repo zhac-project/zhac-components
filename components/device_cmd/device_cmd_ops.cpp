@@ -12,6 +12,7 @@
 #include "device_backend.h"
 #include "device_shadow.h"
 #include "esp_log.h"
+#include "event_bus.h"
 #include "esp_timer.h"
 #include "zap_common.h"
 #include "zap_store.h"
@@ -101,13 +102,21 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     }
     if (!hard) {
         zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
-        return DEVCMD_OK;
+    } else {
+        zap_store_delete_device(ieee);
+        device_shadow_remove(ieee);
+        zhac_adapter_invalidate_def_cache(ieee);
+        zhac_adapter_fallback_clear(ieee);
+        zigbee_pool_remove(ieee);
+        ESP_LOGI(TAG, "removed 0x%016llX (hard)", static_cast<unsigned long long>(ieee));
     }
-    zap_store_delete_device(ieee);
-    device_shadow_remove(ieee);
-    zhac_adapter_invalidate_def_cache(ieee);
-    zhac_adapter_fallback_clear(ieee);
-    zigbee_pool_remove(ieee);
-    ESP_LOGI(TAG, "removed 0x%016llX (hard)", static_cast<unsigned long long>(ieee));
+    // Gone from this hub, soft or hard: the web UI drops the row, Home
+    // Assistant retracts the entities, the rules re-resolve. A backend that
+    // owns removal may have published this already; every listener is
+    // idempotent.
+    Event ev{};
+    ev.type = EventType::DEVICE_LEAVE;
+    std::memcpy(ev.data, &ieee, sizeof(ieee));
+    event_bus_publish(ev);
     return DEVCMD_OK;
 }

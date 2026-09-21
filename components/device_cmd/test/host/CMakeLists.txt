@@ -28,6 +28,7 @@ target_include_directories(device_cmd_host_test PRIVATE
     ${COMPONENTS_DIR}/zhc_adapter/include
     ${COMPONENTS_DIR}/zap_store/include
     ${COMPONENTS_DIR}/device_backend/include
+    ${COMPONENTS_DIR}/event_bus/include
     ${COMPONENTS_DIR}/arduinojson/src
 )
 target_compile_options(device_cmd_host_test PRIVATE -Wall -Wextra -Werror)

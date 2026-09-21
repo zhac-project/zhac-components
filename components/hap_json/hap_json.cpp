@@ -357,6 +357,7 @@ bool hap_json_encode_device_info(uint8_t* buf, size_t cap, uint16_t* out_len,
                      ? (const char*)model_buf
                      : (const char*)dev->model_id;
     doc["lqi"]          = dev->link_quality;
+    doc["ps"]           = dev->power_source;   // the S3's HA glue reads it (battery = own availability)
     doc["bat_pct"]      = dev->battery_pct;
     doc["ep_count"]     = dev->endpoint_count;
     JsonArray eps = doc["eps"].to<JsonArray>();

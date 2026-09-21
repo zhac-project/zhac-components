@@ -18,7 +18,7 @@ namespace {
 
 constexpr unsigned kAccessState = 0b001;   // publishes (z2m access bits, as
 constexpr unsigned kAccessSet   = 0b010;   // zhc_adapter emits them)
-constexpr size_t   kPayloadCap  = 1152;
+constexpr size_t   kPayloadCap  = 1536;   // a climate config is the longest
 constexpr const char* kSupportUrl = "https://github.com/zhac-project/zhac-platform";
 
 // Read-only numeric -> sensor device_class, only for the units Home Assistant
@@ -69,6 +69,10 @@ constexpr BinaryClass kBinaryClasses[] = {
     {"vibration",       "vibration",       false},
 };
 
+// Home Assistant's own hvac mode words; anything else in a device's
+// system_mode list cannot be a climate mode.
+constexpr const char* kHvacModes[] = {"auto", "off", "cool", "heat", "dry", "fan_only"};
+
 bool unit_in(const char* units, const char* unit) {
     if (!unit || !unit[0]) return false;
     const size_t n = strlen(unit);
@@ -103,6 +107,11 @@ struct Expose {
     bool is(const char* t) const { return type && strcmp(type, t) == 0; }
     bool settable() const { return (access & kAccessSet) != 0; }
     bool publishes() const { return (access & kAccessState) != 0; }
+    bool has_value(const char* v) const {
+        for (JsonVariantConst x : values) if (x.is<const char*>() && strcmp(x.as<const char*>(), v) == 0) return true;
+        return false;
+    }
+    bool has_values() const { return !values.isNull() && values.size() > 0; }
 };
 
 Expose read_expose(JsonObjectConst o) {
@@ -124,6 +133,7 @@ struct Writer {
     const Context& c;
     EmitFn         emit;
     void*          user;
+    bool           passive;   // gets the per-device availability topic
     int            count = 0;
 
     void topic_of(char* out, size_t cap, const char* key, bool set) const {
@@ -140,7 +150,18 @@ struct Writer {
         if (name) doc["name"] = name;
         else      doc["name"] = nullptr;
         snprintf(buf, sizeof(buf), "%s/availability", c.root);
-        doc["availability_topic"] = buf;
+        if (passive) {
+            // Hub online AND the device heard from lately; ha_bridge flips the
+            // device topic to "offline" after a day of silence.
+            JsonArray av = doc["availability"].to<JsonArray>();
+            av.add<JsonObject>()["topic"] = buf;
+            char dt[96];
+            if (device_availability_topic(dt, sizeof(dt), c.root, d.ieee) > 0)
+                av.add<JsonObject>()["topic"] = dt;
+            doc["availability_mode"] = "all";
+        } else {
+            doc["availability_topic"] = buf;
+        }
         JsonObject dev = doc["device"].to<JsonObject>();
         snprintf(buf, sizeof(buf), "zhac_%016" PRIx64, d.ieee);
         dev["identifiers"].to<JsonArray>().add(buf);
@@ -190,6 +211,133 @@ struct Writer {
             if (ct->has_max) doc["max_mireds"] = ct->max;
         }
         finish(doc, "light", "light");
+    }
+
+    // Enum option list -> a JSON array, skipping `drop` (HA reserves "none").
+    static void options(JsonArray out, const Expose& e, const char* drop = nullptr) {
+        for (JsonVariantConst v : e.values) {
+            const char* o = v.as<const char*>();
+            if (o && !(drop && strcmp(o, drop) == 0)) out.add(o);
+        }
+    }
+
+    void topics(JsonDocument& doc, const Expose& e, const char* state_key, const char* cmd_key) {
+        char t[160];
+        if (state_key && e.publishes()) { topic_of(t, sizeof(t), e.name, false); doc[state_key] = t; }
+        if (cmd_key && e.settable())    { topic_of(t, sizeof(t), e.name, true);  doc[cmd_key] = t; }
+    }
+
+    // Thermostats and TRVs ship flat exposes; Home Assistant wants one entity.
+    void climate(const Expose& temp, const Expose& setpoint, const Expose* mode,
+                 const Expose* preset, const Expose* running, const Expose* fan) {
+        JsonDocument doc;
+        base(doc, "climate", nullptr);
+        topics(doc, setpoint, "temperature_state_topic", "temperature_command_topic");
+        topics(doc, temp, "current_temperature_topic", nullptr);
+        doc["temperature_unit"] = (setpoint.unit && strchr(setpoint.unit, 'F')) ? "F" : "C";
+        if (setpoint.has_min) doc["min_temp"] = setpoint.min;
+        if (setpoint.has_max) doc["max_temp"] = setpoint.max;
+        if (setpoint.has_step && setpoint.step > 0) doc["temp_step"] = setpoint.step;
+        JsonArray modes = doc["modes"].to<JsonArray>();
+        if (mode && mode->settable() && mode->has_values()) {
+            for (const char* m : kHvacModes) if (mode->has_value(m)) modes.add(m);
+        }
+        if (modes.size() > 0) {
+            topics(doc, *mode, "mode_state_topic", "mode_command_topic");
+        } else {
+            modes.clear();
+            modes.add("heat");   // a heater with no mode switch: always heating
+        }
+        if (preset && preset->settable() && preset->has_values()) {
+            options(doc["preset_modes"].to<JsonArray>(), *preset, "none");
+            topics(doc, *preset, "preset_mode_state_topic", "preset_mode_command_topic");
+        }
+        if (running && running->publishes()) {
+            topics(doc, *running, "action_topic", nullptr);
+            // Device words (or 1/0 for a binary running_state) -> HA's action words.
+            doc["action_template"] =
+                "{% set m = {'heat':'heating','cool':'cooling','fan':'fan','dry':'drying',"
+                "'1':'heating','0':'idle'} %}{{ m.get(value, value) }}";
+        }
+        if (fan && fan->settable() && fan->has_values()) {
+            options(doc["fan_modes"].to<JsonArray>(), *fan);
+            topics(doc, *fan, "fan_mode_state_topic", "fan_mode_command_topic");
+        }
+        finish(doc, "climate", "climate");
+    }
+
+    void cover(const Expose* position, const Expose* state, const Expose* tilt) {
+        JsonDocument doc;
+        base(doc, "cover", nullptr);
+        if (state) {
+            topics(doc, *state, "state_topic", "command_topic");
+            doc["payload_open"]  = "OPEN";
+            doc["payload_close"] = "CLOSE";
+            if (state->has_value("STOP")) doc["payload_stop"] = "STOP";
+            else                          doc["payload_stop"] = nullptr;
+            doc["state_open"]    = "OPEN";
+            doc["state_closed"]  = "CLOSE";
+            doc["state_stopped"] = "STOP";
+        }
+        if (position) {
+            topics(doc, *position, "position_topic", "set_position_topic");
+            doc["position_open"]   = position->has_max ? position->max : 100;
+            doc["position_closed"] = position->has_min ? position->min : 0;
+        }
+        if (tilt) {
+            topics(doc, *tilt, "tilt_status_topic", "tilt_command_topic");
+            doc["tilt_min"] = tilt->has_min ? tilt->min : 0;
+            doc["tilt_max"] = tilt->has_max ? tilt->max : 100;
+        }
+        finish(doc, "cover", "cover");
+    }
+
+    void lock(const Expose& e) {
+        JsonDocument doc;
+        base(doc, "lock", nullptr);
+        topics(doc, e, "state_topic", "command_topic");
+        doc["payload_lock"]   = "1";
+        doc["payload_unlock"] = "0";
+        doc["state_locked"]   = "1";
+        doc["state_unlocked"] = "0";
+        finish(doc, "lock", "lock");
+    }
+
+    // `power`: the on/off expose (fan_state, or a binary fan_mode); null when
+    // the enum fan_mode carries "off" itself. `modes`: the enum, for presets.
+    void fan(const Expose* power, const Expose* modes) {
+        JsonDocument doc;
+        base(doc, "fan", nullptr);
+        if (power) {
+            topics(doc, *power, "state_topic", "command_topic");
+            doc["payload_on"]  = "1";
+            doc["payload_off"] = "0";
+        } else {
+            // The mode word doubles as the power switch: "off", or the first
+            // real speed for on. HA compares the state template's output with
+            // payload_on/payload_off, so the template must yield those words.
+            const char* on = modes->has_value("on") ? "on" : modes->has_value("auto") ? "auto" : nullptr;
+            if (!on) for (JsonVariantConst v : modes->values) {
+                const char* o = v.as<const char*>();
+                if (o && strcmp(o, "off") != 0) { on = o; break; }
+            }
+            topics(doc, *modes, "state_topic", "command_topic");
+            doc["payload_on"]  = on;
+            doc["payload_off"] = "off";
+            char tpl[96];
+            snprintf(tpl, sizeof(tpl), "{{ 'off' if value == 'off' else '%s' }}", on);
+            doc["state_value_template"] = tpl;
+        }
+        if (modes) {
+            JsonArray presets = doc["preset_modes"].to<JsonArray>();
+            for (JsonVariantConst v : modes->values) {
+                const char* o = v.as<const char*>();
+                if (o && strcmp(o, "off") != 0 && strcmp(o, "on") != 0) presets.add(o);
+            }
+            if (presets.size() == 0) doc.remove("preset_modes");
+            else topics(doc, *modes, "preset_mode_state_topic", "preset_mode_command_topic");
+        }
+        finish(doc, "fan", "fan");
     }
 
     void one(const Expose& e) {
@@ -250,10 +398,17 @@ struct Writer {
             return finish(doc, "sensor", e.name);
         }
         if (e.is("enum")) {
-            if (set && !e.values.isNull() && e.values.size() > 0) {
-                JsonArray opts = doc["options"].to<JsonArray>();
-                for (JsonVariantConst v : e.values) opts.add(v.as<const char*>());
+            if (set && e.has_values()) {
+                options(doc["options"].to<JsonArray>(), e);
                 return finish(doc, "select", e.name);
+            }
+            // Button and remote presses: an event fires on every press, where
+            // a sensor would miss two "single" in a row. ha_bridge publishes
+            // this key without retain so HA does not replay the last press.
+            if (strcmp(e.name, "action") == 0 && e.has_values()) {
+                options(doc["event_types"].to<JsonArray>(), e);
+                doc["value_template"] = "{\"event_type\":\"{{ value }}\"}";
+                return finish(doc, "event", e.name);
             }
             return finish(doc, "sensor", e.name);
         }
@@ -263,7 +418,8 @@ struct Writer {
 
 }  // namespace
 
-int build_device(const Device& d, const Context& c, EmitFn emit, void* user) {
+int build_device(const Device& d, const Context& c, EmitFn emit, void* user, bool* passive_out) {
+    if (passive_out) *passive_out = false;
     JsonDocument in;
     if (!d.exposes || deserializeJson(in, d.exposes) || !in.is<JsonArrayConst>()) return -1;
     JsonArrayConst arr = in.as<JsonArrayConst>();
@@ -284,17 +440,66 @@ int build_device(const Device& d, const Context& c, EmitFn emit, void* user) {
         return nullptr;
     };
 
-    Writer w{d, c, emit, user};
+    auto find_settable = [&](const char* name, const char* type) -> Expose* {
+        Expose* e = find(name, type);
+        return (e && e->settable()) ? e : nullptr;
+    };
+    auto use = [](Expose* e) { if (e) e->used = true; };
+
+    const bool passive = d.battery_powered || find("battery", "numeric") || find("battery_low", "binary");
+    if (passive_out) *passive_out = passive;
+    Writer w{d, c, emit, user, passive};
+
+    // Thermostat: a measured temperature and a writable heating setpoint.
+    Expose* lt = find("local_temperature", "numeric");
+    Expose* sp = find_settable("current_heating_setpoint", "numeric");
+    if (!sp) sp = find_settable("occupied_heating_setpoint", "numeric");
+    Expose* fan_mode = find("fan_mode", "enum");
+    if (lt && sp) {
+        Expose* mode    = find("system_mode", "enum");
+        Expose* preset  = find("preset", "enum");
+        Expose* running = find("running_state", "enum");
+        if (!running) running = find("running_state", "binary");
+        Expose* fan = (fan_mode && fan_mode->settable()) ? fan_mode : nullptr;
+        w.climate(*lt, *sp, mode, preset, running, fan);
+        use(lt); use(sp); use(mode); use(preset); use(running); use(fan);
+    }
+
     // state + brightness (+ color_temp), all writable, is a dimmable light.
     Expose* st = find("state", "binary");
     Expose* br = find("brightness", "numeric");
     if (st && br && st->settable() && br->settable()) {
-        Expose* ct = find("color_temp", "numeric");
-        if (ct && !ct->settable()) ct = nullptr;
+        Expose* ct = find_settable("color_temp", "numeric");
         w.light(*st, *br, ct);
-        st->used = br->used = true;
-        if (ct) ct->used = true;
+        use(st); use(br); use(ct);
     }
+
+    // Cover: a writable position, and/or a state enum spoken in OPEN / CLOSE.
+    Expose* pos = find_settable("position", "numeric");
+    Expose* cs  = find("state", "enum");
+    if (cs && !(cs->has_value("OPEN") && cs->has_value("CLOSE"))) cs = nullptr;
+    if (pos || cs) {
+        Expose* tilt = find_settable("tilt", "numeric");
+        w.cover(pos, cs, tilt);
+        use(pos); use(cs); use(tilt);
+    }
+
+    if (Expose* lk = find_settable("lock_state", "binary")) {
+        w.lock(*lk);
+        use(lk);
+    }
+
+    // Fan, unless the fan speed already belongs to a thermostat above.
+    if (!(fan_mode && fan_mode->used)) {
+        Expose* power = find_settable("fan_state", "binary");
+        if (!power) power = find_settable("fan_mode", "binary");
+        Expose* modes = (fan_mode && fan_mode->settable() && fan_mode->has_values()) ? fan_mode : nullptr;
+        if (power || (modes && modes->has_value("off"))) {
+            w.fan(power, modes);
+            use(power); use(modes);
+        }
+    }
+
     for (size_t i = 0; i < n; i++) {
         // Write-only exposes (identify, effect triggers) have no state to show;
         // they stay on the web UI's Commands tab.
@@ -339,6 +544,11 @@ void build_bridge(const Context& c, const char* fw_version, const char* model,
 
 int state_topic(char* out, size_t cap, const char* root, uint64_t ieee, const char* key) {
     const int n = snprintf(out, cap, "%s/devices/%016" PRIX64 "/%s", root, ieee, key);
+    return (n < 0 || static_cast<size_t>(n) >= cap) ? -1 : n;
+}
+
+int device_availability_topic(char* out, size_t cap, const char* root, uint64_t ieee) {
+    const int n = snprintf(out, cap, "%s/devices/%016" PRIX64 "/availability", root, ieee);
     return (n < 0 || static_cast<size_t>(n) >= cap) ? -1 : n;
 }
 

@@ -8,5 +8,5 @@ idf_component_register(
     SRCS "ha_discovery.cpp" "ha_bridge.cpp"
     INCLUDE_DIRS "include"
     REQUIRES mqtt_gw
-    PRIV_REQUIRES arduinojson nvs_flash esp_app_format freertos
+    PRIV_REQUIRES arduinojson nvs_flash esp_app_format esp_timer freertos
 )
