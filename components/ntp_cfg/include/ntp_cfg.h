@@ -14,8 +14,10 @@
 
 // Start SNTP with the configured server. Call once the interface has an
 // address; safe to call again (it restarts the client with the same server).
-// Before the network starts (before the first DHCP lease): lets lwIP ask the
-// router for a time server (DHCP option 42) unless the owner named one.
+// Right after the network stack exists (esp_netif_init has run, so after
+// eth_start / wifi_start) and before the first DHCP lease lands: lets lwIP
+// hand the router's time server (DHCP option 42) to SNTP unless the owner
+// named one. It runs in the TCP/IP thread; called earlier it asserts.
 void ntp_cfg_init(void);
 // On every address (each DHCP lease): (re)starts the client with the
 // configured server -- next to the router's offer, which lwIP put at slot 0.

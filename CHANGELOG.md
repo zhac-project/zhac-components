@@ -9,6 +9,16 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **`mqtt_gw_cfg`: the local MQTT client's settings in one place.** NVS-backed
+  (`mqtt_cfg`: enabled, broker URL, root topic, client id): `mqtt_gw_cfg_boot()` loads and arms
+  at boot, `mqtt_gw_cfg_apply()` persists and applies a Settings write, `mqtt_gw_cfg_fill_status()`
+  reports (credentials stripped, strings checked to be printable ASCII). Moved out of the wired
+  build's glue so the single-chip build shares it.
+
+- **`ntp_cfg_init()` is documented as a call for after the network stack exists** (after
+  `eth_start` / `wifi_start`): it runs in the TCP/IP thread and asserts before `esp_netif_init`,
+  which boot-looped the wired hub on its first live boot.
+
 - **Home Assistant: colour lights and worded locks.** A light with `color_x` / `color_y`
   (or a `color_xy` expose) gets `xy_state_topic` / `xy_command_topic` on the `color_xy` pair,
   one with `hue` / `saturation` (or `color_hs`) the `hs_*` topics on `color_hs`; the single

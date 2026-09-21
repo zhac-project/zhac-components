@@ -10,11 +10,11 @@ idf_build_get_property(target IDF_TARGET)
 idf_build_get_property(local_client ZHAC_MQTT_GW_LOCAL_CLIENT)
 
 if(target STREQUAL "esp32s3" OR local_client)
-    set(MQTT_GW_SRCS "mqtt_gw_s3.cpp")
+    set(MQTT_GW_SRCS "mqtt_gw_s3.cpp" "mqtt_gw_cfg.cpp")
     # `metrics` carries METRIC_MQTT_DROPPED_MSGS (F-07).
     # `zap_store` carries the uplink selector (zhac_uplink_get, RainMaker
     # bridge Phase 2) that gates whether this gateway is allowed to start.
-    set(MQTT_GW_REQS mqtt freertos zap_common metrics zap_store)
+    set(MQTT_GW_REQS mqtt freertos zap_common metrics zap_store nvs_flash arduinojson)
 else()
     set(MQTT_GW_SRCS "mqtt_gw_p4.cpp")
     set(MQTT_GW_REQS hap_slave hap_session hap_json hap_protocol freertos)
