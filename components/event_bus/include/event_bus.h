@@ -169,3 +169,12 @@ uint8_t event_bus_drain_handle(EventSubHandle handle, uint32_t timeout_ms);
 // deprecation: [[deprecated]] would -Werror existing in-tree callers.
 // Returns number of events processed across all subscriptions.
 uint8_t event_bus_drain(EventType type, uint32_t timeout_ms);
+
+// The pump: one task that drains every subscriber queue. It sleeps until a
+// publish wakes it (task notification), with a one-second sweep as a safety
+// net and so a watchdog can be fed, instead of polling every type every
+// 20 ms -- that poll walked ~40 subscriber queues fifty times a second and
+// cost the wired hub a fifth of core 0 while idle. Never returns. `tick`,
+// when given, runs once per wake (the P4 feeds its task watchdog there).
+// Publish is task-context only (no ISR publishers exist).
+void event_bus_pump_run(void (*tick)(void));

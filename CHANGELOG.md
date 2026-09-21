@@ -9,6 +9,12 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **`event_bus_pump_run()`: the pump sleeps until a publish.** The three firmware pumps
+  polled every event type every 20 ms, walking ~40 subscriber queues fifty times a second; on
+  the wired hub that was 22 % of core 0 while idle (`diag.tasks` named it). Publish now wakes
+  the pump task by notification and it drains until quiet, with a one-second sweep as a safety
+  net and to keep the P4's task watchdog fed.
+
 - **`sys_tasks.h`: per-task CPU share, core, priority and stack headroom** (zap_common,
   header-only). Measured between two calls, wrap-safe on the 32-bit run-time counters; behind
   the new `diag.tasks` WebSocket command on the wired and single-chip builds.

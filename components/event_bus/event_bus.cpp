@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 
 static const char* TAG = "event_bus";
@@ -240,6 +241,8 @@ void event_bus_unsubscribe(EventSubHandle handle) {
     ESP_LOGI(TAG, "unsubscribed type=%d pos=%d", idx, pos);
 }
 
+static TaskHandle_t s_pump = nullptr;   // the task inside event_bus_pump_run, once it runs
+
 void event_bus_publish(const Event& e) {
     uint8_t idx = static_cast<uint8_t>(e.type);
     if (idx == 0 || idx >= EVENT_TYPE_COUNT) return;
@@ -300,6 +303,7 @@ void event_bus_publish(const Event& e) {
         s_subs[idx][targets[k].pos].inflight--;
     reap_locked();   // we may have been the last user of a dying queue
     bus_unlock();
+    if (n && s_pump) xTaskNotifyGive(s_pump);   // wake the pump; it drains everything
 }
 
 // Drain core for one subscription slot. `gen` comes from the caller's
@@ -389,4 +393,19 @@ uint8_t event_bus_drain(EventType type, uint32_t timeout_ms) {
     for (uint8_t k = 0; k < n; k++)
         count += drain_slot(idx, poss[k], gens[k], (k == 0) ? timeout_ms : 0);
     return count;
+}
+
+void event_bus_pump_run(void (*tick)(void)) {
+    s_pump = xTaskGetCurrentTaskHandle();
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));   // a publish, or the 1 s sweep
+        if (tick) tick();
+        uint8_t processed;
+        do {
+            processed = 0;
+            for (uint8_t t = 1; t < EVENT_TYPE_COUNT; t++) {
+                processed += event_bus_drain(static_cast<EventType>(t), 0);
+            }
+        } while (processed);   // a handler may publish; drain until quiet
+    }
 }
