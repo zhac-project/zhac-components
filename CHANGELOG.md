@@ -9,6 +9,13 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **Home Assistant: colour lights and worded locks.** A light with `color_x` / `color_y`
+  (or a `color_xy` expose) gets `xy_state_topic` / `xy_command_topic` on the `color_xy` pair,
+  one with `hue` / `saturation` (or `color_hs`) the `hs_*` topics on `color_hs`; the single
+  axes stop appearing as number entities. A lock that takes `LOCK` / `UNLOCK` on `state` and
+  reports a worded `lock_state` becomes a **lock** entity (payloads `LOCK` / `UNLOCK`, states
+  `locked` / `unlocked`). Host suite: 180 checks.
+
 - **Devices with only a Tuya datapoint map get exposes.** `zhac_adapter_build_exposes_json`
   used to answer `[]` for the 666 generated Tuya / Moes definitions that ship no expose table,
   so the web UI showed no controls and Home Assistant no entities. It now derives the table

@@ -113,6 +113,28 @@ static void test_light() {
     CHECK(l && std::string(l->cfg["color_temp_state_topic"]) == "zhac/devices/000B57FFFE8C4D21/color_temp");
     CHECK(l && l->cfg["min_mireds"].as<int>() == 250);
     CHECK(l && l->cfg["max_mireds"].as<int>() == 454);
+    CHECK(l && l->cfg["xy_command_topic"].isNull() && l->cfg["hs_command_topic"].isNull());
+
+    // colour: xy from color_x/color_y, hs from hue/saturation; the axes are consumed
+    const char* rgb = R"([
+        {"name":"state","type":"binary","access":3},
+        {"name":"brightness","type":"numeric","access":3},
+        {"name":"color_x","type":"numeric","access":3},
+        {"name":"color_y","type":"numeric","access":3},
+        {"name":"hue","type":"numeric","access":3},
+        {"name":"saturation","type":"numeric","access":3},
+        {"name":"color_mode","type":"enum","access":1,"values":["hs","xy","color_temp"]}
+    ])";
+    CHECK(build("rgb_bulb", "", "", rgb) == 2);   // light + color_mode sensor
+    l = get("zhac_00158d0007a1b2c3_light");
+    CHECK(l && std::string(l->cfg["xy_state_topic"]) == "zhac/devices/00158D0007A1B2C3/color_xy");
+    CHECK(l && std::string(l->cfg["xy_command_topic"]) == "zhac/devices/00158D0007A1B2C3/color_xy/set");
+    CHECK(l && std::string(l->cfg["hs_command_topic"]) == "zhac/devices/00158D0007A1B2C3/color_hs/set");
+    CHECK(!get("zhac_00158d0007a1b2c3_color_x") && !get("zhac_00158d0007a1b2c3_hue"));
+    // a definition that names the pair itself, whatever type it gave it
+    CHECK(build("bulb", "", "", R"([{"name":"state","type":"binary","access":3},{"name":"brightness","type":"numeric","access":3},{"name":"color_xy","type":"numeric","access":3}])") == 1);
+    l = get("zhac_00158d0007a1b2c3_light");
+    CHECK(l && l->cfg["xy_command_topic"].is<const char*>() && l->cfg["hs_command_topic"].isNull());
 }
 
 static void test_plug_select_number_and_skips() {
@@ -338,8 +360,20 @@ static void test_cover_lock_fan() {
     CHECK(lk && std::string(lk->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/lock_state/set");
     CHECK(lk && std::string(lk->cfg["payload_lock"]) == "1" && std::string(lk->cfg["state_unlocked"]) == "0");
     CHECK(g_passive && lk->cfg["availability"].size() == 2);
-    // an enum lock_state without a value list is left as a sensor
-    CHECK(build("x", "", "", R"([{"name":"lock_state","type":"enum","access":3}])") == 1);
+    // the zigbee2mqtt shape: LOCK/UNLOCK commands on `state`, the word on `lock_state`
+    const char* worded = R"([
+        {"name":"state","type":"enum","access":2,"values":["LOCK","UNLOCK"]},
+        {"name":"lock_state","type":"enum","access":1,"values":["not_fully_locked","locked","unlocked"]},
+        {"name":"action","type":"enum","access":1,"values":["lock","unlock","auto_lock"]}
+    ])";
+    CHECK(build("front_door", "Kwikset", "99140-002", worded) == 2);   // lock + action event
+    lk = get("zhac_00158d0007a1b2c3_lock");
+    CHECK(lk && std::string(lk->cfg["command_topic"]) == "zhac/devices/00158D0007A1B2C3/state/set");
+    CHECK(lk && std::string(lk->cfg["state_topic"]) == "zhac/devices/00158D0007A1B2C3/lock_state");
+    CHECK(lk && std::string(lk->cfg["payload_lock"]) == "LOCK" && std::string(lk->cfg["state_unlocked"]) == "unlocked");
+    CHECK(!get("zhac_00158d0007a1b2c3_state") && !get("zhac_00158d0007a1b2c3_lock_state"));
+    // a worded lock_state with no command row stays a sensor
+    CHECK(build("x", "", "", R"([{"name":"lock_state","type":"enum","access":1,"values":["locked","unlocked"]}])") == 1);
     CHECK(get("zhac_00158d0007a1b2c3_lock_state") && get("zhac_00158d0007a1b2c3_lock_state")->component == "sensor");
 
     // fan with its own on/off and a speed list

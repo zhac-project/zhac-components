@@ -193,7 +193,10 @@ struct Writer {
             doc["entity_category"] = e.settable() ? "config" : "diagnostic";
     }
 
-    void light(const Expose& state, const Expose& bri, const Expose* ct) {
+    // `xy` / `hs`: the device speaks colour; the converter carries the pairs
+    // on the keys `color_xy` ("x,y", CIE 1931) and `color_hs` ("h,s", 0-360
+    // and 0-100), the same shape Home Assistant's light uses on the wire.
+    void light(const Expose& state, const Expose& bri, const Expose* ct, bool xy, bool hs) {
         JsonDocument doc;
         base(doc, "light", nullptr);
         char t[160];
@@ -209,6 +212,14 @@ struct Writer {
             topic_of(t, sizeof(t), ct->name, true);  doc["color_temp_command_topic"] = t;
             if (ct->has_min) doc["min_mireds"] = ct->min;
             if (ct->has_max) doc["max_mireds"] = ct->max;
+        }
+        if (xy) {
+            topic_of(t, sizeof(t), "color_xy", false); doc["xy_state_topic"] = t;
+            topic_of(t, sizeof(t), "color_xy", true);  doc["xy_command_topic"] = t;
+        }
+        if (hs) {
+            topic_of(t, sizeof(t), "color_hs", false); doc["hs_state_topic"] = t;
+            topic_of(t, sizeof(t), "color_hs", true);  doc["hs_command_topic"] = t;
         }
         finish(doc, "light", "light");
     }
@@ -292,6 +303,8 @@ struct Writer {
         finish(doc, "cover", "cover");
     }
 
+    // Binary `lock_state` (1/0 both ways), or the zigbee2mqtt shape: commands
+    // LOCK / UNLOCK on `state`, the reported word on `lock_state`.
     void lock(const Expose& e) {
         JsonDocument doc;
         base(doc, "lock", nullptr);
@@ -300,6 +313,17 @@ struct Writer {
         doc["payload_unlock"] = "0";
         doc["state_locked"]   = "1";
         doc["state_unlocked"] = "0";
+        finish(doc, "lock", "lock");
+    }
+    void lock_worded(const Expose& state_cmd, const Expose& lock_state) {
+        JsonDocument doc;
+        base(doc, "lock", nullptr);
+        topics(doc, state_cmd, nullptr, "command_topic");
+        topics(doc, lock_state, "state_topic", nullptr);
+        doc["payload_lock"]   = "LOCK";
+        doc["payload_unlock"] = "UNLOCK";
+        doc["state_locked"]   = "locked";
+        doc["state_unlocked"] = "unlocked";
         finish(doc, "lock", "lock");
     }
 
@@ -444,6 +468,10 @@ int build_device(const Device& d, const Context& c, EmitFn emit, void* user, boo
         Expose* e = find(name, type);
         return (e && e->settable()) ? e : nullptr;
     };
+    auto find_any = [&](const char* name) -> Expose* {
+        for (size_t i = 0; i < n; i++) if (strcmp(ex[i].name, name) == 0) return &ex[i];
+        return nullptr;
+    };
     auto use = [](Expose* e) { if (e) e->used = true; };
 
     const bool passive = d.battery_powered || find("battery", "numeric") || find("battery_low", "binary");
@@ -469,9 +497,19 @@ int build_device(const Device& d, const Context& c, EmitFn emit, void* user, boo
     Expose* st = find("state", "binary");
     Expose* br = find("brightness", "numeric");
     if (st && br && st->settable() && br->settable()) {
-        Expose* ct = find_settable("color_temp", "numeric");
-        w.light(*st, *br, ct);
+        Expose* ct  = find_settable("color_temp", "numeric");
+        Expose* cx  = find_settable("color_x", "numeric");
+        Expose* cy  = find_settable("color_y", "numeric");
+        Expose* cxy = find_any("color_xy");
+        Expose* hue = find_settable("hue", "numeric");
+        Expose* sat = find_settable("saturation", "numeric");
+        Expose* chs = find_any("color_hs");
+        const bool xy = (cx && cy) || cxy;
+        const bool hs = (hue && sat) || chs;
+        w.light(*st, *br, ct, xy, hs);
         use(st); use(br); use(ct);
+        if (xy) { use(cx); use(cy); use(cxy); }
+        if (hs) { use(hue); use(sat); use(chs); }
     }
 
     // Cover: a writable position, and/or a state enum spoken in OPEN / CLOSE.
@@ -487,6 +525,12 @@ int build_device(const Device& d, const Context& c, EmitFn emit, void* user, boo
     if (Expose* lk = find_settable("lock_state", "binary")) {
         w.lock(*lk);
         use(lk);
+    } else if (Expose* ls = find("lock_state", "enum")) {
+        Expose* cmd = find_settable("state", "enum");
+        if (ls->publishes() && cmd && cmd->has_value("LOCK") && cmd->has_value("UNLOCK")) {
+            w.lock_worded(*cmd, *ls);
+            use(ls); use(cmd);
+        }
     }
 
     // Fan, unless the fan speed already belongs to a thermostat above.

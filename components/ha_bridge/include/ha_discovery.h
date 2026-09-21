@@ -50,9 +50,11 @@ using EmitFn = void (*)(const char* component, const char* topic,
 // Compositions, in this order, each consuming the exposes it uses:
 //   local_temperature + a writable heating setpoint   -> climate (+ system_mode, preset,
 //                                                        running_state, fan_mode)
-//   writable state + brightness (+ color_temp)         -> light
+//   writable state + brightness (+ color_temp,          -> light (xy / hs colour rides
+//     color_x/color_y or color_xy, hue/saturation)         the color_xy / color_hs pairs)
 //   writable position and/or state enum OPEN/CLOSE     -> cover (+ tilt)
-//   writable lock_state on/off                          -> lock
+//   writable lock_state on/off, or state LOCK/UNLOCK    -> lock
+//     + a worded lock_state
 //   fan_state, or a fan_mode with "off"                 -> fan (+ preset modes)
 //   read-only enum "action" with a value list           -> event
 // Everything else becomes the single entity its type implies.
