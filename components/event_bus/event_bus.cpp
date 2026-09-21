@@ -6,6 +6,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "esp_log.h"
 
 static const char* TAG = "event_bus";
@@ -106,7 +107,7 @@ static void reap_locked() {
         for (uint8_t i = 0; i < MAX_SUBS_PER_TYPE; i++) {
             SubEntry& s = s_subs[t][i];
             if (!s.alive && s.queue && s.inflight == 0) {
-                vQueueDelete(s.queue);
+                zhac_queue_delete(s.queue);
                 s.queue = nullptr;
                 s_dying_count--;
                 recalc_hwm_locked(t);
@@ -173,7 +174,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
         return EVENT_SUB_INVALID;
     }
 
-    QueueHandle_t q = xQueueCreate(QUEUE_DEPTH, sizeof(Event));
+    QueueHandle_t q = zhac_queue_create(QUEUE_DEPTH, sizeof(Event));
     if (!q) {
         // Pre-fix this was configASSERT-only: with asserts compiled out the
         // null queue was stored and the handler later ran synchronously
@@ -221,7 +222,7 @@ void event_bus_unsubscribe(EventSubHandle handle) {
     if (s.inflight == 0) {
         // Fast path: no publish/drain holds the queue, and none can newly
         // validate (gen bumped, alive false) while we hold the lock.
-        vQueueDelete(s.queue);
+        zhac_queue_delete(s.queue);
         s.queue = nullptr;
         recalc_hwm_locked(idx);
     } else {

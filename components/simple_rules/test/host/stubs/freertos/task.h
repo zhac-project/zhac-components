@@ -11,6 +11,11 @@ typedef struct StubTask* TaskHandle_t;
 BaseType_t xTaskCreate(TaskFunction_t fn, const char* name, uint32_t stack_depth,
                        void* arg, UBaseType_t priority, TaskHandle_t* out_handle);
 void       vTaskDelay(TickType_t ticks);
+// zhac_task.h's pinned variant compiles against this shim too; the core is ignored.
+static inline BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char* name, uint32_t d,
+                                                 void* arg, UBaseType_t p, TaskHandle_t* out, BaseType_t) {
+    return xTaskCreate(fn, name, d, arg, p, out);
+}
 
 // Task notifications (event_bus pump): no-ops on the single-threaded host.
 static inline TaskHandle_t xTaskGetCurrentTaskHandle(void) { return nullptr; }

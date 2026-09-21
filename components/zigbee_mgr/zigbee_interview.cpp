@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/queue.h"
 #include <cstring>
 #include <atomic>
@@ -884,7 +885,7 @@ bool zigbee_interview_trigger(uint64_t ieee) {
 }
 
 void zigbee_interview_init() {
-    s_join_queue = xQueueCreate(16, sizeof(JoinEvent));
+    s_join_queue = zhac_queue_create(16, sizeof(JoinEvent));
     configASSERT(s_join_queue);
     s_rsp_sem = xSemaphoreCreateBinary();
     configASSERT(s_rsp_sem);
@@ -893,7 +894,7 @@ void zigbee_interview_init() {
     s_wake_sem = xSemaphoreCreateBinary();
     configASSERT(s_wake_sem);
 
-    xTaskCreate(task_interview, "zb_interview", zhac::stack::kZbInterview, nullptr, 5, nullptr);
+    zhac_task_create(task_interview, "zb_interview", zhac::stack::kZbInterview, nullptr, 5, nullptr);
 
     znp_register_areq(MT_AREQ(ZNP_ZDO), 0x82, store_rsp);    // NODE_DESC_RSP
     znp_register_areq(MT_AREQ(ZNP_ZDO), 0x85, store_rsp);    // ACTIVE_EP_RSP

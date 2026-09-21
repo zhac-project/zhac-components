@@ -9,6 +9,7 @@
 #include "metrics/metrics_macros.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
@@ -817,14 +818,14 @@ void device_shadow_init() {
     configASSERT(s_mutex);
     s_emit_mutex = xSemaphoreCreateMutex();
     configASSERT(s_emit_mutex);
-    s_task_queue = xQueueCreate(TASK_QUEUE_DEPTH, sizeof(ShadowTaskMsg));
+    s_task_queue = zhac_queue_create(TASK_QUEUE_DEPTH, sizeof(ShadowTaskMsg));
     configASSERT(s_task_queue);
 
     s_shadow = static_cast<DeviceShadowEntry*>(
         heap_caps_calloc(ZAP_MAX_DEVICES, sizeof(DeviceShadowEntry), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     configASSERT(s_shadow);
 
-    xTaskCreatePinnedToCore(task_shadow, "task_shadow", zhac::stack::kDeviceShadow, nullptr, 4, nullptr, 1);
+    zhac_task_create_pinned(task_shadow, "task_shadow", zhac::stack::kDeviceShadow, nullptr, 4, nullptr, 1);
     ESP_LOGI(TAG, "device_shadow init OK");
 }
 

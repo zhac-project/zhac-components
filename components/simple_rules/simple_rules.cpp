@@ -18,6 +18,7 @@
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -703,7 +704,7 @@ void simple_rules_init() {
     reload_locked();
     xSemaphoreGiveRecursive(s_mutex);
 
-    xTaskCreate(task_cron, "rule_cron", zhac::stack::kRuleCron, nullptr, 2, nullptr);
+    zhac_task_create(task_cron, "rule_cron", zhac::stack::kRuleCron, nullptr, 2, nullptr);
 }
 
 static void publish_changed(uint16_t rule_id, uint8_t change) {

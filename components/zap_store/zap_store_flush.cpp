@@ -24,6 +24,7 @@
 #include "zap_store.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -319,7 +320,7 @@ void zap_store_flush_init() {
     if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
     configASSERT(s_mtx);
     s_task_started = true;
-    if (xTaskCreate(flush_task, "zap_flush", zhac::stack::kZapFlush,
+    if (zhac_task_create(flush_task, "zap_flush", zhac::stack::kZapFlush,
                     nullptr, 3, nullptr) != pdPASS) {
         // P1-T8: with the flag left true, dirty marks would defer into a
         // table no task ever drains (silent persistence loss). Roll back

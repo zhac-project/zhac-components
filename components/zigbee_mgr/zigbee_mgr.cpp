@@ -9,6 +9,7 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/queue.h"
 #include <atomic>
 #include <cstring>
@@ -1092,13 +1093,13 @@ bool zigbee_mgr_init() {
     // init is driven from a single boot task (no concurrent first call).
     const bool first_init = (s_zcl_queue == nullptr);
     if (first_init) {
-        s_zcl_queue = xQueueCreate(ZCL_QUEUE_DEPTH, sizeof(AfRawFrame));
+        s_zcl_queue = zhac_queue_create(ZCL_QUEUE_DEPTH, sizeof(AfRawFrame));
         configASSERT(s_zcl_queue);
         // 8 KB: zhc pipeline puts DecodedMessage (~1.7 KB) +
         // dispatch_from_zigbee scratches + per-converter locals (lumi
         // MI-struct TLV is ~1 KB on its own) on this task's stack. 4 KB
         // overflows on rotate/vibrate frames.
-        xTaskCreate(zcl_attr_task, "zcl_attr", zhac::stack::kZclAttr, nullptr, 5, nullptr);
+        zhac_task_create(zcl_attr_task, "zcl_attr", zhac::stack::kZclAttr, nullptr, 5, nullptr);
 
         znp_register_areq(MT_AREQ(ZNP_SYS), 0x80, on_reset_ind);
         znp_register_areq(MT_AREQ(ZNP_ZDO), 0xC0, on_state_change);

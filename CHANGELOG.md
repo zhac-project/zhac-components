@@ -9,6 +9,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- `zap_common/zhac_task.h`: `zhac_task_create[_pinned]` / `zhac_queue_create|delete` park task stacks and queue storage in PSRAM on builds that execute from PSRAM (`CONFIG_SPIRAM_XIP_FROM_PSRAM`, today the S31 wired core), plain `xTaskCreate`/`xQueueCreate` elsewhere. `event_bus`, `simple_rules` (cron), `device_shadow`, `zigbee_mgr` (zcl/identity/configure/interview), `rule_store` + `zap_store` flush tasks use it. Internal DRAM on the S31 was exhausted ~10 s after boot (mqtt_client task creation failed).
 - **`event_bus_pump_run()`: the pump sleeps until a publish.** The three firmware pumps
   polled every event type every 20 ms, walking ~40 subscriber queues fifty times a second; on
   the wired hub that was 22 % of core 0 while idle (`diag.tasks` named it). Publish now wakes

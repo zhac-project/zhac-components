@@ -24,6 +24,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/timers.h"
 #include <cstdlib>
 #include "task_stacks.h"
@@ -244,9 +245,9 @@ void zigbee_configure_enqueue(uint64_t ieee) {
 
 void zigbee_configure_init() {
     if (s_q) return;  // idempotent
-    s_q = xQueueCreate(CONFIGURE_QUEUE_DEPTH, sizeof(uint64_t));
+    s_q = zhac_queue_create(CONFIGURE_QUEUE_DEPTH, sizeof(uint64_t));
     configASSERT(s_q);
-    xTaskCreate(task_configure, "zb_configure", zhac::stack::kZbConfigure, nullptr, 4, nullptr);
+    zhac_task_create(task_configure, "zb_configure", zhac::stack::kZbConfigure, nullptr, 4, nullptr);
     ESP_LOGI(TAG, "configure queue ready (depth=%u max_attempts=%u)",
              CONFIGURE_QUEUE_DEPTH, MAX_ATTEMPTS);
 }

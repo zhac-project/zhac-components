@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include <cstring>
 #include "task_stacks.h"
 
@@ -237,8 +238,8 @@ static void task_identity(void*) {
 
 void zigbee_identity_init() {
     if (s_q) return;  // idempotent
-    s_q = xQueueCreate(8, sizeof(IdentityUpdate));
+    s_q = zhac_queue_create(8, sizeof(IdentityUpdate));
     configASSERT(s_q);
-    xTaskCreate(task_identity, "zb_identity", zhac::stack::kZbIdentity, nullptr, 4, nullptr);
+    zhac_task_create(task_identity, "zb_identity", zhac::stack::kZbIdentity, nullptr, 4, nullptr);
     ESP_LOGI(TAG, "identity task ready");
 }

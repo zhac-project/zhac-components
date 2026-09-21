@@ -21,6 +21,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 #include "freertos/semphr.h"
 #include <cstring>
 #include "task_stacks.h"
@@ -338,7 +339,7 @@ void rule_store_flush_init() {
     // 3072 was overflowing under burst: due[DIRTY_CAP]=256B + NVS commit
     // path (~2 KB) + printf in log line (~1.5 KB) easily exceeds. 6144
     // gives ~2x headroom and matches other NVS-touching tasks.
-    if (xTaskCreate(flush_task, "rule_flush", zhac::stack::kRuleFlush,
+    if (zhac_task_create(flush_task, "rule_flush", zhac::stack::kRuleFlush,
                     nullptr, 3, nullptr) != pdPASS) {
         // P1-T8: with the flag left true, marks would defer into a table
         // no task ever drains. Roll back so they fall through to the
