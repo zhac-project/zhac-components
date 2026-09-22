@@ -139,6 +139,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- `rule_store_mark_dirty`: the direct-save fallback (writeback not started) now logs an error when the save fails instead of dropping the rule silently; the wired and mono cores had never initialised the store and nothing said so.
 - **`zigbee.set` with an attribute key of 20 or more characters mis-parsed silently.** The key
   field held 19 characters, so `zigbee.set valve current_heating_setpoint 21.5` kept
   `current_heating_set` as the key and `point` as the value, and the rule saved without a word.

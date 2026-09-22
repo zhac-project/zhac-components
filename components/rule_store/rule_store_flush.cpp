@@ -164,7 +164,9 @@ static bool flush_slot(size_t idx) {
 void rule_store_mark_dirty(const RuleSlot* slot) {
     if (!slot) return;
     if (!s_mtx || !s_task_started || !s_dirty) {
-        rule_store_save(slot);
+        if (!rule_store_save(slot))
+            ESP_LOGE(TAG, "rule 0x%04x NOT saved -- store not initialised? (rule_store_init)",
+                     slot->rule_id);
         return;
     }
     xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -174,7 +176,9 @@ void rule_store_mark_dirty(const RuleSlot* slot) {
         xSemaphoreGive(s_mtx);
         ESP_LOGW(TAG, "dirty table full — immediate save rule_id=0x%04x",
                  slot->rule_id);
-        rule_store_save(slot);
+        if (!rule_store_save(slot))
+            ESP_LOGE(TAG, "rule 0x%04x NOT saved -- store not initialised? (rule_store_init)",
+                     slot->rule_id);
         return;
     }
     s_dirty[idx].rule_id   = slot->rule_id;
