@@ -739,7 +739,11 @@ void log_payload(std::uint64_t ieee,
             const auto cmd = msg->command_id;
             const bool cluster_specific =
                 zcl_len >= 1 && (zcl[0] & 0x03) == 0x01;
-            if (!cluster_specific && cmd == 0x0B) {
+            // Global responses to our own requests: default response (0x0B),
+            // write-attributes response (0x04), configure-reporting response
+            // (0x07). Never device state; logging them as "(no match)" sent
+            // owners hunting for a decoder that does not need to exist.
+            if (!cluster_specific && (cmd == 0x0B || cmd == 0x04 || cmd == 0x07)) {
                 protocol_noise = true;
             } else if (cluster_id == 0xEF00 && cluster_specific &&
                        (cmd == 0x10 || cmd == 0x11 ||

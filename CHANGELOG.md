@@ -139,6 +139,8 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- `zhc_adapter`: write-attributes (0x04) and configure-reporting (0x07) responses are protocol frames, logged at debug like the default response, not as "(no match)".
+- `zigbee_mgr` configure-reporting builder: 5–8 byte analog attribute types (u40/u48/u56/u64/double) get a reportable-change field of the right width instead of being refused (seMetering energy on Tuya plugs).
 - `rule_store_mark_dirty`: the direct-save fallback (writeback not started) now logs an error when the save fails instead of dropping the rule silently; the wired and mono cores had never initialised the store and nothing said so.
 - **`zigbee.set` with an attribute key of 20 or more characters mis-parsed silently.** The key
   field held 19 characters, so `zigbee.set valve current_heating_setpoint 21.5` kept

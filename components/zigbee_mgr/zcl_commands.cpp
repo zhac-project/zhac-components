@@ -722,6 +722,13 @@ bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
             // 4-byte analog.
             case 0x23: case 0x2B: case 0x39:        // u32, s32, float32
                 return 4;
+            // 5..8-byte analog: seMetering currentSummDelivered is u48 (0x25),
+            // energy meters use u40/u48/u56/u64 freely. The reportable change
+            // is carried in a u32, so the upper bytes go out as zero.
+            case 0x24: case 0x2C: return 5;         // u40, s40
+            case 0x25: case 0x2D: return 6;         // u48, s48
+            case 0x26: case 0x2E: return 7;         // u56, s56
+            case 0x27: case 0x2F: case 0x3A: return 8;   // u64, s64, double
             default:
                 return 0xFF;
         }
@@ -760,7 +767,7 @@ bool zigbee_zcl_configure_report(uint16_t nwk_addr, uint8_t endpoint,
     zcl_frame[pos++] = static_cast<uint8_t>((max_interval >> 8) & 0xFF);
     for (uint8_t i = 0; i < chg_w; ++i) {
         zcl_frame[pos++] = static_cast<uint8_t>(
-            (reportable_change >> (8 * i)) & 0xFF);
+            (static_cast<uint64_t>(reportable_change) >> (8 * i)) & 0xFF);   // 64-bit: widths up to 8
     }
 
     // IDEMPOTENT (Configure Reporting sets absolute min/max/change — same
