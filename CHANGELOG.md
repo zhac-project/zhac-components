@@ -139,6 +139,19 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **Settings sent to a sleeping device are no longer lost.** A battery device (a Tuya radiator
+  valve checks in every ~20 min) only collects frames the coordinator holds for it for ~7.7 s,
+  so a Configure's Tuya DATA_QUERY or a setpoint/schedule write usually expired unseen and the
+  device never answered. `zhc_adapter` now holds idempotent frames for such devices (Tuya
+  setData/setDataResponse/dataQuery on 0xEF00, ZCL Write Attributes) and resends them when the
+  device next transmits: a write until the device reports that key (at most 3 times, at least
+  10 s apart), a query once, nothing older than an hour, 16 frames at most. Resends run on a
+  small task (`TaskZhcWake`) so frame callbacks never wait on a delivery confirm. Backends say
+  which devices sleep through the new `zhac_adapter_register_sleepy()`; `zigbee_mgr`'s ZNP
+  bridge uses a battery power source. Policy in `src/wake_queue.{hpp,cpp}`, host test in
+  `zhc_adapter/test/host`.
+- `zigbee_mgr` host harness builds again: its FreeRTOS stub lacked `TaskFunction_t` (used by
+  `zhac_task.h`) and the task-notification calls of the event-bus pump.
 - `zhc_adapter` answers a Tuya MCU time-sync request (0xEF00 cmd 0x24) the way z2m's `tuya.onEvent({timeStart})` does -- UTC + local seconds, big-endian, in the def's `tuya_time_start` epoch, only once NTP has set the clock. Nothing on any core answered before; a Saswell TRV asked every minute and its weekly schedule ran on a wrong clock. Also: a matched frame that decodes to no keys now logs its cluster/command/length instead of a bare "matched, 0 keys".
 - `zhc_adapter`: write-attributes (0x04) and configure-reporting (0x07) responses are protocol frames, logged at debug like the default response, not as "(no match)".
 - `zigbee_mgr` configure-reporting builder: 5–8 byte analog attribute types (u40/u48/u56/u64/double) get a reportable-change field of the right width instead of being refused (seMetering energy on Tuya plugs).

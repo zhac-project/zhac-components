@@ -16,8 +16,11 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "zap_common.h"   // ZAP_MAX_DEVICES — single source of device-count truth
+#include "zhac_task.h"    // zhac_task_create: PSRAM stacks where the target allows
+#include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
 
 #include "metrics/metrics_macros.h"
 
@@ -809,6 +812,12 @@ extern "C" void zhac_adapter_register_shadow(zhac_shadow_update_fn_t fn) {
 }
 
 namespace {
+// Send-when-awake (defined with the send path below): hold a frame for a
+// device that sleeps between polls; note that a device just transmitted.
+void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
+               uint16_t cluster, const uint8_t* bytes, size_t len);
+void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result);
+
 zhac_configure_bind_fn_t   g_cfg_bind   = nullptr;
 zhac_configure_report_fn_t g_cfg_report = nullptr;
 zhac_configure_cmd_fn_t    g_cfg_cmd    = nullptr;
@@ -988,6 +997,9 @@ extern "C" bool zhac_adapter_configure(uint64_t ieee, uint16_t nwk,
                              0x03, nullptr, 0, 0);
             ESP_LOGI(TAG, "[configure] Tuya DATA_QUERY sent ieee=0x%016llx ep=%u",
                       static_cast<unsigned long long>(ieee), tuya_ep);
+            // A battery valve answering the bind may doze off before it polls
+            // for this query; ask again when it next transmits.
+            wake_hold(ieee, "#query", true, tuya_ep, 0xEF00, nullptr, 0);
         }
     }
 
@@ -1484,6 +1496,7 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         if (result.any_matched) {
             log_payload(ieee, *supp, result, cluster_id, &msg, zcl, zcl_len);
             fire_shadow_updates(ieee, result);
+            wake_seen(ieee, ctx.device_nwk, &result);
             return true;
         }
     }
@@ -1540,6 +1553,9 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
 
     log_payload(ieee, *def, result, cluster_id, &msg, zcl, zcl_len);
     if (result.any_matched) fire_shadow_updates(ieee, result);
+    // The device just transmitted, so it is awake: resend what it missed
+    // (dropping what this frame reported, i.e. what it has applied).
+    wake_seen(ieee, ctx.device_nwk, &result);
     return result.any_matched;
 }
 
@@ -1547,6 +1563,67 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
 
 namespace {
 zhac_af_send_fn_t g_af_send = nullptr;
+
+// ── Send when awake ──────────────────────────────────────────────────
+// Policy in src/wake_queue.hpp. The queue sits in PSRAM where there is some.
+// A small task does the resends: a backend's send may wait for its delivery
+// confirmation (up to 2 s on the ZNP path), and the frame callbacks that
+// notice a device is awake must not stall on it.
+zhac_is_sleepy_fn_t g_is_sleepy = nullptr;
+EXT_RAM_BSS_ATTR zhac_wake::Queue g_wake;
+SemaphoreHandle_t g_wake_mtx  = nullptr;
+TaskHandle_t      g_wake_task = nullptr;
+
+std::uint32_t wake_now_ms() {
+    return static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
+}
+
+void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
+               uint16_t cluster, const uint8_t* bytes, size_t len) {
+    if (!g_is_sleepy || !g_wake_mtx || !g_wake_task) return;
+    if (!query && !zhac_wake::holdable(cluster, bytes, len)) return;
+    if (!g_is_sleepy(ieee)) return;
+    bool held = false;
+    if (xSemaphoreTake(g_wake_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        held = g_wake.hold(ieee, key, query, ep, cluster, bytes, len, wake_now_ms());
+        xSemaphoreGive(g_wake_mtx);
+    }
+    if (held) {
+        ESP_LOGI(TAG, "[wake] 0x%016llx sleeps between polls -- %s held for its next wake-up",
+                 static_cast<unsigned long long>(ieee), key);
+    }
+}
+
+void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result) {
+    if (!g_wake_mtx || !g_wake_task) return;
+    if (xSemaphoreTake(g_wake_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    const std::size_t due = g_wake.on_wake(ieee, nwk, wake_now_ms(), [result](const char* k) {
+        return result && result->merged.find(k) != nullptr;
+    });
+    xSemaphoreGive(g_wake_mtx);
+    if (due) xTaskNotifyGive(g_wake_task);
+}
+
+void wake_task(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        zhac_wake::Frame f{};
+        for (;;) {
+            bool got = false;
+            if (xSemaphoreTake(g_wake_mtx, portMAX_DELAY) == pdTRUE) {
+                got = g_wake.take_due(wake_now_ms(), f);
+                xSemaphoreGive(g_wake_mtx);
+            }
+            if (!got) break;
+            const bool sent = f.query
+                ? (g_cfg_cmd && g_cfg_cmd(f.ieee, f.nwk, f.ep, f.cluster, 0x03, nullptr, 0, 0))
+                : (g_af_send && g_af_send(f.nwk, f.ep, f.cluster, f.bytes, f.len));
+            ESP_LOGI(TAG, "[wake] 0x%016llx is awake -- resent %s (try %u)%s",
+                     static_cast<unsigned long long>(f.ieee), f.key,
+                     static_cast<unsigned>(f.tries), sent ? "" : " -- send failed");
+        }
+    }
+}
 
 bool dispatch_and_send(uint64_t ieee,
                         const char* model_id, const char* manu_name,
@@ -1642,13 +1719,26 @@ bool dispatch_and_send(uint64_t ieee,
         return false;
     }
 
-    return g_af_send(nwk_addr, target_ep, r.cluster_id,
-                      frame, r.frame_size);
+    const bool sent = g_af_send(nwk_addr, target_ep, r.cluster_id,
+                                frame, r.frame_size);
+    // Also when the send failed: a device asleep is exactly when it does.
+    wake_hold(ieee, key, false, target_ep, r.cluster_id, frame, r.frame_size);
+    return sent;
 }
 }  // namespace
 
 extern "C" void zhac_adapter_register_send(zhac_af_send_fn_t fn) {
     g_af_send = fn;
+}
+
+extern "C" void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn) {
+    if (!g_wake_mtx) g_wake_mtx = xSemaphoreCreateMutex();
+    if (g_wake_mtx && !g_wake_task &&
+        zhac_task_create(wake_task, "TaskZhcWake", 6 * 1024, nullptr, 3, &g_wake_task) != pdPASS) {
+        g_wake_task = nullptr;
+        ESP_LOGE(TAG, "[wake] task create failed -- frames for sleeping devices are not held");
+    }
+    g_is_sleepy = fn;
 }
 
 extern "C" void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk) {

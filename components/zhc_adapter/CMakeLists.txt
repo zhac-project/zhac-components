@@ -100,6 +100,7 @@ idf_component_register(
     SRCS
         "src/zhc_adapter.cpp"
         "src/zhc_adapter_fallback.cpp"
+        "src/wake_queue.cpp"
         "${ZHC_ROOT}/src/zcl/header.cpp"
         "${ZHC_ROOT}/src/zcl/foundation.cpp"
         "${ZHC_ROOT}/src/zcl/decoder.cpp"

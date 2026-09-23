@@ -111,6 +111,17 @@ typedef bool (*zhac_af_send_fn_t)(uint16_t nwk_addr, uint8_t dst_ep,
 
 void zhac_adapter_register_send(zhac_af_send_fn_t fn);
 
+// Does this device switch its radio off between polls? Registered by the radio
+// backend (it knows the neighbour table / power source). With it, the adapter
+// holds the writes and Tuya queries it sends to such a device and sends them
+// again right after the device next transmits: a frame for a sleeping device
+// waits in its parent's indirect queue for ~7.7 s and is then dropped, so a
+// write made while a battery valve dozed never arrived. A held write ends when
+// the device reports that key, after 3 resends or after an hour (see
+// src/wake_queue.hpp). Without a registered predicate nothing is held.
+typedef bool (*zhac_is_sleepy_fn_t)(uint64_t ieee);
+void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn);
+
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame
 // before invoking `zhac_adapter_try_decode`. Required so fz

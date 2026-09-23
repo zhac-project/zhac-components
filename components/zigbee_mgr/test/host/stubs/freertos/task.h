@@ -1,8 +1,14 @@
 #pragma once
 #include "FreeRTOS.h"
 typedef void* TaskHandle_t;
+typedef void (*TaskFunction_t)(void*);   // zhac_task.h spells its parameters with this
 BaseType_t xTaskCreate(void (*fn)(void*), const char*, uint32_t, void*, UBaseType_t, TaskHandle_t*);
 void vTaskDelay(TickType_t);
+// event_bus_pump_run() sleeps on a task notification; the pump never runs on
+// the host, so these only need to link (same shims as simple_rules' stubs).
+static inline TaskHandle_t xTaskGetCurrentTaskHandle(void) { return nullptr; }
+static inline void xTaskNotifyGive(TaskHandle_t) {}
+static inline uint32_t ulTaskNotifyTake(BaseType_t, TickType_t) { return 0; }
 
 // device_shadow spawns task_shadow via xTaskCreatePinnedToCore. Like the
 // zap_store flush task, the shadow housekeeping task NEVER runs on the host —

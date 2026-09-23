@@ -12,6 +12,7 @@
 #include "zigbee_mgr.h"
 #include "znp_driver.h"
 #include "zcl_seq.h"   // zcl_seq_next()
+#include "zigbee_pool.h" // zigbee_pool_snapshot: power source for the sleepy check
 
 #include "esp_log.h"
 #include <cstdint>
@@ -57,6 +58,16 @@ extern "C" bool zhc_send_af(uint16_t nwk_addr, uint8_t dst_ep,
     return true;
 }
 
+// Does this device switch its radio off between polls? ZNP gives us no
+// neighbour table here, so a battery power source (ZCL powerSource 0x03,
+// bit 7 = backup battery) marks it. The adapter then holds writes and Tuya
+// queries for it and resends them when it next transmits.
+static bool zhc_is_sleepy(uint64_t ieee) {
+    ZapDevice d{};
+    return zigbee_pool_snapshot(ieee, &d) && (d.power_source & 0x7F) == 0x03;
+}
+
 extern "C" void zhc_send_bridge_register(void) {
     zhac_adapter_register_send(&zhc_send_af);
+    zhac_adapter_register_sleepy(&zhc_is_sleepy);
 }
