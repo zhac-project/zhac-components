@@ -3,6 +3,7 @@
 #include "zhc_adapter.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
@@ -1718,6 +1719,35 @@ bool dispatch_and_send(uint64_t ieee,
                  static_cast<unsigned long long>(ieee), key);
         return false;
     }
+
+    // A Tuya dataRequest / sendData carries its own 2-byte sequence after the
+    // ZCL header. The library writes a constant 1; z2m and ZHA number every
+    // command, and a Tuya MCU may take a repeated number for a repeated
+    // command. Numbered here, where every write passes.
+    const std::size_t hdr = (frame[0] & 0x04) ? 5 : 3;   // manufacturer code adds two bytes
+    if (r.cluster_id == 0xEF00 && (frame[0] & 0x03) == 0x01 && r.frame_size >= hdr + 2 &&
+        (frame[hdr - 1] == 0x00 || frame[hdr - 1] == 0x04)) {
+        static std::atomic<std::uint16_t> s_tuya_seq{0};
+        const std::uint16_t seq = static_cast<std::uint16_t>(s_tuya_seq.fetch_add(1) + 1);
+        frame[hdr]     = static_cast<std::uint8_t>(seq >> 8);
+        frame[hdr + 1] = static_cast<std::uint8_t>(seq);
+    }
+
+    // What was asked for, so a device that does something else can be told
+    // apart from a UI that sent something else.
+    char shown[48];
+    switch (value.type) {
+        case zhc::ValueType::StringRef:
+            std::snprintf(shown, sizeof(shown), "\"%s\"", value.str ? value.str : ""); break;
+        case zhc::ValueType::Bool:  std::snprintf(shown, sizeof(shown), "%s", value.b ? "true" : "false"); break;
+        case zhc::ValueType::Uint:  std::snprintf(shown, sizeof(shown), "%llu", static_cast<unsigned long long>(value.u)); break;
+        case zhc::ValueType::Int:   std::snprintf(shown, sizeof(shown), "%lld", static_cast<long long>(value.i)); break;
+        case zhc::ValueType::Float: std::snprintf(shown, sizeof(shown), "%.2f", static_cast<double>(value.f)); break;
+        default: std::snprintf(shown, sizeof(shown), "(type %u)", static_cast<unsigned>(value.type)); break;
+    }
+    ESP_LOGI(TAG, "[zhc-send] 0x%016llx %s=%s -> ep=%u cl=0x%04x len=%u",
+             static_cast<unsigned long long>(ieee), key, shown, target_ep, r.cluster_id,
+             static_cast<unsigned>(r.frame_size));
 
     const bool sent = g_af_send(nwk_addr, target_ep, r.cluster_id,
                                 frame, r.frame_size);

@@ -139,6 +139,12 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **`zhc_adapter` numbers every Tuya write.** A dataRequest / sendData (0xEF00 cmd 0x00 / 0x04)
+  carries its own 2-byte sequence after the ZCL header and the library writes a constant 1; z2m
+  and ZHA give each command a fresh one, and a Tuya MCU may take a repeated number for a repeated
+  command (a Saswell valve given five schedule days in one Save did not apply them as sent).
+  Each command sent through `dispatch_and_send` is now logged as `[zhc-send] <ieee> key=value ->
+  ep cl len`, so what a UI or rule asked for is on the console next to what the device reports.
 - **Settings sent to a sleeping device are no longer lost.** A battery device (a Tuya radiator
   valve checks in every ~20 min) only collects frames the coordinator holds for it for ~7.7 s,
   so a Configure's Tuya DATA_QUERY or a setpoint/schedule write usually expired unseen and the
