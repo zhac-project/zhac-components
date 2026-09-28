@@ -25,3 +25,8 @@ add_executable(meter_poll_host_test
 target_include_directories(meter_poll_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_options(meter_poll_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME meter_poll COMMAND meter_poll_host_test)
+
+add_executable(def_memo_host_test test_def_memo.cpp)
+target_include_directories(def_memo_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+target_compile_options(def_memo_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME def_memo COMMAND def_memo_host_test)

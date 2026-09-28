@@ -24,6 +24,7 @@
 #include "zhac_task.h"    // zhac_task_create: PSRAM stacks where the target allows
 #include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
 #include "meter_poll.hpp" // periodic meter reads for plugs that never report
+#include "def_memo.hpp"   // remembered registry lookups (model, manufacturer) -> def
 
 #include "metrics/metrics_macros.h"
 
@@ -114,6 +115,8 @@ static const char* TAG = "zhc_adapter";
 //     synchronous try_decode / configure read that consumes it
 //     (latch-before-read) — no cross-call addressing mutex.
 // (5) g_timer_mux (portMUX spinlock, not a mutex) guards the timer slots.
+// (6) g_def_memo_mtx guards the find_definition() memo. Leaf lock: held
+//     only around the memo's own get/put, never across the registry walk.
 // ──────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -469,6 +472,10 @@ void store_cached_defs(std::uint64_t ieee,
 constexpr std::size_t kMaxRegistry = 8192;
 EXT_RAM_BSS_ATTR const zhc::PreparedDefinition* g_merged[kMaxRegistry];
 std::size_t g_merged_count = 0;
+// Set once g_merged is complete. The P4 starts TaskHAP before
+// zhac_adapter_init(), so a device.list can walk an empty or half-built
+// registry; that result must not be remembered (g_def_memo below).
+std::atomic<bool> g_merged_ready{false};
 
 void merge_registries() {
     g_merged_count = 0;
@@ -580,13 +587,37 @@ void merge_registries() {
         const auto& e = zhc::devices::tier_e::kTierERegistries[i];
         add(e.reg, e.count);
     }
+    g_merged_ready.store(true, std::memory_order_release);
 }
+
+// find_definition() results, remembered (policy in src/def_memo.hpp):
+// device.list, Home Assistant discovery and the device page resolve every
+// device on every call, and each cold lookup walks all of g_merged. PSRAM like
+// g_merged: task context only, never an ISR. g_def_memo_mtx is a leaf lock,
+// nothing else is called while it is held.
+EXT_RAM_BSS_ATTR zhac_def_memo::Memo<const zhc::PreparedDefinition*> g_def_memo;
+SemaphoreHandle_t g_def_memo_mtx = xSemaphoreCreateMutex();
 
 const zhc::PreparedDefinition* find_definition(const char* model_id,
                                                  const char* manu_name) {
+    const bool memo = g_def_memo_mtx && g_merged_ready.load(std::memory_order_acquire);
+    const zhc::PreparedDefinition* def = nullptr;
+    if (memo) {
+        xSemaphoreTake(g_def_memo_mtx, portMAX_DELAY);
+        const bool hit = g_def_memo.get(model_id, manu_name, &def);
+        xSemaphoreGive(g_def_memo_mtx);
+        if (hit) return def;
+    }
+    // The walk runs unlocked: one cold lookup must not stall the others' hits.
     std::span<const zhc::PreparedDefinition* const> view(
         g_merged, g_merged_count);
-    return zhc::find_definition(model_id, manu_name, view);
+    def = zhc::find_definition(model_id, manu_name, view);
+    if (memo) {
+        xSemaphoreTake(g_def_memo_mtx, portMAX_DELAY);
+        g_def_memo.put(model_id, manu_name, def);
+        xSemaphoreGive(g_def_memo_mtx);
+    }
+    return def;
 }
 
 // Registry first, cluster-based fallback second. `ieee == 0` → registry
