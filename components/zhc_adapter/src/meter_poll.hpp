@@ -77,7 +77,15 @@ public:
     // Up to `max` polled devices due at `now_ms`. They stay due until
     // polled() is called for them.
     std::size_t take_due(std::uint32_t now_ms, Due* out, std::size_t max);
-    void polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
+
+    // Reschedules the device for `interval_ms` from now, regardless of `ok`
+    // (I-2: a failed read backs off exactly like a successful one, instead
+    // of retrying every kTickMs). Returns true the first time in a row that
+    // `ok` is false -- the caller should log a warning once for the new
+    // failure streak; a success (`ok` true, the default) always resets the
+    // streak and returns false.
+    bool polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms,
+                bool ok = true);
 
 private:
     struct Slot {
@@ -86,6 +94,7 @@ private:
         std::uint16_t nwk;
         std::uint8_t  flags;
         bool          seen;
+        bool          warned;       // already logged this failure streak
     };
     Slot* find(std::uint64_t ieee);
     Slot slots_[kSlots] = {};

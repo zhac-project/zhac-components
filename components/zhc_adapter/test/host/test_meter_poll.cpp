@@ -62,13 +62,33 @@ static void test_polls_every_interval() {
     assert(poll(s, first + 2 * kMin) == 1);
 }
 
-static void test_unacked_poll_retries_next_tick() {
+// I-2: a failed read backs off to the full interval, same as a successful
+// one, instead of retrying every kTickMs. The caller (zhc_adapter's
+// meter_tick) always calls polled(..., ok) whether the send succeeded or
+// not -- this pins that behaviour at the Scheduler level.
+static void test_failed_poll_backs_off_to_interval() {
     Scheduler s;
     s.add(kPlug, 1, kBoth, 0, kMin);
     Due d[kMaxPerTick];
     const std::uint32_t t = stagger(kPlug, kMin);
-    assert(s.take_due(t, d, kMaxPerTick) == 1);    // send failed: no polled()
-    assert(s.take_due(t + kTickMs, d, kMaxPerTick) == 1);
+    assert(s.take_due(t, d, kMaxPerTick) == 1);
+    assert(s.polled(kPlug, t, kMin, false) == true);      // first failure: log once
+    assert(s.take_due(t + kTickMs, d, kMaxPerTick) == 0);  // no retry next 5 s tick
+    assert(s.take_due(t + kMin - 1, d, kMaxPerTick) == 0);
+    assert(s.take_due(t + kMin, d, kMaxPerTick) == 1);     // retried after the interval
+}
+
+// Warn once per failure streak; a success resets it so the next failure
+// warns again.
+static void test_failure_streak_warns_once() {
+    Scheduler s;
+    s.add(kPlug, 1, kBoth, 0, kMin);
+    std::uint32_t t = stagger(kPlug, kMin);
+    assert(s.polled(kPlug, t, kMin, false) == true);    // 1st failure in streak: warn
+    assert(s.polled(kPlug, t, kMin, false) == false);   // still in streak: silent
+    assert(s.polled(kPlug, t, kMin, false) == false);   // still in streak: silent
+    assert(s.polled(kPlug, t, kMin, true)  == false);   // success resets the streak
+    assert(s.polled(kPlug, t, kMin, false) == true);    // new streak: warn again
 }
 
 static void test_stagger_spreads_devices() {
@@ -149,7 +169,8 @@ int main() {
     test_reads_carry_z2m_attrs();
     test_mains_only();
     test_polls_every_interval();
-    test_unacked_poll_retries_next_tick();
+    test_failed_poll_backs_off_to_interval();
+    test_failure_streak_warns_once();
     test_stagger_spreads_devices();
     test_flagless_or_battery_never_polled();
     test_removed_device_stops();

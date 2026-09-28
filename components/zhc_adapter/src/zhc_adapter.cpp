@@ -1697,9 +1697,21 @@ void meter_tick() {
                             reads[r].attrs_le, reads[r].count, 0);
         }
         if (!ok) {
-            // Radio busy: this one and the rest stay due for the next tick.
-            ESP_LOGW(TAG, "[meter] 0x%016llx read not sent -- retry next tick",
-                     static_cast<unsigned long long>(due[i].ieee));
+            // Send/hook failed (radio busy or backend not ready): back this
+            // device off to the full poll interval instead of retrying every
+            // kTickMs (I-2), and log the warning once per failure streak --
+            // again only after a success resets it. The rest that never got
+            // a chance this tick are untouched and stay due for the next one.
+            bool should_warn = true;
+            {
+                MeterLock l;
+                if (l.ok) should_warn = g_meter.polled(due[i].ieee, now, kMeterIntervalMs, false);
+            }
+            if (should_warn) {
+                ESP_LOGW(TAG, "[meter] 0x%016llx read not sent -- backing off %u s",
+                         static_cast<unsigned long long>(due[i].ieee),
+                         static_cast<unsigned>(CONFIG_ZHAC_METER_POLL_S));
+            }
             break;
         }
         ESP_LOGD(TAG, "[meter] 0x%016llx polled", static_cast<unsigned long long>(due[i].ieee));
@@ -1711,25 +1723,30 @@ void meter_tick() {
 void wake_task(void*) {
     for (;;) {
         // Frames for a device that just woke come by notify; the meter tick
-        // needs the timeout.
+        // needs the timeout. Flush the wake queue FIRST (I-2): meter reads
+        // can block the send path for seconds when the radio is degraded
+        // (NO_MEM retries, ZNP SREQ timeouts) -- exactly when frames are
+        // pending for a child that just woke, so they must go out before
+        // meter_tick() has a chance to stall behind a bad read.
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(zhac_meter::kTickMs));
-        meter_tick();
-        if (!g_wake_mtx) continue;
-        zhac_wake::Frame f{};
-        for (;;) {
-            bool got = false;
-            if (xSemaphoreTake(g_wake_mtx, portMAX_DELAY) == pdTRUE) {
-                got = g_wake.take_due(wake_now_ms(), f);
-                xSemaphoreGive(g_wake_mtx);
+        if (g_wake_mtx) {
+            zhac_wake::Frame f{};
+            for (;;) {
+                bool got = false;
+                if (xSemaphoreTake(g_wake_mtx, portMAX_DELAY) == pdTRUE) {
+                    got = g_wake.take_due(wake_now_ms(), f);
+                    xSemaphoreGive(g_wake_mtx);
+                }
+                if (!got) break;
+                const bool sent = f.query
+                    ? (g_cfg_cmd && g_cfg_cmd(f.ieee, f.nwk, f.ep, f.cluster, 0x03, nullptr, 0, 0))
+                    : (g_af_send && g_af_send(f.nwk, f.ep, f.cluster, f.bytes, f.len));
+                ESP_LOGI(TAG, "[wake] 0x%016llx is awake -- resent %s (try %u)%s",
+                         static_cast<unsigned long long>(f.ieee), f.key,
+                         static_cast<unsigned>(f.tries), sent ? "" : " -- send failed");
             }
-            if (!got) break;
-            const bool sent = f.query
-                ? (g_cfg_cmd && g_cfg_cmd(f.ieee, f.nwk, f.ep, f.cluster, 0x03, nullptr, 0, 0))
-                : (g_af_send && g_af_send(f.nwk, f.ep, f.cluster, f.bytes, f.len));
-            ESP_LOGI(TAG, "[wake] 0x%016llx is awake -- resent %s (try %u)%s",
-                     static_cast<unsigned long long>(f.ieee), f.key,
-                     static_cast<unsigned>(f.tries), sent ? "" : " -- send failed");
         }
+        meter_tick();
     }
 }
 

@@ -41,7 +41,7 @@ bool Scheduler::add(std::uint64_t ieee, std::uint16_t nwk, std::uint8_t flags,
     if (!s) {
         s = find(0);
         if (!s) return false;
-        *s = Slot{ieee, now_ms + stagger(ieee, interval_ms), nwk, flags, true};
+        *s = Slot{ieee, now_ms + stagger(ieee, interval_ms), nwk, flags, true, false};
         return true;
     }
     s->nwk = nwk;
@@ -88,8 +88,15 @@ std::size_t Scheduler::take_due(std::uint32_t now_ms, Due* out, std::size_t max)
     return n;
 }
 
-void Scheduler::polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms) {
-    if (Slot* s = find(ieee)) s->due_ms = now_ms + interval_ms;
+bool Scheduler::polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms,
+                       bool ok) {
+    Slot* s = find(ieee);
+    if (!s) return false;
+    s->due_ms = now_ms + interval_ms;
+    if (ok) { s->warned = false; return false; }
+    if (s->warned) return false;
+    s->warned = true;
+    return true;
 }
 
 }  // namespace zhac_meter
