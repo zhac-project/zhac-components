@@ -110,6 +110,7 @@ static bool init_responder(const ZnpRecordedReq& req, MtFrame& srsp) {
 // Captured by the zhc_adapter stub when zhc_shadow_bridge_register() runs;
 // lets the test drive the real bridge callback.
 extern zhac_shadow_update_fn_t g_stub_shadow_fn;
+extern zhac_poll_device_fn_t g_stub_poll_source;
 extern "C" void zhc_shadow_bridge_register(void);
 
 int main() {
@@ -688,6 +689,40 @@ int main() {
         const uint16_t before = pool_count();
         g_stub_shadow_fn(0xFEEDFACEULL, "battery", 2 /*Uint*/, 0, 50, 0.0f, false, nullptr);
         CHECK(pool_count() == before, "battery for an unknown device adds no pool entry");
+    }
+
+    // ── G13: meter-poll device source (zhc_shadow_bridge) ───────────────
+    // zhc_adapter's meter polling walks the pool through this hook: it must
+    // list live devices with their nwk/power source/identity, blank removed
+    // or unidentified entries (ieee 0), and stop past the end.
+    {
+        printf("\nG13 meter-poll device source\n");
+        pool_clear();
+        zhc_shadow_bridge_register();
+        CHECK(g_stub_poll_source != nullptr, "shadow bridge registers the poll source");
+
+        ZapDevice* plug = pool_add();
+        plug->ieee_addr = 0xA4C1380000000001ULL;
+        plug->nwk_addr = 0x1234;
+        plug->power_source = 0x01;
+        strcpy(plug->model_id, "TS011F");
+        strcpy(plug->manufacturer_name, "_TZ3000_okaz9tjs");
+        ZapDevice* gone = pool_add();
+        gone->ieee_addr = 0xA4C1380000000002ULL;
+        strcpy(gone->model_id, "TS011F");
+        zap_dev_mark_removed(gone);
+        ZapDevice* fresh = pool_add();   // interview not done: no model yet
+        fresh->ieee_addr = 0xA4C1380000000003ULL;
+
+        zhac_poll_device_t pd{};
+        CHECK(g_stub_poll_source(0, &pd) && pd.ieee == 0xA4C1380000000001ULL &&
+              pd.nwk == 0x1234 && pd.power_source == 0x01 &&
+              strcmp(pd.model_id, "TS011F") == 0 &&
+              strcmp(pd.manufacturer_name, "_TZ3000_okaz9tjs") == 0,
+              "live device listed with nwk, power source and identity");
+        CHECK(g_stub_poll_source(1, &pd) && pd.ieee == 0, "removed device blanked");
+        CHECK(g_stub_poll_source(2, &pd) && pd.ieee == 0, "device without model blanked");
+        CHECK(!g_stub_poll_source(3, &pd), "false past the end");
     }
 
     printf("\n%s (failures=%d)\n", s_failures ? "FAILED" : "OK", s_failures);

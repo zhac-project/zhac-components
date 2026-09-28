@@ -12,6 +12,7 @@
 #include <span>
 
 #include "esp_attr.h"
+#include "sdkconfig.h"      // CONFIG_ZHAC_METER_POLL_S
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -22,6 +23,7 @@
 #include "zap_common.h"   // ZAP_MAX_DEVICES — single source of device-count truth
 #include "zhac_task.h"    // zhac_task_create: PSRAM stacks where the target allows
 #include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
+#include "meter_poll.hpp" // periodic meter reads for plugs that never report
 
 #include "metrics/metrics_macros.h"
 
@@ -818,6 +820,8 @@ namespace {
 void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
                uint16_t cluster, const uint8_t* bytes, size_t len);
 void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result);
+// Meter polling (defined with the send path below): stop polling a device.
+void meter_forget(uint64_t ieee);
 
 zhac_configure_bind_fn_t   g_cfg_bind   = nullptr;
 zhac_configure_report_fn_t g_cfg_report = nullptr;
@@ -1079,10 +1083,12 @@ extern "C" void zhac_adapter_register_endpoint(uint64_t ieee,
 extern "C" void zhac_adapter_fallback_clear(uint64_t ieee) {
     zhc_fallback::clear(ieee);
     clear_cached_defs_for(ieee);
+    meter_forget(ieee);
 }
 
 extern "C" void zhac_adapter_invalidate_def_cache(uint64_t ieee) {
     clear_cached_defs_for(ieee);
+    meter_forget(ieee);   // identity may have changed: look the def up again
     // The synthesized fallback def is rebuilt on demand from cluster
     // data still cached in zhc_adapter_fallback; no extra clear needed
     // here unless the caller also wants the cluster data gone (use
@@ -1605,9 +1611,110 @@ void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result) {
     if (due) xTaskNotifyGive(g_wake_task);
 }
 
+// ── Meter polling ────────────────────────────────────────────────────
+// Policy in src/meter_poll.hpp. Runs on the wake task (one tick per
+// kTickMs): the reads go out through the configure read hook, the same
+// transport configure steps use, and their responses decode like reports.
+static_assert(zhac_meter::kElectrical == zhc::kMeterPollElectrical &&
+              zhac_meter::kMetering == zhc::kMeterPollMetering,
+              "meter_poll.hpp bits must match the library's kMeterPoll*");
+static_assert(zhac_meter::kSlots == kMaxDevices, "one meter slot per pool device");
+
+#ifndef CONFIG_ZHAC_METER_POLL_S
+#define CONFIG_ZHAC_METER_POLL_S 60
+#endif
+constexpr std::uint32_t kMeterIntervalMs = CONFIG_ZHAC_METER_POLL_S * 1000u;
+
+zhac_poll_device_fn_t g_poll_source = nullptr;
+EXT_RAM_BSS_ATTR zhac_meter::Scheduler g_meter;
+SemaphoreHandle_t g_meter_mtx = nullptr;
+
+struct MeterLock {
+    const bool ok;
+    MeterLock() : ok(g_meter_mtx && xSemaphoreTake(g_meter_mtx, portMAX_DELAY) == pdTRUE) {}
+    ~MeterLock() { if (ok) xSemaphoreGive(g_meter_mtx); }
+};
+
+void meter_forget(uint64_t ieee) {
+    MeterLock l;
+    if (l.ok) g_meter.forget(ieee);
+}
+
+// Look a device up once: its def's meter_poll, and only when it stays awake.
+// Unknown power source (interview missed Basic 0x0007) counts as mains when
+// the radio says the device keeps its receiver on.
+std::uint8_t meter_flags_for(const zhac_poll_device_t& d) {
+    const zhc::PreparedDefinition* def = find_definition(d.model_id, d.manufacturer_name);
+    if (!def || !def->meter_poll) return 0;
+    const bool awake = zhac_meter::mains_powered(d.power_source) ||
+                       (d.power_source == 0 && g_is_sleepy && !g_is_sleepy(d.ieee));
+    if (!awake) return 0;
+    ESP_LOGI(TAG, "[meter] 0x%016llx %s/%s: meter read every %u s",
+             static_cast<unsigned long long>(d.ieee), d.model_id, d.manufacturer_name,
+             static_cast<unsigned>(CONFIG_ZHAC_METER_POLL_S));
+    return def->meter_poll;
+}
+
+void meter_tick() {
+    if (kMeterIntervalMs == 0 || !g_poll_source || !g_cfg_read || !g_meter_mtx) return;
+    static std::uint32_t s_last = 0;
+    static bool s_ran = false;
+    const std::uint32_t now = wake_now_ms();
+    if (s_ran && now - s_last < zhac_meter::kTickMs) return;   // woken early by wake_seen
+    s_ran = true;
+    s_last = now;
+
+    // Mark-and-sweep against the device pool. The pool lock (inside the
+    // source) and the meter lock are never held together.
+    { MeterLock l; if (!l.ok) return; g_meter.begin_scan(); }
+    zhac_poll_device_t d;
+    for (std::uint16_t i = 0; i <= kMaxDevices; ++i) {
+        d = zhac_poll_device_t{};
+        if (!g_poll_source(i, &d)) break;
+        if (!d.ieee) continue;
+        { MeterLock l; if (!l.ok || g_meter.refresh(d.ieee, d.nwk)) continue; }
+        d.model_id[sizeof(d.model_id) - 1] = '\0';
+        d.manufacturer_name[sizeof(d.manufacturer_name) - 1] = '\0';
+        const std::uint8_t flags = meter_flags_for(d);
+        MeterLock l;
+        if (l.ok) (void)g_meter.add(d.ieee, d.nwk, flags, now, kMeterIntervalMs);
+    }
+    zhac_meter::Due due[zhac_meter::kMaxPerTick];
+    std::size_t n = 0;
+    {
+        MeterLock l;
+        if (!l.ok) return;
+        g_meter.end_scan();
+        n = g_meter.take_due(now, due, zhac_meter::kMaxPerTick);
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        zhac_meter::Read reads[2];
+        const std::size_t nr = zhac_meter::reads_for(due[i].flags, reads);
+        bool ok = true;
+        for (std::size_t r = 0; r < nr && ok; ++r) {
+            ok = g_cfg_read(due[i].ieee, due[i].nwk, 1, reads[r].cluster,
+                            reads[r].attrs_le, reads[r].count, 0);
+        }
+        if (!ok) {
+            // Radio busy: this one and the rest stay due for the next tick.
+            ESP_LOGW(TAG, "[meter] 0x%016llx read not sent -- retry next tick",
+                     static_cast<unsigned long long>(due[i].ieee));
+            break;
+        }
+        ESP_LOGD(TAG, "[meter] 0x%016llx polled", static_cast<unsigned long long>(due[i].ieee));
+        MeterLock l;
+        if (l.ok) g_meter.polled(due[i].ieee, now, kMeterIntervalMs);
+    }
+}
+
 void wake_task(void*) {
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Frames for a device that just woke come by notify; the meter tick
+        // needs the timeout.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(zhac_meter::kTickMs));
+        meter_tick();
+        if (!g_wake_mtx) continue;
         zhac_wake::Frame f{};
         for (;;) {
             bool got = false;
@@ -1761,14 +1868,27 @@ extern "C" void zhac_adapter_register_send(zhac_af_send_fn_t fn) {
     g_af_send = fn;
 }
 
-extern "C" void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn) {
-    if (!g_wake_mtx) g_wake_mtx = xSemaphoreCreateMutex();
-    if (g_wake_mtx && !g_wake_task &&
+namespace {
+// The wake task also runs the meter tick; whichever hook arrives first starts it.
+void ensure_worker() {
+    if (!g_wake_mtx)  g_wake_mtx  = xSemaphoreCreateMutex();
+    if (!g_meter_mtx) g_meter_mtx = xSemaphoreCreateMutex();
+    if (g_wake_mtx && g_meter_mtx && !g_wake_task &&
         zhac_task_create(wake_task, "TaskZhcWake", 6 * 1024, nullptr, 3, &g_wake_task) != pdPASS) {
         g_wake_task = nullptr;
-        ESP_LOGE(TAG, "[wake] task create failed -- frames for sleeping devices are not held");
+        ESP_LOGE(TAG, "[wake] task create failed -- sleeping-device holds and meter polls are off");
     }
+}
+}  // namespace
+
+extern "C" void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn) {
+    ensure_worker();
     g_is_sleepy = fn;
+}
+
+extern "C" void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn) {
+    ensure_worker();
+    g_poll_source = fn;
 }
 
 extern "C" void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk) {

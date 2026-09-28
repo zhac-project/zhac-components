@@ -122,6 +122,23 @@ void zhac_adapter_register_send(zhac_af_send_fn_t fn);
 typedef bool (*zhac_is_sleepy_fn_t)(uint64_t ieee);
 void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn);
 
+// Meter polling (src/meter_poll.hpp). Devices whose definition sets
+// `meter_poll` and that are mains-powered get their meter read every
+// CONFIG_ZHAC_METER_POLL_S seconds (0 = off) through the configure read hook
+// (`zhac_adapter_register_configure_ex`); the replies decode like reports.
+// The platform lists its devices through this hook: fill `out` for the
+// index-th pool entry and return true, false past the end. A pool entry that
+// must not be polled (removed, no model yet) is returned with ieee 0.
+typedef struct {
+    uint64_t ieee;
+    uint16_t nwk;
+    uint8_t  power_source;           // ZCL Basic 0x0007 as stored; 0 = unknown
+    char     model_id[34];
+    char     manufacturer_name[34];
+} zhac_poll_device_t;
+typedef bool (*zhac_poll_device_fn_t)(uint16_t index, zhac_poll_device_t* out);
+void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn);
+
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame
 // before invoking `zhac_adapter_try_decode`. Required so fz

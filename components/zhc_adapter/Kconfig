@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC zhc_adapter"
+
+config ZHAC_METER_POLL_S
+    int "Meter poll interval (s), 0 = off"
+    default 60
+    range 0 86400
+    help
+      Devices whose definition sets meter_poll (e.g. Tuya TS011F plugs that
+      never report power/energy) get their electrical measurement and/or
+      metering read every this many seconds, like zigbee2mqtt's
+      measurement_poll_interval (default 60). Mains-powered devices only.
+      0 turns polling off.
+
+endmenu

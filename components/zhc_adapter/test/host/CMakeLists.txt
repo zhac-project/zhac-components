@@ -17,3 +17,11 @@ add_executable(wake_queue_host_test
 target_include_directories(wake_queue_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_options(wake_queue_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME wake_queue COMMAND wake_queue_host_test)
+
+add_executable(meter_poll_host_test
+    test_meter_poll.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/meter_poll.cpp
+)
+target_include_directories(meter_poll_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+target_compile_options(meter_poll_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME meter_poll COMMAND meter_poll_host_test)

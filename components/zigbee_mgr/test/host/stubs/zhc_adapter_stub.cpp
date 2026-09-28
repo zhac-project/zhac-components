@@ -28,6 +28,8 @@ void     zhac_stub_reset() { g_last_invalidated_ieee = 0; g_invalidate_count = 0
 void zhac_adapter_init(void) {}
 void zhac_adapter_register_send(zhac_af_send_fn_t) {}
 void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t) {}
+zhac_poll_device_fn_t g_stub_poll_source = nullptr;
+void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn) { g_stub_poll_source = fn; }
 // Captured rather than discarded so a test can drive the REAL
 // zhc_shadow_bridge callback (which lives in an anonymous namespace and is
 // otherwise unreachable) exactly the way zhc_adapter would.

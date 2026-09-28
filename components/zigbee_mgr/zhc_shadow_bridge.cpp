@@ -138,8 +138,33 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
     mirror_battery_pct(ieee, attr);
 }
 
+// The device list meter polling walks (zhac_adapter_register_poll_source).
+// Lives here because this file is compiled on both radios (ZNP zigbee_mgr and
+// zhac-wired-core's zigbee_mgr override) and already bridges pool <-> adapter.
+bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
+    zigbee_pool_lock();
+    const bool more = index < pool_count();
+    if (more) {
+        const ZapDevice& d = pool_all()[index];
+        if (!zap_dev_is_removed(&d) && d.model_id[0]) {
+            out->ieee         = d.ieee_addr;
+            out->nwk          = d.nwk_addr;
+            out->power_source = d.power_source;
+            static_assert(sizeof(out->model_id) == sizeof(d.model_id));
+            static_assert(sizeof(out->manufacturer_name) == sizeof(d.manufacturer_name));
+            memcpy(out->model_id, d.model_id, sizeof(out->model_id));
+            memcpy(out->manufacturer_name, d.manufacturer_name, sizeof(out->manufacturer_name));
+        } else {
+            out->ieee = 0;
+        }
+    }
+    zigbee_pool_unlock();
+    return more;
+}
+
 }  // namespace
 
 extern "C" void zhc_shadow_bridge_register(void) {
     zhac_adapter_register_shadow(&zhc_shadow_update_cb);
+    zhac_adapter_register_poll_source(&zhc_poll_device_at);
 }
