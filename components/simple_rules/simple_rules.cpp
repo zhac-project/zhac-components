@@ -623,9 +623,16 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
                 fail();
                 break;
             }
-            uint32_t ms = (uint32_t)strtoul(a.arg1, nullptr, 10);
-            if (ms == 0) ms = 1;
+            const uint32_t ms = (uint32_t)strtoul(a.arg1, nullptr, 10);
             TimerHandle_t& tmr = s_timers[idx - 1];
+            // `timer <n> 0` stops timer n, as Tasmota's RuleTimer<n> 0 does:
+            // the motion recipe cancels its off-timer when motion comes back.
+            // It used to mean "fire in 1 ms". A timer that never ran has
+            // nothing to stop.
+            if (ms == 0) {
+                if (tmr && xTimerStop(tmr, 0) != pdPASS) fail();
+                break;
+            }
             // P1-T8: block-time-0 timer commands return pdFAIL on a full
             // timer command queue — previously ignored, so the rule's
             // timer action was silently lost. Warn (once per boot, this
@@ -722,8 +729,15 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
     case TriggerType::BOOT:       snprintf(what, sizeof(what), "System#Boot"); break;
     }
     const char* how = manual ? "run now" : "fired";
-    if (r.name[0]) ESP_LOGI(TAG, "rule '%s' %s (%s)", r.name, how, what);
-    else           ESP_LOGI(TAG, "rule #%u %s (%s)", (unsigned)r.rule_id, how, what);
+    char who[sizeof(r.name) + 8];
+    if (r.name[0]) snprintf(who, sizeof(who), "'%s'", r.name);
+    else           snprintf(who, sizeof(who), "#%u", (unsigned)r.rule_id);
+    // A timer or cron rule may run every few seconds: DEBUG, so it does not
+    // bury the log. Device, MQTT, event and manual runs stay at INFO.
+    if (!manual && (t.type == TriggerType::TIMER || t.type == TriggerType::TIME_CRON))
+        ESP_LOGD(TAG, "rule %s %s (%s)", who, how, what);
+    else
+        ESP_LOGI(TAG, "rule %s %s (%s)", who, how, what);
 }
 
 // Runs rule `id` (at `idx` when matched) from a copy taken under the lock, as

@@ -59,7 +59,9 @@ frames and reads via REST/WS — it never imports this header.
 |---|---|
 | `bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg)` / `_get_config(...)` | Read/write the full middleware config blob. Persisted to NVS on set. False means device not found. |
 | `bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t ms)` | Convenience setter for chatty devices (e.g. Tuya thermostats spamming ~10 msg/s). 0 disables. |
-| `bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t s)` | TTL for `occupancy=1` → auto-clear to `0` after `s` seconds. 0 disables. Range 10–3600 enforced by REST. |
+| `bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t s)` | The user's "no motion" interval: TTL for `occupancy=1` → auto-clear to `0` after `s` seconds, 0 = never. Marks it chosen (`DeviceConfig::occupancy_timeout_set`), so the definition default below no longer applies. Range checked by the callers (REST/WS). |
+| `bool device_shadow_set_occupancy_default(uint64_t ieee, uint16_t s)` | The device definition's default interval (z2m option `occupancy_timeout`, e.g. 90 s for PIRs that never report "no motion"), used while the user has chosen none. RAM only; `zhc_shadow_bridge` passes it with each occupancy report. |
+| `uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee)` / `device_shadow_occupancy_effective(cfg, default)` | The interval in force: the user's choice (0 = never), else the default. |
 
 ### Housekeeping
 

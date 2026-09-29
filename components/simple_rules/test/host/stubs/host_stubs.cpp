@@ -107,24 +107,40 @@ BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t s) {
     return pdTRUE;
 }
 
-// ── Timers: created but never fire ───────────────────────────────────────
+// ── Timers: created, started and stopped, but never fire ─────────────────
 
-struct StubTimer { void* id; };
+struct StubTimer { void* id; bool running; TickType_t period; };
+static StubTimer* s_timers_made[16];
+static int        s_timers_n = 0;
 
 TimerHandle_t xTimerCreate(const char* name, TickType_t period,
                            UBaseType_t auto_reload, void* timer_id,
                            TimerCallbackFunction_t cb) {
-    (void)name; (void)period; (void)auto_reload; (void)cb;
+    (void)name; (void)auto_reload; (void)cb;
     auto* t = static_cast<StubTimer*>(calloc(1, sizeof(StubTimer)));
-    if (t) t->id = timer_id;
+    if (t) { t->id = timer_id; t->period = period; }
+    if (t && s_timers_n < 16) s_timers_made[s_timers_n++] = t;
     return t;
 }
-BaseType_t xTimerStart(TimerHandle_t t, TickType_t ticks) { (void)t; (void)ticks; return pdTRUE; }
-BaseType_t xTimerReset(TimerHandle_t t, TickType_t ticks) { (void)t; (void)ticks; return pdTRUE; }
+BaseType_t xTimerStart(TimerHandle_t t, TickType_t ticks) { (void)ticks; if (t) t->running = true; return pdTRUE; }
+BaseType_t xTimerReset(TimerHandle_t t, TickType_t ticks) { (void)ticks; if (t) t->running = true; return pdTRUE; }
+BaseType_t xTimerStop(TimerHandle_t t, TickType_t ticks) { (void)ticks; if (t) t->running = false; return pdTRUE; }
+// FreeRTOS: changing the period of a dormant timer also starts it.
 BaseType_t xTimerChangePeriod(TimerHandle_t t, TickType_t period, TickType_t ticks) {
-    (void)t; (void)period; (void)ticks; return pdTRUE;
+    (void)ticks;
+    if (t) { t->period = period; t->running = true; }
+    return pdTRUE;
 }
 void* pvTimerGetTimerID(TimerHandle_t t) { return t ? t->id : nullptr; }
+
+bool stub_timer_running(void* timer_id, TickType_t* period) {
+    for (int i = 0; i < s_timers_n; i++) {
+        if (s_timers_made[i]->id != timer_id) continue;
+        if (period) *period = s_timers_made[i]->period;
+        return s_timers_made[i]->running;
+    }
+    return false;
+}
 
 // ── Tasks: recorded, never run (keeps task_cron out of the test) ─────────
 

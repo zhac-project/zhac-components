@@ -134,6 +134,14 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
             return;   // None / BytesRef / ObjectRef — not shadowable
     }
 
+    // A sensor that reports motion but never "no motion" gets its def's
+    // interval (z2m option occupancy_timeout) before the report arms the
+    // shadow's TTL. Passed with every occupancy report: the lookup is
+    // memoized, and a late identity (zigbee_identity) changes the def.
+    if (std::strcmp(attr.key, "occupancy") == 0) {
+        device_shadow_set_occupancy_default(
+            ieee, zhac_adapter_occupancy_timeout_default(snap.model_id, snap.manufacturer_name));
+    }
     device_shadow_process(&snap, &attr, 1);
     mirror_battery_pct(ieee, attr);
 }

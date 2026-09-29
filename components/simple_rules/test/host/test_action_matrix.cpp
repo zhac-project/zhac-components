@@ -21,6 +21,7 @@
 #include "event_bus.h"
 #include "zigbee_pool.h"
 #include "zcl_attribute.h"
+#include "freertos/timers.h"   // stub_timer_running (host shim)
 
 #include <cstdio>
 #include <cstring>
@@ -310,6 +311,37 @@ int main() {
         publish_attr_str("action", "single"); drain_attr();
         CHECK(stub_shadow_opt_count() == 0, "string event value skips a numeric expression");
         simple_rules_delete(id);
+    }
+
+    // ── 10. timer <n> 0 stops timer n (Tasmota's RuleTimer<n> 0) ─────────
+    // The motion recipe arms its off-timer when motion stops and cancels it
+    // when motion comes back. `0` used to mean "fire in 1 ms" instead.
+    {
+        void* const t3 = reinterpret_cast<void*>(static_cast<uintptr_t>(3));
+        void* const t4 = reinterpret_cast<void*>(static_cast<uintptr_t>(4));
+        const uint16_t arm  = add("t_arm",  "ON s1#lux=900 DO timer 3 60000 ENDON");
+        const uint16_t stop = add("t_stop", "ON s1#lux=901 DO timer 3 0 ENDON");
+        publish_attr("lux", VAL_INT, 900); drain_attr();
+        TickType_t period = 0;
+        CHECK(stub_timer_running(t3, &period) && period == pdMS_TO_TICKS(60000),
+              "timer 3 60000 runs timer 3 for 60 s");
+        publish_attr("lux", VAL_INT, 901); drain_attr();
+        CHECK(!stub_timer_running(t3, nullptr), "timer 3 0 stops timer 3");
+        publish_attr("lux", VAL_INT, 900); drain_attr();
+        CHECK(stub_timer_running(t3, &period) && period == pdMS_TO_TICKS(60000),
+              "a stopped timer arms again");
+
+        // Stopping a timer that never ran: nothing to stop, and no action error.
+        const uint16_t idle = add("t_idle", "ON s1#lux=902 DO timer 4 0 ENDON");
+        publish_attr("lux", VAL_INT, 902); drain_attr();
+        SimpleRuleStatus st[64];
+        const uint16_t n = simple_rules_status(st, 64);
+        bool clean = false;
+        for (uint16_t i = 0; i < n; i++)
+            if (st[i].rule_id == idle) clean = st[i].runs == 1 && st[i].last_skip[0] == '\0';
+        CHECK(clean && !stub_timer_running(t4, nullptr),
+              "timer 4 0 on a timer that never ran: a clean run, nothing started");
+        simple_rules_delete(arm); simple_rules_delete(stop); simple_rules_delete(idle);
     }
 
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",

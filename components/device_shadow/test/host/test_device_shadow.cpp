@@ -623,6 +623,57 @@ int main() {
               "rejected config → T27 fallback to defaults (debounce 0, last_seen_enabled true)");
     }
 
+    // ── G13: "no motion" interval — the definition's default until the user
+    //    picks one (z2m option occupancy_timeout) ─────────────────────────────
+    {
+        printf("\nG13 occupancy interval: default vs the user's choice\n");
+        DeviceConfig c{};
+        CHECK(device_shadow_occupancy_effective(c, 90) == 90, "effective: nothing chosen -> the default");
+        c.occupancy_timeout_s = 45;
+        CHECK(device_shadow_occupancy_effective(c, 90) == 45,
+              "effective: a nonzero value saved before the flag existed is the user's");
+        c.occupancy_timeout_s   = 0;
+        c.occupancy_timeout_set = 1;
+        CHECK(device_shadow_occupancy_effective(c, 90) == 0, "effective: an explicit 0 means never");
+
+        const uint64_t P = 0x0F50ULL;   // an Aqara-style PIR, never configured
+        ZapDevice pdev{};
+        pdev.ieee_addr = P;
+        ZclAttribute occ[1]{};
+        zcl_attr_set_int(&occ[0], "occupancy", 1, VAL_BOOL);
+        CHECK(device_shadow_set_occupancy_default(P, 90), "set_occupancy_default creates the entry");
+        CHECK(device_shadow_get_occupancy_timeout(P) == 90, "interval in force = the definition's default");
+        const int arms0 = g_stub_change_period_calls;
+        device_shadow_process(&pdev, occ, 1);
+        CHECK(g_stub_change_period_calls == arms0 + 1 && g_stub_last_period == pdMS_TO_TICKS(90000),
+              "occupancy=1 arms the TTL with the default (90 s)");
+        device_shadow_process(&pdev, occ, 1);
+        CHECK(g_stub_change_period_calls == arms0 + 2, "every occupancy=1 restarts it");
+
+        CHECK(device_shadow_set_occupancy_timeout(P, 30), "the user picks 30 s");
+        DeviceConfig got{};
+        CHECK(device_shadow_get_config(P, &got) && got.occupancy_timeout_set == 1 && got.occupancy_timeout_s == 30,
+              "the choice is recorded as the user's");
+        device_shadow_process(&pdev, occ, 1);
+        CHECK(g_stub_last_period == pdMS_TO_TICKS(30000) && device_shadow_get_occupancy_timeout(P) == 30,
+              "the user's interval wins over the default");
+
+        CHECK(device_shadow_set_occupancy_timeout(P, 0), "the user picks 0 (never)");
+        const int arms1 = g_stub_change_period_calls;
+        device_shadow_process(&pdev, occ, 1);
+        CHECK(g_stub_change_period_calls == arms1 && device_shadow_get_occupancy_timeout(P) == 0,
+              "an explicit 0 never arms, and the default does not come back");
+
+        const uint64_t Q = 0x0F51ULL;   // a sensor whose definition has no default
+        ZapDevice qdev{};
+        qdev.ieee_addr = Q;
+        const int arms2 = g_stub_change_period_calls;
+        device_shadow_process(&qdev, occ, 1);
+        CHECK(g_stub_change_period_calls == arms2 && device_shadow_get_occupancy_timeout(Q) == 0,
+              "no default and nothing chosen: no timer, as before");
+        CHECK(device_shadow_get_occupancy_timeout(0xDEADULL) == 0, "unknown device: 0");
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);
     return s_failures ? 1 : 0;
 }

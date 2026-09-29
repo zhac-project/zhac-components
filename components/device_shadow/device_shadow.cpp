@@ -359,6 +359,11 @@ static DeviceShadowEntry* find_or_create_entry(uint64_t ieee) {
     return e;
 }
 
+// The "no motion" interval in force: the user's choice, else the definition's.
+static uint16_t occupancy_interval(const DeviceShadowEntry* e) {
+    return device_shadow_occupancy_effective(e->config, e->occupancy_default_s);
+}
+
 // ── Forward declarations ─────────────────────────────────────────────────
 static void upsert_cache(DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_t count);
 
@@ -493,7 +498,7 @@ static void occupancy_timeout_cb(TimerHandle_t timer) {
 // sweep writes flash outside the lock.
 static void occupancy_apply_locked(DeviceShadowEntry* e) {
     e->occupancy_timeout_pending = false;
-    if (e->config.occupancy_timeout_s == 0) return;
+    if (occupancy_interval(e) == 0) return;
     // A fresh occupancy=1 report may have re-armed the TTL timer between the
     // timeout enqueue and this drain (the queue hop adds up to one sweep
     // period) — synthesizing occupancy=0 now would clobber live state. An
@@ -592,18 +597,18 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
     uint8_t n = shadow_pipeline_filter(&e->config, attrs, count, filtered, 32);
     if (n == 0) return;
 
-    if (e->config.occupancy_timeout_s > 0) {
+    if (const uint16_t occ_s = occupancy_interval(e); occ_s > 0) {
         for (uint8_t i = 0; i < n; i++) {
             if (strncmp(filtered[i].key, KEY_OCCUPANCY, ATTR_KEY_MAX) == 0
                 && filtered[i].int_val == 1) {
                 if (!e->occupancy_timer) {
                     e->occupancy_timer = xTimerCreate("occ_ttl",
-                        pdMS_TO_TICKS((uint32_t)e->config.occupancy_timeout_s * 1000UL),
+                        pdMS_TO_TICKS((uint32_t)occ_s * 1000UL),
                         pdFALSE, static_cast<void*>(e), occupancy_timeout_cb);
                 }
                 if (e->occupancy_timer) {
                     xTimerChangePeriod(e->occupancy_timer,
-                        pdMS_TO_TICKS((uint32_t)e->config.occupancy_timeout_s * 1000UL), 0);
+                        pdMS_TO_TICKS((uint32_t)occ_s * 1000UL), 0);
                     xTimerReset(e->occupancy_timer, 0);
                 }
                 break;
@@ -1215,7 +1220,8 @@ bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s) {
     DeviceShadowEntry* e = find_entry(ieee);
     if (!e) { xSemaphoreGive(s_mutex); return false; }
 
-    e->config.occupancy_timeout_s = timeout_s;
+    e->config.occupancy_timeout_s   = timeout_s;
+    e->config.occupancy_timeout_set = 1;   // the user's choice: the default no longer applies
 
     if (timeout_s == 0 && e->occupancy_timer) {
         xTimerDelete(e->occupancy_timer, 0);
@@ -1226,4 +1232,22 @@ bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s) {
     xSemaphoreGive(s_mutex);
     persist_config_commit(&cp);
     return true;
+}
+
+bool device_shadow_set_occupancy_default(uint64_t ieee, uint16_t timeout_s) {
+    if (!s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_or_create_entry(ieee);
+    if (e) e->occupancy_default_s = timeout_s;
+    xSemaphoreGive(s_mutex);
+    return e != nullptr;
+}
+
+uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee) {
+    if (!s_mutex) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    const DeviceShadowEntry* e = find_entry(ieee);
+    const uint16_t s = e ? occupancy_interval(e) : 0;
+    xSemaphoreGive(s_mutex);
+    return s;
 }

@@ -231,9 +231,10 @@ Host harness in `test/host/` (plain cmake + ctest, FreeRTOS/ESP shims) covers th
 - **2026-09 edge triggers + rule status.** Device-attribute rules fire on a
   change, seeded from the shadow on every (re)load (a Tuya contact sensor's
   4-hourly `contact=1` heartbeat used to re-fire its rule). Each run logs
-  `rule '<name>' fired (<dev>#<attr>=<value>)` at INFO and books runs / last
-  run / last skip reason; `simple_rules_status` + `simple_rules_run_now`.
-  Host test `test/host/test_edge_status.cpp`.
+  `rule '<name>' fired (<dev>#<attr>=<value>)` (INFO; DEBUG for timer and
+  cron runs) and books runs / last run / last skip reason;
+  `simple_rules_status` + `simple_rules_run_now`. `timer <n> 0` stops timer n
+  (Tasmota's `RuleTimer<n> 0`). Host test `test/host/test_edge_status.cpp`.
 - **2026-04-25 snapshot-then-exec pattern.** Both `dispatch_event`
   and `task_cron` now drop the rule mutex before action dispatch
   (LUA-F8 + SR-F8 + CC-F5 in `docs/FINDINGS.md`). Mutex acquire is

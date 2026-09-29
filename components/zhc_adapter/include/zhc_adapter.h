@@ -49,6 +49,12 @@ bool zhac_adapter_has_def(uint64_t ieee,
 uint8_t zhac_adapter_power_source_override(const char* model_id,
                                             const char* manufacturer_name);
 
+// The matched definition's default "no motion" interval in seconds (z2m
+// option `occupancy_timeout`: sensors that report motion but never "no
+// motion"), or 0 when the device isn't matched or its def offers none.
+uint16_t zhac_adapter_occupancy_timeout_default(const char* model_id,
+                                                const char* manufacturer_name);
+
 // Record the input/output cluster list parsed from a device's
 // Simple_Desc_rsp. Called once per endpoint during the interview.
 // Enables cluster-aware fallback exposes for devices that have no

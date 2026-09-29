@@ -50,8 +50,13 @@ struct __attribute__((packed)) DeviceConfig {
     uint8_t  debounce_ignore_count;    // number of entries in debounce_ignore[]
     char     filtered[DEVICE_CONFIG_FILTER_MAX][ATTR_KEY_MAX];
     char     debounce_ignore[DEVICE_CONFIG_FILTER_MAX][ATTR_KEY_MAX];
-    uint16_t occupancy_timeout_s;      // 0 = disabled, range 10–3600
-    uint8_t  _cfg_pad[2];              // alignment padding
+    uint16_t occupancy_timeout_s;      // "no motion" interval chosen by the user, 0 = never
+    // 1 = occupancy_timeout_s was chosen by the user; 0 = not chosen, so the
+    // device definition's default applies (device_shadow_set_occupancy_default).
+    // Was padding: configs saved before it read 0, and a nonzero interval in
+    // them could only have come from the user, so it still counts as chosen.
+    uint8_t  occupancy_timeout_set;
+    uint8_t  _cfg_pad;                 // alignment padding
 };
 
 // ── Runtime-only pending state for debounce (not persisted) ──────────────
@@ -79,6 +84,8 @@ struct DeviceShadowEntry {
     bool          cfg_crc_valid;    // F26: true once cfg_crc reflects a persisted config
     bool          attr_overflow_logged; // T27: once-per-device log gate for the
                                         // 32-slot attr cap (avoids per-frame spam)
+    uint16_t      occupancy_default_s;  // runtime-only: the definition's "no motion"
+                                        // default (device_shadow_set_occupancy_default)
 };
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -153,9 +160,28 @@ void device_shadow_clear_attrs(uint64_t ieee);
 // FILTER (no emit involved, but keep parity with the other mutating APIs).
 void device_shadow_remove(uint64_t ieee);
 
-// Set per-device occupancy timeout. 0 = disabled.
-// Returns false if device not found.
+// Set per-device occupancy timeout: the user's choice of "no motion"
+// interval, 0 = never clear occupancy. Marks it as chosen, so the device
+// definition's default no longer applies. Returns false if device not found.
 bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s);
+
+// "No motion" interval of a sensor that reports motion but never "no motion"
+// (z2m option occupancy_timeout): the shadow synthesizes occupancy = false
+// this many seconds after the last occupancy = true. `timeout_s` is the device
+// definition's default (0 = it has none), used while the user has not chosen
+// one. RAM only: the decode path (zhc_shadow_bridge) passes it with each
+// occupancy report. Creates the entry, like device_shadow_set_config.
+bool device_shadow_set_occupancy_default(uint64_t ieee, uint16_t timeout_s);
+
+// The interval in force for `ieee`: the user's choice, else the default above
+// (0 = none, or unknown device).
+uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee);
+
+// The rule both of the above apply: the user's value once chosen (0 = never),
+// else `default_s`. For callers that hold a config and know the default.
+inline uint16_t device_shadow_occupancy_effective(const DeviceConfig& c, uint16_t default_s) {
+    return (c.occupancy_timeout_set || c.occupancy_timeout_s) ? c.occupancy_timeout_s : default_s;
+}
 
 // Set per-device debounce window. 0 = disabled (every attr publishes
 // immediately). Non-zero = coalesce repeated attrs by last-write-wins

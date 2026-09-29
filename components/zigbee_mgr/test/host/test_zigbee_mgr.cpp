@@ -689,6 +689,26 @@ int main() {
         const uint16_t before = pool_count();
         g_stub_shadow_fn(0xFEEDFACEULL, "battery", 2 /*Uint*/, 0, 50, 0.0f, false, nullptr);
         CHECK(pool_count() == before, "battery for an unknown device adds no pool entry");
+
+        // "No motion" default: an occupancy report carries the matched def's
+        // interval into the shadow (the stub adapter gives the Aqara PIR 90 s),
+        // so a sensor that never reports "no motion" gets one without setup.
+        const uint64_t kPirIeee = 0x2222000000000014ULL;
+        ZapDevice* pir = pool_add();
+        pir->ieee_addr = kPirIeee;
+        pir->nwk_addr  = 0x2014;
+        std::snprintf(pir->model_id, sizeof(pir->model_id), "%s", "lumi.sensor_motion.aq2");
+        g_stub_shadow_fn(kPirIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
+        CHECK(device_shadow_get_occupancy_timeout(kPirIeee) == 90,
+              "an occupancy report passes the def's 90 s default to the shadow");
+        const uint64_t kPlainIeee = 0x2222000000000015ULL;
+        ZapDevice* plain = pool_add();
+        plain->ieee_addr = kPlainIeee;
+        plain->nwk_addr  = 0x2015;
+        std::snprintf(plain->model_id, sizeof(plain->model_id), "%s", "TS0202");
+        g_stub_shadow_fn(kPlainIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
+        CHECK(device_shadow_get_occupancy_timeout(kPlainIeee) == 0,
+              "a def without the option gets no interval (reports no-motion itself)");
     }
 
     // ── G13: meter-poll device source (zhc_shadow_bridge) ───────────────

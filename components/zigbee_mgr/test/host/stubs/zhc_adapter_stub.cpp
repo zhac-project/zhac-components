@@ -14,6 +14,8 @@
 #include "zhc_adapter.h"
 #include "znp_stub.h"   // spy accessor declarations
 
+#include <cstring>
+
 namespace {
 uint64_t g_last_invalidated_ieee = 0;
 int      g_invalidate_count      = 0;
@@ -56,6 +58,12 @@ void zhac_adapter_invalidate_def_cache(uint64_t ieee) {
 bool zhac_adapter_has_def(uint64_t, const char*, const char*) { return false; }
 
 uint8_t zhac_adapter_power_source_override(const char*, const char*) { return 0; }
+
+// One matched definition with a "no motion" default (z2m occupancy_timeout):
+// the Aqara PIR, 90 s. Everything else has none.
+uint16_t zhac_adapter_occupancy_timeout_default(const char* model_id, const char*) {
+    return (model_id && std::strcmp(model_id, "lumi.sensor_motion.aq2") == 0) ? 90 : 0;
+}
 
 bool zhac_adapter_try_decode(uint64_t, const char*, const char*, uint16_t,
                              uint16_t, uint8_t, uint8_t, const uint8_t*,

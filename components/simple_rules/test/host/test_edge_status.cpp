@@ -22,6 +22,7 @@
 #include "event_bus.h"
 #include "zigbee_pool.h"
 #include "zcl_attribute.h"
+#include "esp_log.h"   // stub_log_count (host shim)
 
 #include <cstdio>
 #include <cstring>
@@ -242,7 +243,7 @@ int main() {
 
     // ── 7. Non-device triggers keep today's behaviour (every event) ──────
     add("ev", "ON Event#go DO script.run ev ENDON");
-    add("tm", "ON Rules#Timer=2 DO script.run tm ENDON");
+    const uint16_t tm = add("tm", "ON Rules#Timer=2 DO script.run tm ENDON");
     add("mq", "ON Mqtt#zhac/x DO script.run mq ENDON");
     add("bt", "ON System#Boot DO script.run bt ENDON");
     add("wild", "ON cube DO script.run wild ENDON");
@@ -329,6 +330,21 @@ int main() {
     simple_rules_enable(rn2, false);
     CHECK(simple_rules_run_now(rn2) && fires("rn2") == 2, "Run now also runs a disabled rule");
     CHECK(!simple_rules_run_now(9999), "Run now of an unknown rule id fails");
+
+    // ── 10. Log level: timer and cron runs at DEBUG, the rest at INFO ─────
+    // A `Time#Cron=*/5 * * * * *` rule would put a line in the log every 5 s.
+    // Cron runs share the timer's branch; the cron task does not run on host.
+    CHECK(stub_log_count('D', "rule 'tm' fired (Rules#Timer=2)") == 2 &&
+          stub_log_count('I', "rule 'tm' fired") == 0,
+          "log: a timer-triggered run logs at DEBUG");
+    CHECK(stub_log_count('I', "rule 'heartbeat' fired (door#contact=1)") == 1 &&
+          stub_log_count('I', "rule 'mq' fired (Mqtt#zhac/x=on)") == 2 &&
+          stub_log_count('I', "rule 'ev' fired (Event#go)") == 2,
+          "log: device, MQTT and event runs stay at INFO");
+    s = status_of(tm);
+    CHECK(s && s->runs == 2, "log: a DEBUG-logged timer run still counts in the status");
+    CHECK(simple_rules_run_now(tm) && stub_log_count('I', "rule 'tm' run now (Rules#Timer=2)") == 1,
+          "log: Run now of a timer rule logs at INFO");
 
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
