@@ -1881,7 +1881,10 @@ bool dispatch_and_send(uint64_t ieee,
     }
     // A write z2m makes on a fixed endpoint goes there whatever the caller
     // named: a wall switch's operation_mode_right to its right button's
-    // endpoint, a legacy switch's genBasic write to endpoint 1.
+    // endpoint, a legacy switch's genBasic write to endpoint 1. This also
+    // overrides an endpoint_map suffix and default_endpoint, as z2m's
+    // genBasic writer ignores the key's endpoint: the converter's endpoint is
+    // the one z2m uses for that key. (No definition has both today.)
     if (r.endpoint) target_ep = r.endpoint;
 
     // A Tuya dataRequest / sendData carries its own 2-byte sequence after the
