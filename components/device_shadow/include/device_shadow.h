@@ -99,13 +99,21 @@ void device_shadow_init();
 
 // Restore shadow entries (config + attrs + last_seen) for each device
 // in the supplied pool slice. Caller must hold the pool lock for the
-// duration of the call (the pool array is iterated in place). Table
-// mutation is serialised internally against the (already-running)
+// duration of the call (the pool array is iterated in place). A device's
+// last_seen is raised in place to the persisted `_last_seen` (the time of
+// its last report) when that is newer and was taken with a set clock.
+// Table mutation is serialised internally against the (already-running)
 // task_shadow housekeeping loop; NVS reads and the DEVICE_JOIN event
 // fired per restored device both happen outside the shadow lock.
 // Boot-path only: must not run concurrently with itself. Returns the
 // number of entries restored.
-uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count);
+uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count);
+
+// Write every device's unsaved attrs now, without the NVS_MIN_INTERVAL_S
+// (300 s) wait the sweep keeps. For the shutdown handler and OTA: a graceful
+// restart otherwise drops up to 5 min of state changes per device. Blocks on
+// flash writes; task context only.
+void device_shadow_flush_now();
 
 // Called by zigbee_mgr / zhc_adapter_shadow_bridge to register a decoded
 // attribute against a device.

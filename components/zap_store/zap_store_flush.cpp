@@ -16,6 +16,7 @@
 // Power-loss contract:
 //   - LOW-priority data can lose up to 300 s on a hard crash.
 //   - HIGH-priority data can lose up to 5 s.
+//   - last_seen (side-car, zap_store.h) can lose up to 10 min.
 //   - Graceful reboots + OTA register shutdown handlers to flush first.
 //     flush_now()/flush_device() are durability barriers: they only
 //     return once in-flight NVS writes have settled, so "flushed" means
@@ -36,6 +37,9 @@ static const char* TAG = "zap_flush";
 static constexpr uint32_t FLUSH_TICK_MS   = 1000;
 static constexpr uint32_t HIGH_MAX_AGE_MS = 5 * 1000;
 static constexpr uint32_t LOW_MAX_AGE_MS  = 300 * 1000;
+// last_seen side-car cadence: 12 B per device, written only when a value
+// changed — for 18 devices ~9 NVS entries (288 B) per save, ≤ 41 KB a day.
+static constexpr uint32_t LAST_SEEN_PERIOD_MS = 10 * 60 * 1000;
 static constexpr size_t   DIRTY_CAP       = 64;  // concurrent dirty entries
 static constexpr uint32_t FLUSH_WAIT_POLL_MS = 10;    // barrier poll period
 // Barrier upper bound — ≫ worst-case NVS commit incl. page GC (tens of
@@ -267,6 +271,7 @@ bool zap_store_flush_device(uint64_t ieee) {
 }
 
 void zap_store_flush_now() {
+    zap_store_save_last_seen(s_snapshot);
     if (!s_mtx) return;
     // Two bounded passes. Pass 1 flushes everything DIRTY; the barrier then
     // settles writes owned by other tasks (tick task mid-write when we were
@@ -291,10 +296,12 @@ void zap_store_flush_now() {
 }
 
 static void flush_task(void*) {
-    ESP_LOGI(TAG, "flush task started tick=%lums high=%lums low=%lums",
+    ESP_LOGI(TAG, "flush task started tick=%lums high=%lums low=%lums last_seen=%lums",
              (unsigned long)FLUSH_TICK_MS,
              (unsigned long)HIGH_MAX_AGE_MS,
-             (unsigned long)LOW_MAX_AGE_MS);
+             (unsigned long)LOW_MAX_AGE_MS,
+             (unsigned long)LAST_SEEN_PERIOD_MS);
+    uint32_t last_seen_saved_ms = now_ms();
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(FLUSH_TICK_MS));
         const uint32_t now = now_ms();
@@ -312,6 +319,11 @@ static void flush_task(void*) {
         }
         xSemaphoreGive(s_mtx);
         for (size_t k = 0; k < due_n; k++) flush_slot(due[k]);
+
+        if (now - last_seen_saved_ms >= LAST_SEEN_PERIOD_MS) {
+            last_seen_saved_ms = now;
+            zap_store_save_last_seen(s_snapshot);
+        }
     }
 }
 

@@ -26,6 +26,7 @@
 static std::map<std::string, std::vector<uint8_t>> g_blobs;
 static std::map<std::string, uint16_t>             g_u16;
 static std::map<std::string, uint8_t>              g_u8;
+static std::map<std::string, int>                  g_blob_writes;   // flash-wear probe, never reset
 
 esp_err_t nvs_open(const char*, nvs_open_mode_t, nvs_handle_t* out) { *out = 1; return ESP_OK; }
 esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
@@ -34,6 +35,7 @@ void      nvs_close(nvs_handle_t) {}
 esp_err_t nvs_set_blob(nvs_handle_t, const char* key, const void* val, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(val);
     g_blobs[key] = std::vector<uint8_t>(p, p + len);
+    g_blob_writes[key]++;
     return ESP_OK;
 }
 esp_err_t nvs_get_blob(nvs_handle_t, const char* key, void* out, size_t* len) {
@@ -107,3 +109,7 @@ void vTaskDelay(TickType_t) {}
 // ── Test helpers ───────────────────────────────────────────────────────────
 extern "C" void nvs_stub_reset(void)            { g_blobs.clear(); g_u16.clear(); g_u8.clear(); }
 extern "C" void nvs_stub_set_schema(uint16_t v) { g_u16["schema_ver"] = v; }
+extern "C" int  nvs_stub_blob_writes(const char* key) {
+    auto it = g_blob_writes.find(key);
+    return it == g_blob_writes.end() ? 0 : it->second;
+}

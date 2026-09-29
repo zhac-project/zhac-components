@@ -107,6 +107,21 @@ void zap_store_flush_now();
 // not settle within the bounded wait.
 bool zap_store_flush_device(uint64_t ieee);
 
+// ── last_seen side-car ───────────────────────────────────────────────────
+//
+// The radio updates ZapDevice.last_seen in RAM on every frame, and the 522 B
+// record is only rewritten with other changes, so a reboot used to reload
+// last_seen as of that rewrite (often the previous boot). One small blob
+// ("lseen": 12 B per device, ieee + last_seen) carries it instead:
+// zap_store_load_devices() raises each record to it, never lowers it.
+//
+// Written from the live values `snap` returns (the callback installed with
+// zap_store_set_snapshot_cb), only when one changed, and only values taken
+// with a set clock (zap_clock.h). The flush task calls it every 10 min and
+// zap_store_flush_now() on a graceful restart / OTA, so a hard reset loses at
+// most 10 min. Returns false on an NVS or allocation failure.
+bool zap_store_save_last_seen(ZapStoreSnapshotCb snap);
+
 // ── Uplink selector ──────────────────────────────────────────────────────
 //
 // Runtime choice of which cloud uplink connects: an existing configured

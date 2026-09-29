@@ -22,13 +22,16 @@
 //     restore_from_pool rehydrates config + attrs from seeded NVS blobs; the
 //     F26/T27 CRC guards reject a corrupt attr / config blob on load
 //
+//   • last_seen: restore raises ZapDevice.last_seen to the persisted
+//     _last_seen (never lowers it, ignores pre-clock values, rewrites no
+//     record); process injects no _last_seen before the clock is set
+//   • flush_now writes unsaved attrs synchronously (shutdown / OTA path)
+//
 // NOT host-testable (documented, timer/task driven — the FreeRTOS timer service
 // task and task_shadow sweep do not exist on the host):
 //   • debounce/occupancy TIMER FIRING (synthetic occupancy=0 on TTL expiry,
 //     the sweep's deferred attr-blob NVS write). We characterize the arm/disarm
 //     bookkeeping and the flush-on-config-change path instead.
-//   • the restore→_last_seen→zap_store_mark_dirty branch (firmware wiring;
-//     device_shadow only links zap_store to resolve the symbol).
 //
 // Characterization only — asserts the component's ACTUAL behavior; it never
 // modifies device_shadow. A failing CHECK means a prediction was wrong (fix the
@@ -44,6 +47,19 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
+
+// device_shadow reads the wall clock with time(). This definition replaces
+// libc's for the whole test binary, so a test can stand before SNTP has set
+// the clock (a hub after power-on counts from 1970). 0 = the real clock.
+static time_t g_fake_now = 0;
+extern "C" time_t time(time_t* t) noexcept {
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    const time_t v = g_fake_now ? g_fake_now : ts.tv_sec;
+    if (t) *t = v;
+    return v;
+}
 
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                              \
@@ -142,6 +158,27 @@ static bool read_cfg_blob(uint64_t ieee, DeviceConfig* out) {
     return true;
 }
 
+// Find `key` in the attr blob device_shadow wrote for `ieee` (false: no blob,
+// or the key is not in it).
+static bool read_attr_blob(uint64_t ieee, const char* key, ShadowAttr* out) {
+    nvs_handle_t h;
+    nvs_open("zap_shadow", NVS_READWRITE, &h);
+    char k[16];
+    shadow_key(k, 'a', ieee);
+    uint8_t buf[sizeof(TestShadowBlobHdr) + 32 * sizeof(ShadowAttr)];
+    size_t len = sizeof(buf);
+    esp_err_t e = nvs_get_blob(h, k, buf, &len);
+    nvs_close(h);
+    if (e != ESP_OK || len < sizeof(TestShadowBlobHdr)) return false;
+    const auto* hdr = reinterpret_cast<const TestShadowBlobHdr*>(buf);
+    for (uint8_t i = 0; i < hdr->count; i++) {
+        ShadowAttr a;
+        memcpy(&a, buf + sizeof(TestShadowBlobHdr) + i * sizeof(ShadowAttr), sizeof(a));
+        if (strncmp(a.key, key, ATTR_KEY_MAX) == 0) { *out = a; return true; }
+    }
+    return false;
+}
+
 // ── Small helpers ───────────────────────────────────────────────────────────
 static bool keyeq(const char* a, const char* b) { return strncmp(a, b, ATTR_KEY_MAX) == 0; }
 
@@ -181,7 +218,7 @@ int main() {
     // it spawns is a no-op on the host (see stubs/freertos/task.h).
     device_shadow_init();
     event_bus_init();   // publishes with zero subscribers are safe no-ops
-    zap_store_init();   // linked to resolve zap_store_mark_dirty (restore path)
+    zap_store_init();   // linked so G14 can see that restore writes no device record
 
     // ── G1: update_optimistic → get_attr/get_attrs round-trip ──────────────
     {
@@ -672,6 +709,94 @@ int main() {
         CHECK(g_stub_change_period_calls == arms2 && device_shadow_get_occupancy_timeout(Q) == 0,
               "no default and nothing chosen: no timer, as before");
         CHECK(device_shadow_get_occupancy_timeout(0xDEADULL) == 0, "unknown device: 0");
+    }
+
+    // ── G14: restore puts the persisted _last_seen back on the device ──────
+    // The shadow saves the time of each device's last report with its attrs.
+    // Restore used to copy it into a stack ZapDevice handed to
+    // zap_store_mark_dirty, which keeps only the IEEE and later saves the LIVE
+    // record: the value never reached the pool, and every device record was
+    // rewritten 300 s after every boot for nothing.
+    const uint32_t T0 = 1790000000u;   // 2026-09-21, a clock SNTP has set
+    {
+        printf("\nG14 restore: _last_seen -> ZapDevice.last_seen\n");
+        nvs_stub_reset();
+        const uint64_t L = 0x0F60ULL;
+        ShadowAttr la[2] = {
+            make_attr("temperature", VAL_FLOAT, 2150, 7),
+            make_attr("_last_seen",  VAL_INT, (int32_t)(T0 + 3600), 7),
+        };
+        seed_attr_blob(L, la, 2, false);
+        ZapDevice lp{};
+        lp.ieee_addr = L;
+        lp.last_seen = T0;                 // the record's own, older value
+        device_shadow_restore_from_pool(&lp, 1);
+        CHECK(lp.last_seen == T0 + 3600, "restore raises last_seen to the newer _last_seen");
+
+        nvs_handle_t h;
+        nvs_open("zap_v0", NVS_READWRITE, &h);   // the stub is namespace-agnostic
+        ZapDevice rec{};
+        size_t sz = sizeof(rec);
+        CHECK(nvs_get_blob(h, "d0000", &rec, &sz) == ESP_ERR_NVS_NOT_FOUND,
+              "restore rewrites no device record");
+        nvs_close(h);
+
+        const uint64_t M = 0x0F61ULL;
+        ShadowAttr ma = make_attr("_last_seen", VAL_INT, 30, 1);   // 1970 + 30 s
+        seed_attr_blob(M, &ma, 1, false);
+        ZapDevice mp{};
+        mp.ieee_addr = M;
+        mp.last_seen = T0;
+        device_shadow_restore_from_pool(&mp, 1);
+        CHECK(mp.last_seen == T0, "a _last_seen taken before the clock was set is ignored");
+
+        const uint64_t O = 0x0F62ULL;
+        ShadowAttr oa = make_attr("_last_seen", VAL_INT, (int32_t)(T0 - 100), 1);
+        seed_attr_blob(O, &oa, 1, false);
+        ZapDevice op{};
+        op.ieee_addr = O;
+        op.last_seen = T0;
+        device_shadow_restore_from_pool(&op, 1);
+        CHECK(op.last_seen == T0, "an older _last_seen never lowers it");
+    }
+
+    // ── G15: no _last_seen from a clock that is not set ────────────────────
+    {
+        printf("\nG15 process: _last_seen only with a set clock\n");
+        const uint64_t N = 0x0F70ULL;
+        ZapDevice nd{};
+        nd.ieee_addr = N;
+        ZclAttribute na[1]{};
+        zcl_attr_set_int(&na[0], "state", 1, VAL_BOOL);
+        ShadowAttr o{};
+
+        g_fake_now = 25;                   // 25 s after power-on, no SNTP yet
+        device_shadow_process(&nd, na, 1);
+        CHECK(!device_shadow_get_attr(N, "_last_seen", &o), "no _last_seen from a 1970 clock");
+
+        g_fake_now = T0;
+        device_shadow_process(&nd, na, 1);
+        CHECK(device_shadow_get_attr(N, "_last_seen", &o) && o.int_val == (int32_t)T0,
+              "clock set: _last_seen = now");
+        g_fake_now = 0;
+    }
+
+    // ── G16: flush_now writes unsaved attrs (shutdown handler / OTA) ───────
+    // The sweep writes a device at most every NVS_MIN_INTERVAL_S (300 s), so a
+    // restart used to drop up to 5 min of state changes per device.
+    {
+        printf("\nG16 flush_now\n");
+        nvs_stub_reset();
+        const uint64_t F = 0x0F80ULL;
+        ZapDevice fd{};
+        fd.ieee_addr = F;
+        ZclAttribute fa[1]{};
+        zcl_attr_set_int(&fa[0], "state", 1, VAL_BOOL);
+        device_shadow_process(&fd, fa, 1); // dirty; the sweep never runs here
+        ShadowAttr o{};
+        CHECK(!read_attr_blob(F, "state", &o), "a new report waits for the sweep");
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(F, "state", &o) && o.int_val == 1, "flush_now writes it");
     }
 
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);

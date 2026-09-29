@@ -23,6 +23,9 @@
 //   • writeback: dropped when snapshot reports gone     flush_now + snapshot cb
 //   • uplink selector: absent-key default, round-trip,
 //     out-of-range fallback                             zhac_uplink_get / zhac_uplink_set
+//   • last_seen side-car: survives restart + reset,
+//     writes only on change, pre-clock never stored,
+//     never lowers a newer record value                 save_last_seen / flush_now / load_devices
 //
 // Characterization only — asserts the component's ACTUAL behavior; it never
 // modifies zap_store. A failing CHECK here means a prediction was wrong (fix
@@ -46,6 +49,7 @@ static int s_failures = 0;
 // Test-side hooks into the NVS stub (defined in stubs/nvs_stub.cpp).
 extern "C" void nvs_stub_reset(void);
 extern "C" void nvs_stub_set_schema(uint16_t v);
+extern "C" int  nvs_stub_blob_writes(const char* key);   // nvs_set_blob count per key
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 static ZapDevice make_dev(uint64_t ieee, uint16_t nwk, const char* name) {
@@ -343,6 +347,95 @@ int main() {
         nvs_close(h);
         CHECK(zhac_uplink_get() == ZHAC_UPLINK_CUSTOM_MQTT,
               "out-of-range stored value falls back to CUSTOM_MQTT");
+    }
+
+    // ── G14: last_seen survives a restart and a reset ──────────────────────
+    // The radio updates ZapDevice.last_seen in RAM on every frame; the 522 B
+    // record reaches flash only with other changes (interview, rename,
+    // battery). A reboot used to reload the last_seen of that last rewrite:
+    // "seen 2 min ago" before a flash, "seen 30 h ago" after it.
+    const uint32_t T0 = 1790000000u;   // 2026-09-21, a clock SNTP has set
+    {
+        fresh_store();
+        g_live.clear();
+        ZapDevice x = make_dev(0x0A0AULL, 0x1A1A, "sensor");
+        x.last_seen = T0;
+        (void)zap_store_save_device(&x);   // the record, as of its last rewrite
+        x.last_seen = T0 + 7200;           // heard two hours later: RAM only
+        g_live[x.ieee_addr] = x;
+
+        zap_store_flush_now();             // graceful restart / OTA
+        ZapDevice pool[4]{};
+        uint16_t n = zap_store_load_devices(pool, 4);
+        CHECK(n == 1 && pool[0].last_seen == T0 + 7200,
+              "restart: last_seen reloads as the RAM value, not the record's");
+
+        // Periodic save, then an ungraceful reset (USB flash, power cut).
+        g_live[x.ieee_addr].last_seen = T0 + 9000;
+        const int rec0 = nvs_stub_blob_writes("d0000");
+        CHECK(zap_store_save_last_seen(test_snapshot), "periodic save returns true");
+        n = zap_store_load_devices(pool, 4);
+        CHECK(n == 1 && pool[0].last_seen == T0 + 9000,
+              "reset: last_seen reloads as of the last periodic save");
+        CHECK(nvs_stub_blob_writes("d0000") == rec0,
+              "last_seen alone never rewrites the 522 B record");
+    }
+
+    // ── G15: the periodic save writes only when a value changed ────────────
+    {
+        const int w0 = nvs_stub_blob_writes("lseen");
+        CHECK(zap_store_save_last_seen(test_snapshot), "save with nothing new returns true");
+        CHECK(nvs_stub_blob_writes("lseen") == w0, "nothing new: no flash write");
+        g_live[0x0A0AULL].last_seen = T0 + 9060;
+        (void)zap_store_save_last_seen(test_snapshot);
+        CHECK(nvs_stub_blob_writes("lseen") == w0 + 1, "one device heard: one write");
+        (void)zap_store_save_last_seen(test_snapshot);
+        CHECK(nvs_stub_blob_writes("lseen") == w0 + 1, "and none after it");
+    }
+
+    // ── G16: pre-clock values never reach flash; the side-car only raises ──
+    {
+        fresh_store();
+        g_live.clear();
+        ZapDevice y = make_dev(0x0B0BULL, 0x2B2B, "y");     // seen with a set clock
+        ZapDevice z = make_dev(0x0C0CULL, 0x3C3C, "z");     // never seen with one
+        y.last_seen = T0;
+        z.last_seen = 0;
+        (void)zap_store_save_device(&y);
+        (void)zap_store_save_device(&z);
+        g_live[y.ieee_addr] = y;
+        g_live[z.ieee_addr] = z;
+        g_live[z.ieee_addr].last_seen = 42;                 // 1970 + 42 s: clock not set
+        (void)zap_store_save_last_seen(test_snapshot);
+
+        nvs_handle_t h;
+        (void)nvs_open("zap_v0", NVS_READWRITE, &h);
+        size_t len = 0;
+        const bool have = nvs_get_blob(h, "lseen", nullptr, &len) == ESP_OK;
+        CHECK(have && len == 12, "side-car holds one 12 B row: the pre-clock device has none");
+
+        ZapDevice pool[4]{};
+        uint16_t n = zap_store_load_devices(pool, 4);
+        bool z_ok = false;
+        for (uint16_t i = 0; i < n; i++) if (pool[i].ieee_addr == z.ieee_addr) z_ok = pool[i].last_seen == 0;
+        CHECK(n == 2 && z_ok, "a pre-clock value is never loaded back");
+
+        // A record rewritten after the side-car's save (rename, battery) is newer.
+        y.last_seen = T0 + 500;
+        (void)zap_store_save_device(&y);
+        n = zap_store_load_devices(pool, 4);
+        bool y_ok = false;
+        for (uint16_t i = 0; i < n; i++) if (pool[i].ieee_addr == y.ieee_addr) y_ok = pool[i].last_seen == T0 + 500;
+        CHECK(y_ok, "an older side-car value never lowers a newer record");
+
+        // A side-car of the wrong size is ignored, not half-read.
+        const uint8_t junk[5] = {1, 2, 3, 4, 5};
+        (void)nvs_set_blob(h, "lseen", junk, sizeof(junk));
+        nvs_close(h);
+        n = zap_store_load_devices(pool, 4);
+        y_ok = false;
+        for (uint16_t i = 0; i < n; i++) if (pool[i].ieee_addr == y.ieee_addr) y_ok = pool[i].last_seen == T0 + 500;
+        CHECK(n == 2 && y_ok, "a malformed side-car is ignored");
     }
 
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);

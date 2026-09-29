@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "device_shadow.h"
 #include "event_bus.h"
-#include "zap_store.h"
+#include "zap_clock.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"   // EXT_RAM_BSS_ATTR — park the big CRC scratch in PSRAM
 #include "esp_log.h"
@@ -834,13 +834,13 @@ void device_shadow_init() {
     ESP_LOGI(TAG, "device_shadow init OK");
 }
 
-uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) {
+uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
     // Pre-fix (:500) this mutated s_shadow/s_count and loaded through the
     // shared s_attr_blob scratch with NO lock, racing task_shadow (spawned
     // earlier in init) which iterates the table every SWEEP_PERIOD_MS. Now each
     // device's NVS reads happen OUTSIDE s_mutex into a boot-only scratch
     // (leaf-lock rule), the table install goes under the lock, and the
-    // DEVICE_JOIN publish + zap_store_mark_dirty run after release.
+    // DEVICE_JOIN publish runs after release.
     // Spawning task_shadow after restore instead was rejected: restore is
     // invoked by firmware after init() returns, so reordering would need a
     // split init/start API rippling through both firmware cores.
@@ -853,7 +853,7 @@ uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) 
 
     uint16_t restored = 0;
     for (uint16_t i = 0; i < count; i++) {
-        const ZapDevice* d = &pool[i];
+        ZapDevice* d = &pool[i];
 
         bool has_cfg = nvs_load_config(d->ieee_addr, &sc.cfg);
         uint32_t cfg_crc = 0;
@@ -866,9 +866,7 @@ uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) 
         uint8_t ac = 0;
         bool has_attrs = nvs_load_attrs(d->ieee_addr, sc.attrs, &ac);
 
-        ZapDevice patched{};
-        bool patch_last_seen = false;
-
+        uint32_t seen = 0;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         DeviceShadowEntry* e = find_or_create_entry(d->ieee_addr);
         if (!e) {
@@ -884,20 +882,20 @@ uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) 
             memcpy(e->attrs, sc.attrs, (size_t)ac * sizeof(ShadowAttr));
             e->attr_count = ac;
         }
-        // Restore last_seen from synthetic attr → ZapDevice. Deferred via
-        // mark_dirty(LOW) so the flush task batches the write outside the
-        // boot critical path.
+        // The time of the device's last report, saved with its attrs.
         for (uint8_t j = 0; j < e->attr_count; j++) {
             if (strncmp(e->attrs[j].key, KEY_LAST_SEEN, ATTR_KEY_MAX) == 0) {
-                patched = *d;
-                patched.last_seen = (uint32_t)e->attrs[j].int_val;
-                patch_last_seen = true;
+                seen = (uint32_t)e->attrs[j].int_val;
                 break;
             }
         }
         xSemaphoreGive(s_mutex);
 
-        if (patch_last_seen) zap_store_mark_dirty(&patched, ZAP_PERSIST_LOW);
+        // Onto the pool record itself (the caller holds the pool lock) when it
+        // is newer. This used to go to zap_store_mark_dirty on a stack copy,
+        // which keeps only the IEEE and later saves the LIVE record: the value
+        // never arrived, and every record was rewritten 300 s after each boot.
+        if (zap_clock_is_set(seen) && seen > d->last_seen) d->last_seen = seen;
 
         Event ev{};
         ev.type = EventType::DEVICE_JOIN;
@@ -908,6 +906,38 @@ uint16_t device_shadow_restore_from_pool(const ZapDevice* pool, uint16_t count) 
     }
     ESP_LOGI(TAG, "boot restore: %u devices", restored);
     return restored;
+}
+
+void device_shadow_flush_now() {
+    if (!s_mutex) return;
+    // Own scratch: task_shadow may be mid-write from s_sweep_blob. If it is
+    // writing the same device right now, the older of two snapshots taken
+    // milliseconds apart can land last; accepted on the way to a restart.
+    auto* blob = static_cast<uint8_t*>(
+        heap_caps_malloc(sizeof(s_sweep_blob), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!blob) return;
+    unsigned written = 0;
+    for (uint16_t i = 0; ; i++) {
+        uint64_t ieee = 0;
+        size_t   len  = 0;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (i >= s_count) { xSemaphoreGive(s_mutex); break; }
+        DeviceShadowEntry* e = &s_shadow[i];
+        if (e->nvs_dirty) {
+            ieee = e->ieee;
+            len  = attr_blob_serialize(blob, e->attrs, e->attr_count);
+            e->nvs_dirty = false;
+            e->nvs_force = false;
+        }
+        xSemaphoreGive(s_mutex);
+        if (!len) continue;
+        if (nvs_write_attr_blob(ieee, blob, len)) { written++; continue; }
+        xSemaphoreTake(s_mutex, portMAX_DELAY);   // failed: the sweep retries it
+        if (DeviceShadowEntry* re = find_entry(ieee)) re->nvs_dirty = true;
+        xSemaphoreGive(s_mutex);
+    }
+    heap_caps_free(blob);
+    if (written) ESP_LOGI(TAG, "flush_now: %u device(s) written", written);
 }
 
 void device_shadow_process(const ZapDevice* dev,
@@ -928,10 +958,13 @@ void device_shadow_process(const ZapDevice* dev,
 
     apply_pipeline_and_stage(e, attrs, count);
 
-    // Inject synthetic _last_seen (bypasses pipeline — internal bookkeeping)
-    if (e->config.last_seen_enabled) {
+    // Inject synthetic _last_seen (bypasses pipeline — internal bookkeeping).
+    // Only with a set clock: before SNTP the hub counts from 1970, and such a
+    // value would overwrite a real one.
+    const time_t now = time(nullptr);
+    if (e->config.last_seen_enabled && zap_clock_is_set(now)) {
         ZclAttribute ls{};
-        zcl_attr_set_int(&ls, KEY_LAST_SEEN, (int32_t)time(nullptr), VAL_INT);
+        zcl_attr_set_int(&ls, KEY_LAST_SEEN, (int32_t)now, VAL_INT);
         ls.cluster = 0xFFFF;
         ls.attr_id = 0xFFFF;
         upsert_cache(e, &ls, 1);

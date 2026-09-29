@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // components/zap_store/zap_store.cpp
 #include "zap_store.h"
+#include "zap_clock.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nvs_checked.h"
@@ -68,6 +69,26 @@ static int16_t index_find_locked(uint64_t ieee) {
     for (uint16_t i = 0; i < s_idx_count; i++)
         if (s_idx_ieee[i] == ieee) return static_cast<int16_t>(i);
     return -1;
+}
+
+// last_seen side-car (zap_store.h): one row per stored device, one blob.
+struct __attribute__((packed)) LastSeenRow {
+    uint64_t ieee;
+    uint32_t ts;
+};
+static_assert(sizeof(LastSeenRow) == 12);
+static const char* LAST_SEEN_KEY = "lseen";
+static constexpr size_t LAST_SEEN_CAP = ZAP_MAX_DEVICES * sizeof(LastSeenRow);   // 2.4 KB
+static uint32_t    s_ls_crc = 0;   // CRC of the rows on flash, so an unchanged set is not rewritten
+
+static LastSeenRow* last_seen_rows_alloc() {
+    void* p = heap_caps_malloc(LAST_SEEN_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return static_cast<LastSeenRow*>(p ? p : std::malloc(LAST_SEEN_CAP));
+}
+
+static uint32_t last_seen_crc(const LastSeenRow* rows, size_t n) {
+    return esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(rows),
+                            static_cast<uint32_t>(n * sizeof(LastSeenRow)));
 }
 
 // ── CRC32 integrity ──────────────────────────────────────────────────────
@@ -388,10 +409,77 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
         loaded++;
     }
 
+    // last_seen side-car: raise each record to the newer value saved there. A
+    // blob of the wrong size is ignored; the next save rewrites it.
+    LastSeenRow* rows = loaded ? last_seen_rows_alloc() : nullptr;
+    size_t len = LAST_SEEN_CAP;
+    if (rows && nvs_get_blob(h, LAST_SEEN_KEY, rows, &len) == ESP_OK &&
+        len % sizeof(LastSeenRow) == 0) {
+        const size_t n = len / sizeof(LastSeenRow);
+        for (uint16_t i = 0; i < loaded; i++) {
+            for (size_t j = 0; j < n; j++) {
+                if (rows[j].ieee != pool[i].ieee_addr) continue;
+                if (zap_clock_is_set(rows[j].ts) && rows[j].ts > pool[i].last_seen)
+                    pool[i].last_seen = rows[j].ts;
+                break;
+            }
+        }
+        s_ls_crc = last_seen_crc(rows, n);
+    }
+    heap_caps_free(rows);
+
     nvs_close(h);
     store_unlock();
     ESP_LOGI(TAG, "Loaded %u devices from NVS", loaded);
     return loaded;
+}
+
+bool zap_store_save_last_seen(ZapStoreSnapshotCb snap) {
+    if (!snap) return true;   // no live pool to read yet
+    LastSeenRow* rows = last_seen_rows_alloc();
+    if (!rows) return false;
+
+    // The stored devices, copied under the store lock. Their live values are
+    // read after it is released: `snap` takes the pool lock, and the pool lock
+    // is taken before this one elsewhere.
+    uint16_t n = 0;
+    store_lock();
+    if (!s_idx_built) {
+        if (nvs_handle_t h = open_ns(NVS_READONLY)) {
+            index_build_locked(h);
+            nvs_close(h);
+        }
+    }
+    for (uint16_t i = 0; i < s_idx_count; i++)
+        if (s_idx_ieee[i]) rows[n++].ieee = s_idx_ieee[i];
+    store_unlock();
+
+    // A device gone from the pool, or never seen with a set clock, has no row.
+    uint16_t m = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        ZapDevice d{};
+        if (snap(rows[i].ieee, &d) && zap_clock_is_set(d.last_seen))
+            rows[m++] = LastSeenRow{d.ieee_addr, d.last_seen};
+    }
+
+    bool ok = true;
+    const uint32_t crc = last_seen_crc(rows, m);
+    store_lock();
+    if (m > 0 && crc != s_ls_crc) {
+        esp_err_t acc = ESP_FAIL;
+        if (nvs_handle_t h = open_ns(NVS_READWRITE)) {
+            acc = ESP_OK;
+            nvs_seq(&acc, nvs_set_blob(h, LAST_SEEN_KEY, rows, m * sizeof(LastSeenRow)),
+                    TAG, "set_blob lseen");
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit lseen");
+            nvs_close(h);
+        }
+        ok = acc == ESP_OK;
+        if (ok) s_ls_crc = crc;
+    }
+    store_unlock();
+    heap_caps_free(rows);
+    return ok;
 }
 
 // ── Uplink selector ───────────────────────────────────────────────────────
