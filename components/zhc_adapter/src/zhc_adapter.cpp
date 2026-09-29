@@ -25,6 +25,7 @@
 #include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
 #include "meter_poll.hpp" // periodic meter reads for plugs that never report
 #include "def_memo.hpp"   // remembered registry lookups (model, manufacturer) -> def
+#include "tuya_mcu.hpp"   // answers to a Tuya MCU's time / gateway-status requests
 
 #include "metrics/metrics_macros.h"
 
@@ -1539,43 +1540,40 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
         }
     }
 
-    // Tuya MCU bootstrap kick: when an unmatched mcuVersionResponse
-    // Tuya MCU time sync (cluster 0xEF00 cmd 0x24): the device asks and,
-    // like z2m's tuya.onEvent({timeStart}), gets 2 bytes of size + UTC and
-    // local seconds (big-endian) in the def's epoch. TRVs run their weekly
-    // schedule on this clock. Only answered once NTP has set ours -- a
-    // 1970 answer would be worse than none. Local = UTC + the TZ offset
-    // the port configured (0 when it never set TZ).
-    if (cluster_id == 0xEF00 && msg.command_id == 0x24 && zcl_len >= 1 &&
-        (zcl[0] & 0x03) == 0x01 && def->tuya_time_start && g_cfg_cmd) {
-        const time_t now = time(nullptr);
-        if (now > 1600000000) {
-            struct tm g{};
-            gmtime_r(&now, &g);
-            g.tm_isdst = -1;
-            const long gmtoff = static_cast<long>(now - mktime(&g));
-            const std::uint32_t utc = static_cast<std::uint32_t>(
-                now - (def->tuya_time_start == 2 ? 946684800 : 0));
-            const std::uint32_t local = static_cast<std::uint32_t>(utc + gmtoff);
-            const std::uint8_t p[10] = {
-                0x08, 0x00,   // payloadSize, as z2m encodes it
-                static_cast<std::uint8_t>(utc >> 24), static_cast<std::uint8_t>(utc >> 16),
-                static_cast<std::uint8_t>(utc >> 8),  static_cast<std::uint8_t>(utc),
-                static_cast<std::uint8_t>(local >> 24), static_cast<std::uint8_t>(local >> 16),
-                static_cast<std::uint8_t>(local >> 8),  static_cast<std::uint8_t>(local),
-            };
-            const bool sent = g_cfg_cmd(ieee, ctx.device_nwk, 1, 0xEF00, 0x24, p, sizeof(p),
+    // Tuya MCU requests (cluster 0xEF00), answered as z2m's tuyaBase does
+    // (tuya_mcu.hpp): the time (cmd 0x24), which TRVs run their weekly
+    // schedule on and LCD sensors display, and the gateway connection status
+    // (cmd 0x25), which an LCD sensor shows as "connection lost" while it goes
+    // unanswered. The epoch comes from the def, or from z2m's timeStart
+    // fingerprints for the generated defs that never carried it.
+    if (cluster_id == 0xEF00 && g_cfg_cmd) {
+        const std::uint8_t ts = msg.command_id == 0x24
+            ? zhc::tuya::time_start(*def, manufacturer_name, model_id) : 0;
+        std::uint8_t p[10];
+        std::size_t n = 0;
+        const std::uint8_t cmd = tuya_mcu::reply(zcl, zcl_len, ts, time(nullptr), p, n);
+        if (cmd) {
+            const bool sent = g_cfg_cmd(ieee, ctx.device_nwk, src_endpoint, 0xEF00, cmd, p,
+                                        static_cast<std::uint8_t>(n),
                                         zhc::kStepFlagDisableDefaultResponse);
-            ESP_LOGI(TAG, "[zhc-lib] mcuSyncTime ieee=0x%016llx epoch=%s utc=%lu gmtoff=%ld%s",
-                     static_cast<unsigned long long>(ieee),
-                     def->tuya_time_start == 2 ? "2000" : "1970",
-                     static_cast<unsigned long>(utc), gmtoff, sent ? "" : " SEND FAILED");
-        } else {
+            auto be32 = [&p](int i) {
+                return static_cast<unsigned long>(p[i]) << 24 | p[i + 1] << 16 | p[i + 2] << 8 | p[i + 3];
+            };
+            if (cmd == 0x24) {
+                ESP_LOGI(TAG, "[zhc-lib] mcuSyncTime ieee=0x%016llx epoch=%s utc=%lu local=%lu%s",
+                         static_cast<unsigned long long>(ieee), ts == 2 ? "2000" : "1970",
+                         be32(2), be32(6), sent ? "" : " SEND FAILED");
+            } else {
+                ESP_LOGI(TAG, "[zhc-lib] mcuGatewayConnectionStatus ieee=0x%016llx: connected%s",
+                         static_cast<unsigned long long>(ieee), sent ? "" : " SEND FAILED");
+            }
+        } else if (msg.command_id == 0x24 && ts) {
             ESP_LOGW(TAG, "[zhc-lib] mcuSyncTime ieee=0x%016llx: clock not synced, not answered",
                      static_cast<unsigned long long>(ieee));
         }
     }
 
+    // Tuya MCU bootstrap kick: when an unmatched mcuVersionResponse
     // arrives (cluster 0xEF00 cmd 0x11), z2m's tuya.modernExtend
     // `respondToMcuVersionResponse` answers with a dataQuery so the
     // device transitions out of handshake into active DP reporting.

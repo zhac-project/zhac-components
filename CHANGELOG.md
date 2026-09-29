@@ -143,6 +143,15 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **`zhc_adapter` answers a Tuya MCU's gateway-status query (0xEF00 cmd 0x25), so LCD sensors no longer show
+  "connection lost".** z2m's `tuyaBase` answers every such query with payloadSize 1 and status 1 (`01 00 01`,
+  connected). ZHAC never answered and logged the query as debug-level protocol noise. The time request
+  (cmd 0x24) is now answered for every device z2m answers it for, not only the few definitions that set
+  `tuya_time_start` by hand. The epoch comes from embedded-zhc's `zhc::tuya::time_start()`: the definition's
+  field, else z2m's timeStart fingerprints. Both answers go to the endpoint the request came from, as in z2m,
+  and are built in `src/tuya_mcu.hpp`, which has no ESP-IDF dependency. Host test `tuya_mcu` feeds it the
+  device's request frames and checks the reply bytes: UTC and local seconds in the 1970 and 2000 epochs, in
+  summer and in winter. Needs embedded-zhc with `zhc::tuya::time_start()`.
 - **`zhc_adapter` numbers every Tuya write.** A dataRequest / sendData (0xEF00 cmd 0x00 / 0x04)
   carries its own 2-byte sequence after the ZCL header and the library writes a constant 1; z2m
   and ZHA give each command a fresh one, and a Tuya MCU may take a repeated number for a repeated

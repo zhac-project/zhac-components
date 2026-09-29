@@ -30,3 +30,10 @@ add_executable(def_memo_host_test test_def_memo.cpp)
 target_include_directories(def_memo_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_options(def_memo_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME def_memo COMMAND def_memo_host_test)
+
+add_executable(tuya_mcu_host_test test_tuya_mcu.cpp)
+target_include_directories(tuya_mcu_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../zap_common/include)
+target_compile_options(tuya_mcu_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME tuya_mcu COMMAND tuya_mcu_host_test)
