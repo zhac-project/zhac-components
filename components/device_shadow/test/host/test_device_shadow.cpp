@@ -63,6 +63,7 @@ extern "C" uint8_t shadow_pipeline_flush_pending(PendingState*, ZclAttribute*, u
 
 // NVS stub reset (defined in stubs/nvs_stub.cpp).
 extern "C" void nvs_stub_reset(void);
+extern "C" int  nvs_stub_null_sem_takes(void);
 
 // ── Mirror of device_shadow.cpp internals needed to seed/inspect NVS ────────
 // shadow_key() (base36, 15-char cap) — copied verbatim so seeded blobs land on
@@ -166,6 +167,14 @@ static ShadowAttr make_attr(const char* key, uint8_t val_type, int32_t int_val, 
 
 int main() {
     printf("test_device_shadow (public API + pipeline over in-memory NVS)\n");
+
+    // Before init: the P4 main-core starts simple_rules (which seeds rule memory
+    // through get_attr) before device_shadow_init. The mutex does not exist yet.
+    {
+        ShadowAttr o{};
+        CHECK(!device_shadow_get_attr(0x00A1ULL, "state", &o) && nvs_stub_null_sem_takes() == 0,
+              "get_attr before init: false, without taking the not-yet-created mutex");
+    }
 
     // Lifecycle: init once. device_shadow_init allocates the table, opens the
     // shadow NVS namespace and stamps the schema version; the housekeeping task

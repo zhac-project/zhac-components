@@ -982,7 +982,10 @@ uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_coun
 // the ZIGBEE_TOGGLE action avoid a ~2.7 KB ShadowAttr[32] + 522 B device
 // snapshot on that shared stack.
 bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
-    if (!key || !out) return false;
+    // Null-safe like zigbee_pool_lock(): the P4 main-core starts simple_rules,
+    // which seeds its rule memory from here, before device_shadow_init(). No
+    // table yet means no attribute, and taking a NULL mutex would assert.
+    if (!key || !out || !s_mutex) return false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
     bool found = false;

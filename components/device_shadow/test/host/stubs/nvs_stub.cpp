@@ -90,7 +90,11 @@ int64_t esp_timer_get_time(void) { return (g_time_us += 1000); }   // +1 ms per 
 
 static int s_mutex_obj = 0;
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &s_mutex_obj; }
-BaseType_t xSemaphoreTake(SemaphoreHandle_t, TickType_t) { return pdTRUE; }
+// FreeRTOS configASSERTs a NULL handle (a panic on the hub): count such takes
+// so a test can prove a call made before device_shadow_init() never locks.
+static int s_null_takes = 0;
+BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t) { if (!s) s_null_takes++; return pdTRUE; }
+extern "C" int nvs_stub_null_sem_takes(void) { return s_null_takes; }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t) { return pdTRUE; }
 BaseType_t xTaskCreate(void (*)(void*), const char*, uint32_t, void*, UBaseType_t, TaskHandle_t*) {
     return pdPASS;   // the flush task never runs; flush_now()/flush_device() are synchronous
