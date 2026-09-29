@@ -249,8 +249,9 @@ static bool resolve_action_value(const RuleAction& a, const char* legacy_arg,
 
 // ── Value comparison ──────────────────────────────────────────────────────
 
-// Compare two pre-parsed int values using a conditional operator.
-static bool compare_int(CondOp op, int32_t event_val, int32_t trig_val) {
+// Compare two pre-parsed int values using a conditional operator. 64-bit: an
+// INT reading lifted ×100 to meet a decimal literal can pass int32.
+static bool compare_int(CondOp op, int64_t event_val, int64_t trig_val) {
     if (op == CondOp::ANY) return true;
     switch (op) {
     case CondOp::EQ:  return event_val == trig_val;
@@ -299,8 +300,9 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 
         if (t.op == CondOp::ANY || wildcard_attr) return true;
 
-        // VAL_FLOAT stores value × 100 as an int (the DSL literal is the ×100
-        // value too, e.g. `temperature>2500` = 25.00); VAL_BOOL stores 0/1 in
+        // VAL_FLOAT stores value × 100 as an int (an integer DSL literal is the
+        // ×100 value too, e.g. `temperature>2500` = 25.00; a decimal one is real
+        // units, see the comparison below); VAL_BOOL stores 0/1 in
         // int_val (the shadow bridge normalises the bool). Both share the
         // integer comparison domain as VAL_INT, and DSL binary/numeric literals
         // parse as VAL_INT — so fold both, letting `#occupancy=1` / `=0` match a
@@ -318,8 +320,12 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
             if (t.op == CondOp::NEQ) return !eq;
             return false;
         }
-        // INT/BOOL: both sides are integers.
-        return compare_int(t.op, ze.int_val, t.int_val);
+        // INT/BOOL/FLOAT: both sides are integers. A decimal literal (`>25.5`)
+        // is real units held ×100: a FLOAT reading is ×100 already, an INT or
+        // BOOL one is lifted ×100 to meet it.
+        int64_t reading = ze.int_val;
+        if (t.lit_x100 && ze.val_type != VAL_FLOAT) reading *= 100;
+        return compare_int(t.op, reading, t.int_val);
     }
     case EventType::CTRL_BOOT:
         return t.type == TriggerType::BOOT;

@@ -27,10 +27,16 @@ struct RuleTrigger {
     char        key[64];
     CondOp      op;
     // DEVICE_ATTR comparison value (parsed at DSL time):
-    //   match_val_type == VAL_INT/BOOL: int_val holds the raw parsed int.
+    //   match_val_type == VAL_INT/BOOL: int_val holds the parsed number
+    //                                    (raw, or ×100 when lit_x100).
     //   match_val_type == VAL_STR:       str_val holds the literal string;
     //                                    only EQ/NEQ operators are meaningful.
     uint8_t     match_val_type;  // ValType
+    // The number had a decimal point (`>25.5`): it is in real units and int_val
+    // holds it ×100, the scale of a VAL_FLOAT reading; the matcher lifts an
+    // INT/BOOL reading ×100 to meet it. Without one (`>2500`) it is compared
+    // raw, as it always was. Fills padding: sizeof(RuleTrigger) is unchanged.
+    bool        lit_x100;
     int32_t     int_val;         // parsed int value
     char        str_val[ATTR_STR_MAX]; // parsed string value (STR type)
     char        value[20];       // original DSL literal text

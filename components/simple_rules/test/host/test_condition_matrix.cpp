@@ -12,7 +12,9 @@
 //     negative values);
 //   • the ieee device filter and the empty-attr wildcard;
 //   • every non-DEVICE_ATTR trigger (System#Boot, Event#, Rules#Timer=,
-//     Mqtt#) plus cross-trigger-type rejection.
+//     Mqtt#) plus cross-trigger-type rejection;
+//   • decimal literals in real units (`>25.5`) against FLOAT/INT/BOOL
+//     readings, and their ×100 int32 bound.
 //
 // The matcher (simple_rules_match) and dsl_parse are exercised end-to-end; only
 // the value/trigger structs are hand-built. Companion to test_bool_match, which
@@ -154,8 +156,15 @@ int main() {
     // ── 6. Numeric-literal parsing edges ────────────────────────────────
     const Event l3 = make_attr_event("level", VAL_INT, 3, nullptr);
     const Event l2 = make_attr_event("level", VAL_INT, 2, nullptr);
-    CHECK( M("level=2.5", l3) && !M("level=2.5", l2), "decimal literal rounds half-away (2.5→3)");
-    CHECK( M("level=2.4", l2) && !M("level=2.4", l3), "decimal literal 2.4→2");
+    // A decimal literal is real units (section 12), no longer rounded to a raw
+    // integer: 2.5 lies between the readings 2 and 3 and equals neither.
+    CHECK(!M("level=2.5", l3) && !M("level=2.5", l2), "decimal literal 2.5 equals neither 2 nor 3");
+    CHECK( M("level>2.5", l3) && !M("level>2.5", l2), "decimal literal orders between integer readings");
+    // It rounds half away at hundredths: 0.125 → 13 (×100), -0.125 → -13.
+    const Event f13  = make_attr_event("temperature", VAL_FLOAT, 13, nullptr);
+    const Event fm13 = make_attr_event("temperature", VAL_FLOAT, -13, nullptr);
+    CHECK( M("temperature=0.125", f13) && M("temperature=-0.125", fm13),
+          "decimal literal rounds half-away at hundredths (0.125→13)");
     const Event neg = make_attr_event("balance", VAL_INT, -5, nullptr);
     CHECK( M("balance<-3", neg) && M("balance=-5", neg), "negative literals compare");
     CHECK(!parse_ok("ON dev#temp>nan DO log m ENDON"),  "NaN literal rejected at parse");
@@ -211,6 +220,51 @@ int main() {
           "BOOT event does not fire a DEVICE_ATTR trigger");
     CHECK(!parse_and_match("ON Event#x DO log m ENDON", make_timer_event(1)),
           "TIMER event does not fire an EVENT trigger");
+
+    // ── 12. A decimal literal is real units ─────────────────────────────
+    // `>25.5` means 25.5 °C: held ×100 (2550), it meets a VAL_FLOAT reading
+    // (already ×100) as is and an INT/BOOL reading lifted ×100. It used to round
+    // to the raw int 26, so 23.40 °C (2340) was "above" it: the rule fired at
+    // once and never re-armed. No decimal point = the raw value, as before.
+    const Event t2340 = make_attr_event("temperature", VAL_FLOAT, 2340, nullptr);   // 23.40 °C
+    CHECK(!M("temperature>25.5", t2340), "FLOAT 23.40 > 25.5 is false");
+    CHECK( M("temperature>23.0", t2340), "FLOAT 23.40 > 23.0 is true");
+    CHECK( M("temperature<=23.4", t2340), "FLOAT 23.40 <= 23.4 is true");
+    CHECK( M("temperature=23.4", t2340) && !M("temperature!=23.4", t2340), "FLOAT 23.40 = 23.4 is true");
+    CHECK(!M("temperature>2500", t2340) && M("temperature>2300", t2340) && M("temperature=2340", t2340),
+          "legacy integer literal on FLOAT is still the raw ×100 value");
+    const Event b100 = make_attr_event("brightness", VAL_INT, 100, nullptr);
+    CHECK( M("brightness=100.0", b100) && !M("brightness=100.5", b100), "INT 100 = 100.0 is true");
+    CHECK( M("brightness>99.5", b100) && !M("brightness>100.0", b100), "INT 100 > 99.5 is true");
+    CHECK( M("brightness=100", b100) && !M("brightness=10000", b100), "legacy integer literal on INT stays raw");
+    CHECK( M("contact=1.0", c1) && !M("contact=1.0", c0), "BOOL = 1.0 tracks true");
+    CHECK( M("contact>0.5", c1) && !M("contact>0.5", c0), "BOOL > 0.5 tracks true");
+    const Event tm3 = make_attr_event("temperature", VAL_FLOAT, -300, nullptr);   // -3.00 °C
+    const Event tm4 = make_attr_event("temperature", VAL_FLOAT, -400, nullptr);   // -4.00 °C
+    const Event lm3 = make_attr_event("level", VAL_INT, -3, nullptr);
+    const Event lm4 = make_attr_event("level", VAL_INT, -4, nullptr);
+    CHECK( M("temperature<-3.5", tm4) && !M("temperature<-3.5", tm3), "negative decimal -3.5 on FLOAT");
+    CHECK( M("level<-3.5", lm4) && !M("level<-3.5", lm3), "negative decimal -3.5 on INT");
+    CHECK(!M("action=1.0", single), "a decimal literal never matches a string attr");
+    {
+        ParsedRule r{};
+        CHECK(dsl_parse("ON dev#temperature>25.5 DO log m ENDON", 1, &r) == ParseResult::OK &&
+              r.trigger.int_val == 2550, "decimal literal is held ×100");
+        CHECK(dsl_parse("ON dev#temperature>2500 DO log m ENDON", 1, &r) == ParseResult::OK &&
+              r.trigger.int_val == 2500, "integer literal is held raw");
+    }
+    // ×100 must fit an int32: ±21474836.47 is the widest decimal literal.
+    CHECK( parse_ok("ON dev#temp>21474836.47 DO log m ENDON") &&
+           parse_ok("ON dev#temp>-21474836.48 DO log m ENDON"),
+          "decimal literal at the int32 ×100 edge parses");
+    CHECK(!parse_ok("ON dev#temp>21474836.48 DO log m ENDON") &&
+           std::strstr(dsl_last_error(), "out of range") != nullptr,
+          "decimal literal whose ×100 overflows int32 is refused, error says out of range");
+    CHECK(!parse_ok("ON dev#temp<-21474836.49 DO log m ENDON") &&
+          !parse_ok("ON dev#temp>1000000000.0 DO log m ENDON"),
+          "negative and large decimal literals past the ×100 range are refused");
+    CHECK( parse_ok("ON dev#temp>1000000000 DO log m ENDON"),
+          "the same integer literal (raw) still parses");
 
     #undef M
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",

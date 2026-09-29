@@ -219,6 +219,14 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
             char* endp = nullptr;
             errno = 0;
             double d = strtod(v, &endp);
+            // A number with a decimal point (`>25.5`) is in real units: held
+            // ×100, the scale of a VAL_FLOAT reading, and flagged so the matcher
+            // lifts an INT/BOOL reading to meet it. One without (`>2500`) keeps
+            // the raw meaning it always had, so saved rules match as before.
+            // A '.' in what strtod read implies a finite or overflowing value
+            // (never NaN), so a decimal literal fails below only out of range.
+            const bool x100 = endp != v && memchr(v, '.', (size_t)(endp - v)) != nullptr;
+            if (x100) d *= 100.0;
             // Bound the ROUNDED magnitude: round-half-away-from-zero can push
             // a value up to 0.5 past d, so check (|d| + 0.5) against the
             // int32 limits. This both keeps the subsequent (int32_t) cast in
@@ -233,7 +241,8 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
             if (endp == v || errno == ERANGE || !std::isfinite(d) ||
                 d >= (double)INT32_MAX + 0.5 || d <= (double)INT32_MIN - 0.5) {
                 ESP_LOGW(TAG, "invalid/out-of-range numeric literal in DSL: %s", v);
-                dsl_set_err("invalid numeric literal '%s'", v);
+                if (x100) dsl_set_err("decimal literal '%s' out of range (max +/-21474836.47)", v);
+                else      dsl_set_err("invalid numeric literal '%s'", v);
                 return ParseResult::ERR_BAD_TRIGGER;
             }
             double r = (d < 0 ? d - 0.5 : d + 0.5);
@@ -242,6 +251,7 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
             if (r > (double)INT32_MAX) r = (double)INT32_MAX;
             else if (r < (double)INT32_MIN) r = (double)INT32_MIN;
             t->int_val = (int32_t)r;
+            t->lit_x100 = x100;
             t->match_val_type = VAL_INT;
             t->str_val[0] = '\0';
         }

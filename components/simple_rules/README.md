@@ -51,6 +51,9 @@ Full grammar in `zhac-docs/RULES_DSL.md`. Triggers: `DEVICE_ATTR`,
 `TIME_CRON`, `BOOT`, `EVENT`, `TIMER`, `MQTT_TOPIC`. Actions:
 `ZIGBEE_SET`, `ZIGBEE_TOGGLE`, `PUBLISH`, `EVENT`, `TIMER`, `LOG`, `SCRIPT`.
 Comparison ops: `ANY` *(no operator)*, `=`, `!=`, `>`, `<`, `>=`, `<=`.
+A number with a decimal point is in real units: `temperature>25.5` is 25.5 °C
+(held ×100 with `RuleTrigger::lit_x100`; an INT/BOOL reading is lifted ×100
+to meet it). An integer is raw, as before: `temperature>2500` = 25.00.
 Action device names are a single token — quotes are NOT stripped.
 
 Device-attribute triggers are **edge-triggered**: a comparison fires when it goes
@@ -150,6 +153,8 @@ Consequences callers must know:
   clamping to a differently-parsed action set. (P2-T18 def 4)
 - **Numeric literals:** out-of-range / non-finite literals (`1e20`, garbage)
   are rejected (`ERR_BAD_TRIGGER`) before the `int32_t` cast — no UB. (def 5)
+  A decimal literal must fit after ×100 (±21474836.47), else
+  `decimal literal '…' out of range`.
 
 ## Wire format / on-disk layout
 

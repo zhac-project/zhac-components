@@ -43,6 +43,7 @@ static constexpr uint64_t kBootDoor = 0xA100000000000003ULL;
 static constexpr uint64_t kThermo   = 0xA100000000000004ULL;
 static constexpr uint64_t kCube     = 0xA100000000000005ULL;
 static constexpr uint64_t kLamp     = 0xA100000000000006ULL;
+static constexpr uint64_t kRoom     = 0xA100000000000007ULL;
 
 // ── Fire counter ───────────────────────────────────────────────────────────
 struct Hit { char name[32]; int count; char value[32]; char key[ATTR_KEY_MAX]; uint64_t ieee; };
@@ -134,6 +135,7 @@ int main() {
     seed_device(kThermo, "thermo");
     seed_device(kCube, "cube");
     seed_device(kLamp, "lamp");
+    seed_device(kRoom, "room");
 
     // ── 1. Boot: rules saved before the reboot, shadow restored from flash ──
     persist(1, "boot_contact", "ON bootdoor#contact=1 DO script.run boot_contact ENDON");
@@ -183,6 +185,20 @@ int main() {
     report(kThermo, "temperature", VAL_FLOAT, 2400);
     report(kThermo, "temperature", VAL_FLOAT, 2600);
     CHECK(fires("hot") == 2, "comparison: true -> false -> true fires again");
+
+    // ── 4b. A decimal threshold is real units, and re-arms ────────────────
+    // `>25.5` used to round to the raw 26: 23.40 °C (2340) was "above" it, so
+    // the rule fired on the first report and could never re-arm.
+    add("warm", "ON room#temperature>25.5 DO script.run warm ENDON");
+    report(kRoom, "temperature", VAL_FLOAT, 2340);
+    CHECK(fires("warm") == 0, "decimal threshold: 23.40 is not above 25.5");
+    report(kRoom, "temperature", VAL_FLOAT, 2560);
+    CHECK(fires("warm") == 1, "decimal threshold: crossing 25.5 fires");
+    report(kRoom, "temperature", VAL_FLOAT, 2600);
+    CHECK(fires("warm") == 1, "decimal threshold: staying above does not fire");
+    report(kRoom, "temperature", VAL_FLOAT, 2550);
+    report(kRoom, "temperature", VAL_FLOAT, 2551);
+    CHECK(fires("warm") == 2, "decimal threshold: 25.50 re-arms it, 25.51 fires again");
 
     // ── 5. Momentary attributes keep firing on every report ───────────────
     add("shake", "ON cube#action=\"shake\" DO script.run shake ENDON");
