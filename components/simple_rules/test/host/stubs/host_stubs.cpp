@@ -156,7 +156,14 @@ bool stub_rule_store_last_dirty(RuleSlot* out) {
     return true;
 }
 
-void stub_rule_store_reset(void) { s_store_n = 0; s_last_dirty_valid = false; }
+// Full slots written through rule_store_mark_dirty, so a reload
+// (simple_rules_init / simple_rules_reload) sees the rules saved before it.
+// Ids seeded with stub_rule_store_seed_id have no slot and stay out of
+// load_all, which keeps the "persisted but not cached" model above intact.
+static RuleSlot s_slots[64];
+static uint16_t s_slot_n = 0;
+
+void stub_rule_store_reset(void) { s_store_n = 0; s_slot_n = 0; s_last_dirty_valid = false; }
 void stub_rule_store_seed_id(uint16_t id) {
     if (s_store_n < (uint16_t)(sizeof(s_store_ids) / sizeof(s_store_ids[0])))
         s_store_ids[s_store_n++] = id;
@@ -164,6 +171,12 @@ void stub_rule_store_seed_id(uint16_t id) {
 uint16_t stub_rule_store_count(void) { return s_store_n; }
 
 bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
+    for (uint16_t i = 0; i < s_slot_n; i++) {
+        if (s_slots[i].rule_id == rule_id) {
+            if (out) *out = s_slots[i];
+            return true;
+        }
+    }
     for (uint16_t i = 0; i < s_store_n; i++) {
         if (s_store_ids[i] == rule_id) {
             if (out) { memset(out, 0, sizeof(*out)); out->rule_id = rule_id; }
@@ -172,14 +185,25 @@ bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
     }
     return false;
 }
-uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) { (void)out; (void)max_count; return 0; }
+uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
+    uint16_t n = s_slot_n < max_count ? s_slot_n : max_count;
+    for (uint16_t i = 0; i < n; i++) out[i] = s_slots[i];
+    return n;
+}
 void     rule_store_mark_dirty(const RuleSlot* slot) {
     // Record the create so a subsequent next_rule_id() sees it persisted,
     // mirroring the real writeback overlay being folded into rule_store_max_id.
     if (slot && !rule_store_load(slot->rule_id, nullptr)) stub_rule_store_seed_id(slot->rule_id);
     if (slot) { s_last_dirty = *slot; s_last_dirty_valid = true; }
+    if (!slot) return;
+    for (uint16_t i = 0; i < s_slot_n; i++)
+        if (s_slots[i].rule_id == slot->rule_id) { s_slots[i] = *slot; return; }
+    if (s_slot_n < 64) s_slots[s_slot_n++] = *slot;
 }
 void     rule_store_mark_delete(uint16_t rule_id) {
+    for (uint16_t i = 0; i < s_slot_n; i++) {
+        if (s_slots[i].rule_id == rule_id) { s_slots[i] = s_slots[--s_slot_n]; break; }
+    }
     for (uint16_t i = 0; i < s_store_n; i++) {
         if (s_store_ids[i] == rule_id) {
             s_store_ids[i] = s_store_ids[--s_store_n];
@@ -218,7 +242,28 @@ ZapDevice* pool_find_by_ieee(uint64_t ieee) {
 ZapDevice* pool_all()   { return s_pool_n ? s_pool : nullptr; }
 uint16_t   pool_count() { return s_pool_n; }
 
-// ── device_shadow: no cached attributes; records optimistic writes ────────
+// ── device_shadow: seedable attribute cache; records optimistic writes ────
+// Empty by default (every existing test). stub_shadow_set() plays the part of
+// the real shadow, which holds a device's last report (restored from flash at
+// boot) — the edge-trigger tests seed it to check that (re)loads start from it.
+static constexpr int kShadowMax = 32;
+static uint64_t   s_shadow_ieee[kShadowMax];
+static ShadowAttr s_shadow_attr[kShadowMax];
+static int        s_shadow_n = 0;
+
+void stub_shadow_clear(void) { s_shadow_n = 0; }
+void stub_shadow_set(uint64_t ieee, const char* key, uint8_t vt, int32_t iv, const char* sv) {
+    int i = 0;
+    while (i < s_shadow_n && !(s_shadow_ieee[i] == ieee && strcmp(s_shadow_attr[i].key, key) == 0)) i++;
+    if (i == s_shadow_n) { if (s_shadow_n == kShadowMax) return; s_shadow_n++; }
+    ShadowAttr a{};
+    strncpy(a.key, key, ATTR_KEY_MAX - 1);
+    a.val_type = vt;
+    if (vt == VAL_STR) strncpy(a.str_val, sv ? sv : "", ATTR_STR_MAX - 1);
+    else a.int_val = iv;
+    s_shadow_ieee[i] = ieee;
+    s_shadow_attr[i] = a;
+}
 
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {
     (void)ieee; (void)out; (void)max_count;
@@ -226,7 +271,12 @@ uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_coun
 }
 
 bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
-    (void)ieee; (void)key; (void)out;
+    for (int i = 0; i < s_shadow_n; i++) {
+        if (s_shadow_ieee[i] == ieee && strcmp(s_shadow_attr[i].key, key) == 0) {
+            if (out) *out = s_shadow_attr[i];
+            return true;
+        }
+    }
     return false;
 }
 

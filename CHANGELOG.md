@@ -7,7 +7,13 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Changed
+
+- **`simple_rules`: device-attribute rules fire on a change, not on every report.** A comparison (`#contact=1`, `#temperature>2500`) fires when it goes from not holding to holding; a bare `#attr` when the value differs from the last one. `action`, `click`, `event` and `scene` (button presses, cube gestures) and the bare `ON <device>` wildcard still fire on every report, and `Time#Cron`, `Event#`, `Rules#Timer=`, `Mqtt#`, `System#Boot` are unchanged. The per-rule memory (`ParsedRule::edge`, PSRAM, no flash writes) is seeded from `device_shadow` whenever rules are (re)loaded — boot, add, update, enable, the reload after a device rename, a trigger re-bound to another device — so none of those fires a rule; an attribute with no known value is "unknown" and its first matching report fires. Fixes a Tuya TS0203 contact sensor's 4-hourly `contact=1` heartbeat switching a socket on by itself. Rules that relied on repeats (a motion timer re-armed by repeated `occupancy=1`, a threshold publishing every report) now fire once per transition — see zhac-docs `RULES_DSL.md` "What changed". Host test `test/host/test_edge_status.cpp`; the host stubs gained a seedable shadow and a slot-keeping rule store.
+
 ### Added
+
+- **`simple_rules`: rule status and "Run now".** Each run logs `rule '<name>' fired (<dev>#<attr>=<value>)` at INFO and books runs since boot, the last run (monotonic, reported as epoch once the clock is set) and the last skip reason (`unchanged`, `condition_false`, `action_error:<verb>`), in RAM next to the parsed rule and kept across edits and reloads. `simple_rules_status()` reads them; `simple_rules_run_now()` runs a rule's actions at once with `%value%` = the trigger attribute's shadow value. Deliberately not in `RuleSlot` / the rule objects, which the cloud mirrors. Additive API: the dual-chip P4 and mono cores build unchanged.
 
 - **`ha_bridge`: Home Assistant sensors for a hub's own metrics.** `ha::build_bridge_metrics()` emits diagnostic sensors on the hub's device (the one `ha::build_bridge` makes) — Uptime, CPU core 0, CPU core 1, Internal RAM free, PSRAM free, Devices — each reading its key from the JSON a firmware publishes on `<root>/bridge/metrics` with a `value_json` template; configs go to `<prefix>/sensor/zhac_bridge_<id>_<key>/config`, and an empty retained payload on each removes them. `ha::bridge_id()` turns a root topic into the hub's id (`home/zhac-garage` → `home_zhac-garage`), so a firmware's own hub entities attach to the same device; `ha_bridge` uses it too. Pure and host-tested (`ha_bridge/test/host`). zhac-wired-core publishes and retracts them from its metrics stream task.
 

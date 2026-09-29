@@ -87,12 +87,41 @@ struct RuleAction {
     ExprProg   expr;
 };
 
+// Trigger memory of a device-attribute trigger. Such a trigger fires on a
+// change: a comparison when it goes from not holding to holding, a bare
+// `#attr` when the value differs from the last one. RAM only: seeded from the
+// device shadow whenever the rule is (re)loaded, so a reboot, an edit or a
+// rename never re-fires it. Unused for momentary attributes (action, click,
+// event, scene), the bare `ON <device>` wildcard and non-device triggers,
+// which fire on every event.
+struct RuleEdge {
+    bool    known;                 // a value was seen (reported or seeded)
+    bool    matched;               // the comparison held for it
+    uint8_t val_type;              // that value (ValType) ...
+    int32_t int_val;
+    char    str_val[ATTR_STR_MAX];
+};
+
+// Why a rule last did not run, or ran with a failing action.
+enum class RuleSkip : uint8_t { NONE, UNCHANGED, CONDITION_FALSE, ACTION_ERROR };
+
+// Run counters, RAM only: reset on reboot, kept across edits and reloads.
+struct RuleStat {
+    uint32_t runs;         // since boot, "Run now" included; 0 = never ran
+    uint32_t fired_mono;   // monotonic seconds of the last run
+    RuleSkip skip;
+    uint8_t  skip_action;  // ACTION_ERROR: index of the failing action
+};
+
 struct ParsedRule {
     uint16_t    rule_id;
     bool        enabled;
     RuleTrigger trigger;
     RuleAction  actions[4];
     uint8_t     action_count;
+    char        name[sizeof(RuleSlot::name)];   // for the "fired" log line
+    RuleEdge    edge;
+    RuleStat    stat;
 };
 
 // Parse result
@@ -151,6 +180,26 @@ bool     simple_rules_delete(uint16_t rule_id);
 bool     simple_rules_enable(uint16_t rule_id, bool enabled);
 
 uint16_t simple_rules_list(RuleSlot* out, uint16_t max_count);
+
+// ── Rule status (RAM only, reset on reboot) ───────────────────────────────
+// Deliberately NOT part of the rule objects (RuleSlot, rule.list, the rule.*
+// pushes): the cloud mirrors those and diffs them, so a volatile counter
+// there would churn every sync. Callers expose it through a separate command.
+struct SimpleRuleStatus {
+    uint16_t rule_id;
+    uint32_t runs;          // since boot, 0 = never ran
+    uint32_t last_fired;    // epoch s when the clock is set, else s since boot
+    uint32_t ago_s;         // s since the last run (valid when runs > 0)
+    char     last_skip[32]; // "", "unchanged", "condition_false", "action_error:<verb>"
+};
+// Fills one entry per active (cached) rule. Returns the number written.
+uint16_t simple_rules_status(SimpleRuleStatus* out, uint16_t max_count);
+
+// "Run now": runs the rule's actions immediately, ignoring its trigger and
+// whether it is enabled, and leaves its trigger memory alone. %value% is the
+// trigger attribute's current shadow value when there is one, else empty.
+// Counts as a run. False when the rule is not active.
+bool simple_rules_run_now(uint16_t rule_id);
 
 // ── Rule error callback ───────────────────────────────────────────────────
 // Called when a stored rule DSL fails to parse during reload (e.g. after

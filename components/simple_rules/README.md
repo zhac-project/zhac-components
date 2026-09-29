@@ -53,6 +53,14 @@ Full grammar in `zhac-docs/RULES_DSL.md`. Triggers: `DEVICE_ATTR`,
 Comparison ops: `ANY` *(no operator)*, `=`, `!=`, `>`, `<`, `>=`, `<=`.
 Action device names are a single token — quotes are NOT stripped.
 
+Device-attribute triggers are **edge-triggered**: a comparison fires when it goes
+from not holding to holding, a bare `#attr` when the value changes. `action`,
+`click`, `event`, `scene` and the bare `ON <device>` wildcard fire on every
+report; non-device triggers are unchanged. The per-rule memory
+(`ParsedRule::edge`, RAM) is seeded from `device_shadow` whenever a rule is
+(re)loaded — boot, add, update, enable, the reload after a rename, a trigger
+re-bound to another device — so none of those fires a rule.
+
 `zigbee.set` values and `publish` payloads accept `%value%` (the trigger
 value) or an integer expression over it — `!%value%`, `%value%/100`,
 `(%value%*10)/3+5` — compiled once at rule save by `expr_eval.cpp` (caps
@@ -78,6 +86,8 @@ non-numeric trigger value skips the action). See `zhac-docs/RULES_DSL.md`
 | `bool simple_rules_delete(uint16_t rule_id)` | NVS deletion is queued via `rule_store_mark_delete`. |
 | `bool simple_rules_enable(uint16_t rule_id, bool enabled)` | Persists the flag, no reparse. |
 | `uint16_t simple_rules_list(RuleSlot* out, uint16_t max_count)` | Snapshot of all stored slots. |
+| `uint16_t simple_rules_status(SimpleRuleStatus* out, uint16_t max_count)` | Per active rule: runs since boot, last run (epoch s, or s since boot while the clock is unset), `ago_s`, last skip reason. RAM only; kept out of `RuleSlot` so the cloud's rule mirror never churns. |
+| `bool simple_rules_run_now(uint16_t rule_id)` | "Run now": the actions at once, `%value%` = the trigger attribute's shadow value; ignores the trigger and `enabled`, counts as a run, leaves the edge memory alone. |
 
 ### Parser surface (also used by tests)
 
@@ -218,6 +228,12 @@ Host harness in `test/host/` (plain cmake + ctest, FreeRTOS/ESP shims) covers th
 
 ## Recent changes
 
+- **2026-09 edge triggers + rule status.** Device-attribute rules fire on a
+  change, seeded from the shadow on every (re)load (a Tuya contact sensor's
+  4-hourly `contact=1` heartbeat used to re-fire its rule). Each run logs
+  `rule '<name>' fired (<dev>#<attr>=<value>)` at INFO and books runs / last
+  run / last skip reason; `simple_rules_status` + `simple_rules_run_now`.
+  Host test `test/host/test_edge_status.cpp`.
 - **2026-04-25 snapshot-then-exec pattern.** Both `dispatch_event`
   and `task_cron` now drop the rule mutex before action dispatch
   (LUA-F8 + SR-F8 + CC-F5 in `docs/FINDINGS.md`). Mutex acquire is

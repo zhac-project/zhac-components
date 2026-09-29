@@ -230,6 +230,33 @@ target_include_directories(simple_rules_dsl_structure_test PRIVATE
 
 target_compile_options(simple_rules_dsl_structure_test PRIVATE -Wall -Wextra -Werror)
 
+# Edge-triggered device rules (heartbeat, change, seeding) + status / Run now.
+add_executable(simple_rules_edge_status_test
+    test_edge_status.cpp
+    stubs/host_stubs.cpp
+    ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
+    ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
+    ${COMPONENTS_DIR}/event_bus/event_bus.cpp
+)
+
+target_include_directories(simple_rules_edge_status_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${COMPONENTS_DIR}/simple_rules/include
+    ${COMPONENTS_DIR}/event_bus/include
+    ${COMPONENTS_DIR}/rule_store/include
+    ${COMPONENTS_DIR}/zap_common/include
+    ${COMPONENTS_DIR}/zigbee_mgr/include
+    ${COMPONENTS_DIR}/device_shadow/include
+    ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
+    ${COMPONENTS_DIR}/mqtt_gw/include
+    ${COMPONENTS_DIR}/cron_parser/include
+)
+
+target_compile_options(simple_rules_edge_status_test PRIVATE -Wall -Wextra -Werror)
+
 # Tier-2 value-expression evaluator — pure TU, no stubs. ASan+UBSan because
 # expr_compile parses REST/cloud-supplied text on the P4 (fuzz loop inside).
 add_executable(simple_rules_expr_test
@@ -254,3 +281,4 @@ add_test(NAME simple_rules_update_persist COMMAND simple_rules_update_persist_te
 add_test(NAME simple_rules_condition_matrix COMMAND simple_rules_condition_matrix_test)
 add_test(NAME simple_rules_action_matrix COMMAND simple_rules_action_matrix_test)
 add_test(NAME simple_rules_dsl_structure COMMAND simple_rules_dsl_structure_test)
+add_test(NAME simple_rules_edge_status COMMAND simple_rules_edge_status_test)
