@@ -145,6 +145,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **Home Assistant bridge could run out of stack**: the `ha_bridge` task's 8 KB stack had only 368 B left at its high-water mark on the S31, because the host's device callback (the wired core's `with_device()`, ~3.6 KB of frame) runs on it under the publish path. The stack is now 12 KB; it lives in PSRAM, so internal RAM is unchanged.
 - **`zhc_adapter` answers a Tuya MCU's gateway-status query (0xEF00 cmd 0x25), so LCD sensors no longer show
   "connection lost".** z2m's `tuyaBase` answers every such query with payloadSize 1 and status 1 (`01 00 01`,
   connected). ZHAC never answered and logged the query as debug-level protocol noise. The time request

@@ -29,7 +29,11 @@ constexpr const char* kNvsNs        = "mqtt_cfg";   // beside the broker setting
 constexpr size_t      kPrefixCap    = 32;
 constexpr size_t      kMaxDevices   = 256;
 constexpr int         kQueueDepth   = 24;
-constexpr uint32_t    kTaskStack    = 8192;
+// 8 KB left 368 B at the high-water mark on the S31 (2026-09-29): the host's
+// device callback (e.g. the wired core's with_device(), ~3.6 KB of frame with
+// a pool snapshot and 32 shadow attrs) runs on this stack under the publish
+// path. The stack lives in PSRAM (see ha_bridge_init), so headroom is cheap.
+constexpr uint32_t    kTaskStack    = 12288;
 // A battery device that has said nothing for this long is reported offline
 // (zigbee2mqtt's default for passive devices). Mains devices are never timed
 // out here: they only report on change, so silence proves nothing.
