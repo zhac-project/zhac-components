@@ -74,19 +74,9 @@ char* dup_str(const char* s) {
     return p;
 }
 
-// The hub's id on the broker: the root topic with anything HA does not accept
-// in an id replaced — "home/zhac-garage" -> "home_zhac-garage".
-void bridge_id(char* out, size_t cap) {
-    const char* r = mqtt_gw_get_root_topic();
-    size_t i = 0;
-    for (; r[i] && i + 1 < cap; i++) {
-        const char ch = r[i];
-        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
-        out[i] = ok ? ch : '_';
-    }
-    out[i] = '\0';
-}
+// The hub's id on the broker, from the root topic ("home/zhac-garage" ->
+// "home_zhac-garage"); firmwares attaching their own hub entities use the same.
+void bridge_id(char* out, size_t cap) { ha::bridge_id(out, cap, mqtt_gw_get_root_topic()); }
 
 // Publish with back-pressure: the mqtt_gw queue is 16 deep and a full
 // discovery pass is dozens of messages. The leading '/' tells mqtt_gw the

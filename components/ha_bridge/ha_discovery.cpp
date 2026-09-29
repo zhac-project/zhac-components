@@ -586,6 +586,62 @@ void build_bridge(const Context& c, const char* fw_version, const char* model,
     if (n > 0 && n < sizeof(payload)) emit("binary_sensor", topic, payload, user);
 }
 
+void bridge_id(char* out, size_t cap, const char* root) {
+    if (!cap) return;
+    size_t i = 0;
+    for (; root && root[i] && i + 1 < cap; i++) {
+        const char ch = root[i];
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        out[i] = ok ? ch : '_';
+    }
+    out[i] = '\0';
+}
+
+void build_bridge_metrics(const Context& c, EmitFn emit, void* user) {
+    struct Sensor { const char* key; const char* name; const char* unit; const char* device_class; const char* icon; };
+    static constexpr Sensor kSensors[] = {
+        {"uptime",       "Uptime",            "s",     "duration",  nullptr},
+        {"cpu_c0",       "CPU core 0",        "%",     nullptr,     "mdi:cpu-32-bit"},
+        {"cpu_c1",       "CPU core 1",        "%",     nullptr,     "mdi:cpu-32-bit"},
+        {"int_free",     "Internal RAM free", "B",     "data_size", nullptr},
+        {"psram_free",   "PSRAM free",        "B",     "data_size", nullptr},
+        {"device_count", "Devices",           nullptr, nullptr,     "mdi:zigbee"},
+    };
+    for (const Sensor& s : kSensors) {
+        JsonDocument doc;
+        char buf[96];   // char[], so each assignment below is copied
+        doc["name"] = s.name;
+        snprintf(buf, sizeof(buf), "zhac_bridge_%s_%s", c.bridge_id, s.key);
+        doc["unique_id"] = buf;
+        snprintf(buf, sizeof(buf), "%s/bridge/metrics", c.root);
+        doc["state_topic"] = buf;
+        snprintf(buf, sizeof(buf), "{{ value_json.%s }}", s.key);
+        doc["value_template"] = buf;
+        if (s.unit) doc["unit_of_measurement"] = s.unit;
+        if (s.device_class) doc["device_class"] = s.device_class;
+        // Uptime only ever climbs; long-term statistics of it are noise.
+        if (strcmp(s.key, "uptime") != 0) doc["state_class"] = "measurement";
+        if (s.icon) doc["icon"] = s.icon;
+        doc["entity_category"] = "diagnostic";
+        snprintf(buf, sizeof(buf), "%s/availability", c.root);
+        doc["availability_topic"] = buf;
+        // Identifiers alone attach the sensor to the device build_bridge
+        // describes; its name, model and version stay in one place.
+        snprintf(buf, sizeof(buf), "zhac_bridge_%s", c.bridge_id);
+        doc["device"]["identifiers"].to<JsonArray>().add(buf);
+        JsonObject org = doc["origin"].to<JsonObject>();
+        org["name"] = "ZHAC";
+        org["support_url"] = kSupportUrl;
+
+        char topic[160];
+        snprintf(topic, sizeof(topic), "%s/sensor/zhac_bridge_%s_%s/config", c.prefix, c.bridge_id, s.key);
+        char payload[768];   // ~500 B with a 31-character root; not kPayloadCap: the caller's stack is small
+        const size_t n = serializeJson(doc, payload, sizeof(payload));
+        if (n > 0 && n < sizeof(payload)) emit("sensor", topic, payload, user);
+    }
+}
+
 int state_topic(char* out, size_t cap, const char* root, uint64_t ieee, const char* key) {
     const int n = snprintf(out, cap, "%s/devices/%016" PRIX64 "/%s", root, ieee, key);
     return (n < 0 || static_cast<size_t>(n) >= cap) ? -1 : n;

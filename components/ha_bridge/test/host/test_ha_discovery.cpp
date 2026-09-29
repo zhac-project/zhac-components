@@ -213,6 +213,44 @@ static void test_bad_input_and_bridge() {
     CHECK(br && std::string(br->cfg["device"]["sw_version"]) == "v2026091801");
 }
 
+static void test_bridge_metrics() {
+    char id[32];
+    ha::bridge_id(id, sizeof(id), "home/zhac-garage");
+    CHECK(std::string(id) == "home_zhac-garage");
+    ha::bridge_id(id, sizeof(id), "zhac");
+    CHECK(std::string(id) == "zhac");
+    ha::bridge_id(id, 5, "home/zhac");                 // truncates, still terminated
+    CHECK(std::string(id) == "home");
+
+    g_out.clear();
+    const ha::Context ctx{"homeassistant", "home/zhac-garage", "home_zhac-garage"};
+    ha::build_bridge_metrics(ctx, collect, nullptr);
+    CHECK(g_out.size() == 6);
+    const char* keys[] = {"uptime", "cpu_c0", "cpu_c1", "int_free", "psram_free", "device_count"};
+    for (const char* k : keys) {
+        const std::string uid = std::string("zhac_bridge_home_zhac-garage_") + k;
+        const Entity* e = get(uid.c_str());
+        CHECK(e && e->component == "sensor");
+        CHECK(e && e->topic == "homeassistant/sensor/" + uid + "/config");
+        CHECK(e && std::string(e->cfg["state_topic"]) == "home/zhac-garage/bridge/metrics");
+        CHECK(e && std::string(e->cfg["value_template"]) == std::string("{{ value_json.") + k + " }}");
+        CHECK(e && std::string(e->cfg["entity_category"]) == "diagnostic");
+        CHECK(e && std::string(e->cfg["availability_topic"]) == "home/zhac-garage/availability");
+        // the hub's own device, as build_bridge names it
+        CHECK(e && std::string(e->cfg["device"]["identifiers"][0]) == "zhac_bridge_home_zhac-garage");
+    }
+    const Entity* up = get("zhac_bridge_home_zhac-garage_uptime");
+    CHECK(up && std::string(up->cfg["device_class"]) == "duration" && std::string(up->cfg["unit_of_measurement"]) == "s");
+    CHECK(up && up->cfg["state_class"].isNull());
+    const Entity* ram = get("zhac_bridge_home_zhac-garage_int_free");
+    CHECK(ram && std::string(ram->cfg["device_class"]) == "data_size" && std::string(ram->cfg["unit_of_measurement"]) == "B");
+    CHECK(ram && std::string(ram->cfg["state_class"]) == "measurement");
+    const Entity* cpu = get("zhac_bridge_home_zhac-garage_cpu_c1");
+    CHECK(cpu && std::string(cpu->cfg["unit_of_measurement"]) == "%" && std::string(cpu->cfg["name"]) == "CPU core 1");
+    const Entity* dev = get("zhac_bridge_home_zhac-garage_device_count");
+    CHECK(dev && dev->cfg["unit_of_measurement"].isNull() && dev->cfg["device_class"].isNull());
+}
+
 static void test_topics_and_payloads() {
     uint64_t ieee = 0;
     char key[32];
@@ -415,6 +453,7 @@ int main() {
     test_light();
     test_plug_select_number_and_skips();
     test_bad_input_and_bridge();
+    test_bridge_metrics();
     test_topics_and_payloads();
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("ha_discovery: all checks passed\n");

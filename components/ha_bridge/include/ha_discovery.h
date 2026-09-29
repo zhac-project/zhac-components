@@ -69,6 +69,18 @@ int device_availability_topic(char* out, size_t cap, const char* root, uint64_t 
 void build_bridge(const Context& c, const char* fw_version, const char* model,
                   EmitFn emit, void* user);
 
+// Context::bridge_id for a root topic: every character Home Assistant does not
+// take in an id becomes '_' ("home/zhac-garage" -> "home_zhac-garage").
+void bridge_id(char* out, size_t cap, const char* root);
+
+// Diagnostic sensors on the hub's own device (the one build_bridge makes):
+// uptime, CPU per core, free internal RAM, free PSRAM and device count, read
+// with value_json templates from the JSON a firmware publishes on
+// <root>/bridge/metrics (keys as in /api/status). Topics are
+// <prefix>/sensor/zhac_bridge_<bridge_id>_<key>/config; an empty retained
+// payload on each removes the sensor again.
+void build_bridge_metrics(const Context& c, EmitFn emit, void* user);
+
 // <root>/devices/<IEEE>/<key>. Returns length, or -1 if it does not fit.
 int state_topic(char* out, size_t cap, const char* root, uint64_t ieee, const char* key);
 
