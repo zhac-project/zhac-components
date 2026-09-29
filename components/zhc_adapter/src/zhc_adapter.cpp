@@ -1879,6 +1879,10 @@ bool dispatch_and_send(uint64_t ieee,
                  static_cast<unsigned long long>(ieee), key);
         return false;
     }
+    // A write z2m makes on a fixed endpoint goes there whatever the caller
+    // named: a wall switch's operation_mode_right to its right button's
+    // endpoint, a legacy switch's genBasic write to endpoint 1.
+    if (r.endpoint) target_ep = r.endpoint;
 
     // A Tuya dataRequest / sendData carries its own 2-byte sequence after the
     // ZCL header. The library writes a constant 1; z2m and ZHA number every
