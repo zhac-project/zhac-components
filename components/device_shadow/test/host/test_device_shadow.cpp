@@ -799,6 +799,37 @@ int main() {
         CHECK(read_attr_blob(F, "state", &o) && o.int_val == 1, "flush_now writes it");
     }
 
+    // ── G17: remove_attr drops one key from RAM and from the saved blob ────
+    // A raw `dp_<id>` value saved while a Tuya datapoint was still unmapped
+    // stayed on the States tab forever once the definition learnt it; the
+    // adapter now retires it through this call.
+    {
+        printf("\nG17 remove_attr\n");
+        nvs_stub_reset();
+        const uint64_t R = 0x0F90ULL;
+        ZapDevice rd{};
+        rd.ieee_addr = R;
+        ZclAttribute ra[3]{};
+        zcl_attr_set_int(&ra[0], "co2", 363, VAL_INT);
+        zcl_attr_set_int(&ra[1], "dp_20", 5, VAL_INT);
+        zcl_attr_set_int(&ra[2], "voc", 14, VAL_INT);
+        device_shadow_process(&rd, ra, 3);
+        device_shadow_flush_now();
+        ShadowAttr o{};
+        CHECK(read_attr_blob(R, "dp_20", &o), "dp_20 saved before the definition knew DP20");
+
+        CHECK(device_shadow_remove_attr(R, "dp_20"), "remove_attr reports the key it dropped");
+        CHECK(!device_shadow_get_attr(R, "dp_20", &o), "dp_20 gone from RAM");
+        CHECK(device_shadow_get_attr(R, "co2", &o) && o.int_val == 363 &&
+              device_shadow_get_attr(R, "voc", &o) && o.int_val == 14, "the other keys stay");
+        device_shadow_flush_now();
+        CHECK(!read_attr_blob(R, "dp_20", &o) && read_attr_blob(R, "voc", &o),
+              "and gone from the saved blob, which keeps the rest");
+
+        CHECK(!device_shadow_remove_attr(R, "dp_20"), "removing an absent key is a no-op");
+        CHECK(!device_shadow_remove_attr(0x0DEADULL, "dp_20"), "unknown device is a no-op");
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);
     return s_failures ? 1 : 0;
 }

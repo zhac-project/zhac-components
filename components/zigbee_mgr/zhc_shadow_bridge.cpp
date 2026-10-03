@@ -79,6 +79,12 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
                                       const char* str_val) {
     if (!key) return;
 
+    // A raw `dp_<id>` the definition now decodes: forget the saved value.
+    if (value_kind == ZHAC_SHADOW_KIND_REMOVE) {
+        device_shadow_remove_attr(ieee, key);
+        return;
+    }
+
     // F6/F35 (FINDINGS.md): pool_find_by_ieee returns a raw pointer whose
     // array slot a concurrent swap-with-last pool_remove can relocate.
     // Snapshot the device under the advisory lock and operate on the copy

@@ -840,6 +840,24 @@ void fire_shadow_updates(std::uint64_t ieee,
     }
 }
 
+// While a Tuya datapoint is unmapped, dispatch surfaces it as a raw `dp_<id>`
+// key, and the shadow keeps that value across reboots. Once the definition
+// decodes the datapoint, the raw row would sit on the States tab forever:
+// ask the shadow to forget it. Skipped when this very frame still surfaced
+// the datapoint raw (a map entry that abstained on the payload).
+void drop_stale_raw_dps(std::uint64_t ieee, const zhc::PreparedDefinition& def,
+                        std::span<const zhc::TuyaDpRecord> dps,
+                        const zhc::DispatchResult& result) {
+    if (!g_shadow_update) return;
+    for (const auto& rec : dps) {
+        char key[8];
+        std::snprintf(key, sizeof(key), "dp_%u", static_cast<unsigned>(rec.dp_id));
+        if (result.merged.find(key)) continue;
+        if (!zhc::tuya::definition_decodes_dp(def, rec.dp_id)) continue;
+        g_shadow_update(ieee, key, ZHAC_SHADOW_KIND_REMOVE, 0, 0, 0.0f, false, nullptr);
+    }
+}
+
 }  // namespace
 
 extern "C" void zhac_adapter_register_shadow(zhac_shadow_update_fn_t fn) {
@@ -1595,7 +1613,10 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     }
 
     log_payload(ieee, *def, result, cluster_id, &msg, zcl, zcl_len);
-    if (result.any_matched) fire_shadow_updates(ieee, result);
+    if (result.any_matched) {
+        fire_shadow_updates(ieee, result);
+        drop_stale_raw_dps(ieee, *def, dp_span, result);
+    }
     // The device just transmitted, so it is awake: resend what it missed
     // (dropping what this frame reported, i.e. what it has applied).
     wake_seen(ieee, ctx.device_nwk, &result);

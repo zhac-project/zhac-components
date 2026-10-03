@@ -146,6 +146,11 @@ bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out);
 // The NVS blob is erased so stale data is not reloaded on the next boot.
 void device_shadow_clear_attrs(uint64_t ieee);
 
+// Drop one cached attr: from RAM now, from NVS at the device's next sweep (or
+// flush_now). zhc_adapter uses it to retire a raw `dp_<id>` value saved while
+// that Tuya datapoint was still unmapped. False when the device or key is unknown.
+bool device_shadow_remove_attr(uint64_t ieee, const char* key);
+
 // Forget a device entirely (SHA-F3 / FINDINGS §9). Unlike
 // device_shadow_clear_attrs — which only blanks attrs[] so a *rejoining*
 // device starts clean while the slot lives on — this RECLAIMS the table slot

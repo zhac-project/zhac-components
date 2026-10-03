@@ -709,6 +709,16 @@ int main() {
         g_stub_shadow_fn(kPlainIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
         CHECK(device_shadow_get_occupancy_timeout(kPlainIeee) == 0,
               "a def without the option gets no interval (reports no-motion itself)");
+
+        // A raw `dp_<id>` the definition now decodes: zhc_adapter sends
+        // ZHAC_SHADOW_KIND_REMOVE and the saved value goes.
+        g_stub_shadow_fn(kBatIeee, "dp_20", 3 /*Int*/, 5, 0, 0.0f, false, nullptr);
+        ShadowAttr sa{};
+        CHECK(device_shadow_get_attr(kBatIeee, "dp_20", &sa) && sa.int_val == 5, "raw dp_20 saved");
+        g_stub_shadow_fn(kBatIeee, "dp_20", ZHAC_SHADOW_KIND_REMOVE, 0, 0, 0.0f, false, nullptr);
+        CHECK(!device_shadow_get_attr(kBatIeee, "dp_20", &sa), "REMOVE kind drops the saved dp_20");
+        CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
+              "and leaves the device alone");
     }
 
     // ── G13: meter-poll device source (zhc_shadow_bridge) ───────────────

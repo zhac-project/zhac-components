@@ -164,7 +164,9 @@ void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk);
 // value_kind encoding mirrors zhc::ValueType — adapter users don't need
 // to pull in the C++ enum; values are: 1=Bool, 2=Uint, 3=Int, 4=Float,
 // 5=StringRef. Unused numeric fields are set to 0; str_val is null when
-// not applicable.
+// not applicable. ZHAC_SHADOW_KIND_REMOVE asks to forget `key` instead (a
+// raw `dp_<id>` the definition now decodes); the value fields are unused.
+#define ZHAC_SHADOW_KIND_REMOVE 0xFF
 typedef void (*zhac_shadow_update_fn_t)(uint64_t ieee,
                                           const char* key,
                                           uint8_t value_kind,

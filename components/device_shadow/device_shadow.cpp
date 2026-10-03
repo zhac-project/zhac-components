@@ -1149,6 +1149,30 @@ void device_shadow_clear_attrs(uint64_t ieee) {
     }
 }
 
+bool device_shadow_remove_attr(uint64_t ieee, const char* key) {
+    if (!key) return false;
+    bool removed = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (DeviceShadowEntry* e = find_entry(ieee)) {
+        for (uint8_t j = 0; j < e->attr_count; j++) {
+            if (strncmp(e->attrs[j].key, key, ATTR_KEY_MAX) != 0) continue;
+            // Shift the tail down so the remaining attrs keep their order.
+            memmove(&e->attrs[j], &e->attrs[j + 1],
+                    (size_t)(e->attr_count - j - 1) * sizeof(e->attrs[0]));
+            e->attr_count--;
+            memset(&e->attrs[e->attr_count], 0, sizeof(e->attrs[0]));
+            mark_attrs_dirty(e);
+            removed = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    if (removed) {
+        ESP_LOGI(TAG, "Dropped stale attr '%s' ieee=0x%016llX", key, (unsigned long long)ieee);
+    }
+    return removed;
+}
+
 // T27 (FINDINGS §9, SHA-F3): reclaim a departed device's table slot + timers +
 // BOTH NVS keys. See the header for the contract; in short, this is the
 // "forget forever" teardown, distinct from clear_attrs (which keeps the slot
