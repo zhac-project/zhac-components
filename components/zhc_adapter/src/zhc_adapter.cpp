@@ -34,6 +34,7 @@
 
 #include "definitions/lumi/_shared.hpp"
 #include "definitions/tuya/_shared.hpp"   // exposes_from_dp_map
+#include "definitions/_generic/_shared.hpp"   // color_hex_support
 #include "zhc/devices/lumi_registry.hpp"
 #include "zhc/devices/efekta_registry.hpp"
 #include "zhc/devices/adeo_registry.hpp"
@@ -1380,6 +1381,18 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
             emit_one(e);
         }
     }
+    // Colour lights publish `color_hex` (kFzColor) and take it (kTzColor);
+    // the UIs' colour pickers key on this row. Definitions never list it.
+    if (def && !already_emitted_name("color_hex", def) &&
+        !already_emitted_name("color_hex", supp)) {
+        const zhc::generic::ColorHexSupport hex = zhc::generic::color_hex_support(*def);
+        if (hex.read) {
+            if (emitted++) write(",");
+            write("{\"name\":\"color_hex\",\"type\":\"color\",\"access\":");
+            write_num(hex.write ? 0b011u : 0b001u);
+            write("}");
+        }
+    }
     write("]");
     if (pos + 1 >= cap) return 0;   // truncated
     buf[pos] = '\0';
@@ -2045,4 +2058,12 @@ extern "C" bool zhac_adapter_send_string(uint64_t ieee,
     zhc::Value v{}; v.type = zhc::ValueType::StringRef; v.str = value;
     return dispatch_and_send(ieee, model_id, manu_name, nwk_addr, dst_ep,
                               key, v);
+}
+
+extern "C" const char* zhac_adapter_color_hex_mode(uint64_t ieee, const char* model_id,
+                                                  const char* manufacturer_name) {
+    const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
+    if (!def) return nullptr;
+    const zhc::generic::ColorHexSupport hex = zhc::generic::color_hex_support(*def);
+    return hex.write ? hex.mode : nullptr;
 }

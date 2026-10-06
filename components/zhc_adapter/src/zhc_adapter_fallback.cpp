@@ -341,6 +341,7 @@ void emit_color_ctrl(const FallbackSlot& s, BuiltDef& b,
     push_fz(b, &zhc::generic::kFzColorTemperature);
     push_fz(b, &zhc::generic::kFzColor);
     push_tz(b, &zhc::generic::kTzColorTemp);
+    push_tz(b, &zhc::generic::kTzColor);   // color_hex writes (the x/y rows stay read-only)
     push_binding(b, ep, 0x0300);
     push_report(b, ep, 0x0300, 0x0007, /*u16*/ 0x21, 5, 3600, 1);
     static constexpr std::uint16_t kReadColor[] = { 0x0003, 0x0004, 0x0007, 0x0008 };

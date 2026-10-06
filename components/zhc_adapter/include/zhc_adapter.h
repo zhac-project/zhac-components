@@ -328,6 +328,13 @@ bool zhac_adapter_send_number(uint64_t ieee,
                                uint16_t nwk_addr, uint8_t dst_endpoint,
                                const char* key, double value);
 
+// The colour mode a `color_hex` write puts this device's light in ("xy" or
+// "hs"), or NULL when its definition does not take `color_hex`. device_cmd
+// mirrors it into the shadow as `color_mode` after a successful write.
+const char* zhac_adapter_color_hex_mode(uint64_t ieee,
+                                         const char* model_id,
+                                         const char* manufacturer_name);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
