@@ -294,6 +294,51 @@ int main() {
         event_bus_unsubscribe(zcl);
     }
 
+    // ── G2c: the string twin of G2b — a string optimistic write (a colour pick:
+    //    color_hex / color_mode, which many lights never report back) stores
+    //    VAL_STR and emits SHADOW_OPTIMISTIC only. Same probes as G2b. (Named
+    //    G2c, not G3: G3 below is the multi-device isolation block.) A device of
+    //    its own, so the attr counts the later blocks pin on A stay as they were.
+    {
+        printf("\nG2c string optimistic write: VAL_STR stored, SHADOW_OPTIMISTIC yes, ZCL_ATTR no\n");
+        const uint64_t K = 0x0A10ULL;
+        make_known(K);
+
+        ZclAttrEvent got{};
+        int opt_seen = 0, zcl_seen = 0;
+        auto noop = [](const Event&){};
+        EventSubHandle opt = event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, noop,
+            [&](const Event& e){ opt_seen++; got = *reinterpret_cast<const ZclAttrEvent*>(e.data); return false; });
+        EventSubHandle zcl = event_bus_subscribe(EventType::ZCL_ATTR, noop,
+            [&](const Event&){ zcl_seen++; return false; });
+
+        device_shadow_update_optimistic_str(K, "color_hex", "#ff8a3d");
+        ShadowAttr o{};
+        CHECK(device_shadow_get_attr(K, "color_hex", &o) && o.val_type == VAL_STR &&
+              strcmp(o.str_val, "#ff8a3d") == 0, "G2c: optimistic string stored as VAL_STR");
+        CHECK(opt_seen == 1, "string optimistic write publishes exactly one SHADOW_OPTIMISTIC event");
+        CHECK(got.ieee == K && strcmp(got.key, "color_hex") == 0 && got.val_type == VAL_STR &&
+              strcmp(got.str_val, "#ff8a3d") == 0,
+              "SHADOW_OPTIMISTIC payload carries ieee/key/type/text");
+        CHECK(zcl_seen == 0, "string optimistic write emits NO ZCL_ATTR (rule engine won't self-trigger)");
+
+        ShadowAttr all[8]{};
+        device_shadow_update_optimistic_str(K, "color_hex", "#00ff00");
+        CHECK(device_shadow_get_attr(K, "color_hex", &o) && strcmp(o.str_val, "#00ff00") == 0 &&
+              device_shadow_get_attrs(K, all, 8) == 1,
+              "re-writing a string key replaces the text in place (still one slot)");
+        CHECK(opt_seen == 2, "second string write publishes a second event");
+
+        device_shadow_update_optimistic_str(0x0DEADULL, "color_hex", "#ff8a3d");   // unknown → find-only
+        device_shadow_update_optimistic_str(K, nullptr, "#ff8a3d");                  // no key
+        device_shadow_update_optimistic_str(K, "color_hex", nullptr);                // no text
+        CHECK(opt_seen == 2 && device_shadow_get_attr(K, "color_hex", &o) && strcmp(o.str_val, "#00ff00") == 0,
+              "unknown device / null key / null text: no emit, nothing stored");
+
+        event_bus_unsubscribe(opt);   // filters capture block-locals — remove before they dangle
+        event_bus_unsubscribe(zcl);
+    }
+
     // ── G3: isolation by IEEE + unknown-device reads ───────────────────────
     {
         printf("\nG3 multi-device isolation\n");

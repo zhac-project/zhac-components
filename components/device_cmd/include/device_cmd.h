@@ -16,8 +16,12 @@
 //     converter owns scaling; a converter that only takes integers refuses a
 //     decimal and that comes back as DEVCMD_NO_CONVERTER, never a truncation;
 //   * on success the shadow gets an optimistic value: "state" -> VAL_BOOL,
-//     other integers -> VAL_INT, decimals -> VAL_FLOAT x100, strings -> none
-//     (the shadow holds numbers; the device's report supplies the rest).
+//     other integers -> VAL_INT, decimals -> VAL_FLOAT x100,
+//     strings -> none, except color_hex (mirrored lower-case, with color_mode)
+//     color_temp also mirrors color_mode = "color_temp"
+//     (the device's report supplies the rest);
+//   * a color_hex that is not "#rrggbb" is refused as DEVCMD_BAD_COLOUR before
+//     anything is sent or stored.
 #pragma once
 
 #include <stdbool.h>
@@ -51,6 +55,7 @@ typedef enum {
     DEVCMD_NO_CONVERTER,   // no converter claims the key for this device, or it refused the value
     DEVCMD_BAD_NAME,       // rename: empty, longer than 29 bytes, or holds a quote, backslash or control character
     DEVCMD_RADIO,          // the radio refused (permit join)
+    DEVCMD_BAD_COLOUR,     // color_hex that is not "#rrggbb" (set_attr)
 } DevCmdResult;
 
 // The words every transport answers with. Stable: the web UI and the docs use them.

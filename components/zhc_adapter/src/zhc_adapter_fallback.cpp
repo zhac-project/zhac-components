@@ -31,7 +31,7 @@ constexpr std::size_t kMaxEndpoints = 4;
 constexpr std::size_t kMaxClusters  = 12;   // matches ZAP_CLUSTERS_PER_EP
 constexpr std::size_t kMaxExposes   = 16;
 constexpr std::size_t kMaxFz        = 8;
-constexpr std::size_t kMaxTz        = 4;
+constexpr std::size_t kMaxTz        = 8;
 constexpr std::size_t kMaxBindings  = 8;
 constexpr std::size_t kMaxReports   = 16;
 constexpr std::size_t kMaxSteps     = 16;
@@ -341,7 +341,9 @@ void emit_color_ctrl(const FallbackSlot& s, BuiltDef& b,
     push_fz(b, &zhc::generic::kFzColorTemperature);
     push_fz(b, &zhc::generic::kFzColor);
     push_tz(b, &zhc::generic::kTzColorTemp);
-    push_tz(b, &zhc::generic::kTzColor);   // color_hex writes (the x/y rows stay read-only)
+    // kTzColor takes every colour key (color_hex, color_xy, color_hs,
+    // color_x/color_y, hue/saturation); the x/y exposes above stay read-only.
+    push_tz(b, &zhc::generic::kTzColor);
     push_binding(b, ep, 0x0300);
     push_report(b, ep, 0x0300, 0x0007, /*u16*/ 0x21, 5, 3600, 1);
     static constexpr std::uint16_t kReadColor[] = { 0x0003, 0x0004, 0x0007, 0x0008 };

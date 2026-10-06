@@ -1004,6 +1004,28 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
     xSemaphoreGive(s_emit_mutex);
 }
 
+// The string twin of the above: same lock order (s_emit_mutex outermost, held
+// across stage + publish; s_mutex released before publish_staged), same
+// SHADOW_OPTIMISTIC emit, same find-only rule (an unknown device is a no-op).
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* str_val)
+{
+    if (!key || !str_val) return;
+    xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_entry(ieee);
+    bool staged = false;
+    if (e) {
+        ZclAttribute a{};
+        zcl_attr_set_str(&a, key, str_val);
+        upsert_cache(e, &a, 1);
+        stage_attrs(e, &a, 1);
+        staged = true;
+    }
+    xSemaphoreGive(s_mutex);
+    if (staged) publish_staged(EventType::SHADOW_OPTIMISTIC);
+    xSemaphoreGive(s_emit_mutex);
+}
+
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);

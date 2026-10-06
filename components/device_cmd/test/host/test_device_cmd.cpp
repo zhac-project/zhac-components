@@ -53,7 +53,61 @@ int main() {
     arm(); v = device_cmd_str("restore");
     CHECK(device_cmd_set_attr(IEEE, 0, "power_outage_memory", &v) == DEVCMD_OK &&
           std::strcmp(g_send.kind, "string") == 0 && std::strcmp(g_send.s, "restore") == 0, "string -> adapter string");
-    CHECK(g_shadow.writes == 0, "string writes no shadow value");
+    CHECK(g_shadow.writes == 0 && g_shadow.str_writes == 0, "an ordinary string writes no shadow value");
+
+    // color_hex: refused before any send when it is not #rrggbb
+    arm(); v = device_cmd_str("orange");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_BAD_COLOUR && g_send.calls == 0,
+          "bad colour refused, nothing sent");
+    CHECK(std::strcmp(device_cmd_result_str(DEVCMD_BAD_COLOUR), "colour must be #rrggbb") == 0, "bad colour wording");
+    // color_hex: sent as a string, mirrored lower-case with the adapter's mode
+    arm(); v = device_cmd_str("#FF8A3D");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && std::strcmp(g_send.kind, "string") == 0,
+          "colour goes to the adapter as a string");
+    CHECK(g_shadow.str_writes == 2 && std::strcmp(g_shadow.str_key[0], "color_hex") == 0 &&
+          std::strcmp(g_shadow.str_val[0], "#ff8a3d") == 0 && std::strcmp(g_shadow.str_key[1], "color_mode") == 0 &&
+          std::strcmp(g_shadow.str_val[1], "xy") == 0, "colour and mode mirrored");
+    // a channel suffix carries over to the mode key
+    arm(); v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex_l2", &v) == DEVCMD_OK &&
+          std::strcmp(g_shadow.str_key[0], "color_hex_l2") == 0 && std::strcmp(g_shadow.str_key[1], "color_mode_l2") == 0,
+          "suffix carried");
+    // no mode from the adapter: only the colour is mirrored
+    arm(); g_hex_mode = nullptr; v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && g_shadow.str_writes == 1, "mode only when known");
+    // a refused send mirrors nothing
+    arm(); g_send_result = false; v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_NO_CONVERTER && g_shadow.str_writes == 0,
+          "failed colour mirrors nothing");
+    // color_temp also mirrors color_mode = color_temp
+    arm(); v = device_cmd_int(300);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.writes == 1 &&
+          g_shadow.str_writes == 1 && std::strcmp(g_shadow.str_key[0], "color_mode") == 0 &&
+          std::strcmp(g_shadow.str_val[0], "color_temp") == 0, "white mode mirrored");
+    // color_temp_startup is not color_temp
+    arm(); v = device_cmd_int(300);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp_startup", &v) == DEVCMD_OK && g_shadow.str_writes == 0,
+          "startup temperature leaves the mode alone");
+    // a decimal temperature and a channel suffix mirror the mode the same way
+    arm(); v = device_cmd_float(300.5);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.str_writes == 1 &&
+          std::strcmp(g_shadow.str_key[0], "color_mode") == 0, "decimal white pick mirrors the mode");
+    arm(); v = device_cmd_int(300);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp_l2", &v) == DEVCMD_OK &&
+          std::strcmp(g_shadow.str_key[0], "color_mode_l2") == 0 && std::strcmp(g_shadow.str_val[0], "color_temp") == 0,
+          "white pick on a channel mirrors that channel's mode");
+    // every other way a colour can be malformed: short, long, non-hex digit, no '#', bare '#', not text, suffixed key
+    arm();
+    {
+        const char* bad[] = { "#ff8a3", "#ff8a3d0", "#gg8a3d", "ff8a3dx", "#", "" };
+        bool all = true;
+        for (const char* s : bad) { v = device_cmd_str(s); all = all && device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_BAD_COLOUR; }
+        v = device_cmd_int(255);
+        all = all && device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_BAD_COLOUR;
+        v = device_cmd_str("orange");
+        all = all && device_cmd_set_attr(IEEE, 0, "color_hex_l2", &v) == DEVCMD_BAD_COLOUR;
+        CHECK(all && g_send.calls == 0 && g_shadow.str_writes == 0, "malformed colours refused, nothing sent or stored");
+    }
 
     // explicit endpoint wins over the device default
     arm(); v = device_cmd_bool(false);

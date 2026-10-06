@@ -322,6 +322,11 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
     s_opt_val = int_val;
 }
 
+// device_cmd mirrors a colour pick (a string) and the adapter's colour mode;
+// no rule test writes a colour, so neither records anything.
+void device_shadow_update_optimistic_str(uint64_t, const char*, const char*) {}
+extern "C" const char* zhac_adapter_color_hex_mode(uint64_t, const char*, const char*) { return nullptr; }
+
 // ── zhc_adapter / mqtt_gw: sinks ─────────────────────────────────────────
 // Send result is settable so a test can exercise the failure path (no
 // optimistic shadow write when the command never went out).
