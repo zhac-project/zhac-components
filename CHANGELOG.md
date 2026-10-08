@@ -7,6 +7,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rule names are cut between characters, never inside one** (`simple_rules_add` / `simple_rules_update`), and a name stored cut by older firmware reads back whole (`rule_store_load` / `rule_store_load_all` trim the copy after the CRC check; `rule_store_trim_name()` in `rule_store.h`). The hub page sends names of any length and the slot keeps 23 bytes, so a 12-letter Cyrillic name ended in half a character: invalid UTF-8 in every `rule.added` / `rule.updated` / `rule.list` that carried it, which closes the cloud link and the hub-page tabs. No NVS migration: the next save writes the clean name. Host tests in `simple_rules/test/host` and `rule_store/test/host`.
+
 ### Added
 
 - **`simple_rules_check(dsl, err, cap)`** (`simple_rules`): parses a rule as a save would (the 499-byte limit, then the parser) and stores nothing, with no `RULE_CHANGED`; for the hubs' `rule.check` (remote rules editing, spec 2026-10-05). Host test `test/host/test_check.cpp`.

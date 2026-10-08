@@ -121,6 +121,32 @@ int main() {
     CHECK(!rule_store_load(9, &out) && nvs_stub_rule_count() == 0,
           "flush_now applies the tombstone (gone from NVS)");
 
+    // ── a name stored cut inside a character (older firmware) reads back whole ──
+    // make_slot's strncpy keeps 23 of the 24 bytes of 12 Cyrillic letters: 11 letters and half of the 12th,
+    // which is what simple_rules stored before it cut between characters. Every reader gets the 11 letters.
+    {
+        static const char kCyr12[] = "абвгдежзийкл";
+        static const char kCyr11[] = "абвгдежзийк";
+        nvs_stub_reset();
+        rule_store_init();
+        RuleSlot cut = make_slot(11, kCyr12, "ON x#s=1 DO log m ENDON", true);
+        CHECK(strlen(cut.name) == 23, "the stored name ends in half a character");
+        rule_store_save(&cut);
+        CHECK(rule_store_load(11, &out) && strcmp(out.name, kCyr11) == 0, "load trims the partial character");
+        RuleSlot all[4]{};
+        CHECK(rule_store_load_all(all, 4) == 1 && strcmp(all[0].name, kCyr11) == 0,
+              "load_all trims it too");
+        rule_store_flush_init();
+        RuleSlot pend = make_slot(12, kCyr12, "ON x#s=1 DO log m ENDON", true);
+        rule_store_mark_dirty(&pend);
+        CHECK(rule_store_load(12, &out) && strcmp(out.name, kCyr11) == 0,
+              "a pending (unflushed) slot reads back trimmed");
+        RuleSlot ok = make_slot(13, "ok-name", "ON x#s=1 DO log m ENDON", true);
+        rule_store_save(&ok);
+        CHECK(rule_store_load(13, &out) && strcmp(out.name, "ok-name") == 0, "a whole name is left alone");
+        rule_store_flush_now();
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

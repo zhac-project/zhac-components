@@ -1029,7 +1029,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     slot.trigger_type = (uint8_t)r.trigger.type;
     if (name) {
         strncpy(slot.name, name, sizeof(slot.name) - 1);
-        slot.name[sizeof(slot.name) - 1] = '\0';
+        rule_store_trim_name(slot.name, sizeof(slot.name));   // cut between characters, not inside one
     }
     slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
     memcpy(slot.src, dsl, dsl_len);
@@ -1099,7 +1099,7 @@ bool simple_rules_update(uint16_t rule_id,
     slot.trigger_type = (uint8_t)r.trigger.type;
     if (name) {
         strncpy(slot.name, name, sizeof(slot.name) - 1);
-        slot.name[sizeof(slot.name) - 1] = '\0';
+        rule_store_trim_name(slot.name, sizeof(slot.name));   // cut between characters, not inside one
     }
     slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
     memcpy(slot.src, dsl, dsl_len);

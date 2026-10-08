@@ -75,5 +75,23 @@ int main() {
         CHECK(ids[0] == rid && ids[3] == rid, "RULE_CHANGED carries the rule id");
         CHECK(!simple_rules_enable(9999, true) && n == 4, "a failed mutation publishes nothing");
     }
+
+    // A name longer than the 23 bytes a slot keeps is cut between characters, never inside one: a cut
+    // character is invalid UTF-8, and one invalid byte in a WebSocket text frame closes the socket.
+    {
+        static const char kCyr12[] = "абвгдежзийкл";   // 12 letters, 24 bytes
+        static const char kCyr11[] = "абвгдежзийк";    // what fits: 22 bytes
+        stub_rule_store_reset();
+        simple_rules_init();
+        uint16_t rid = 0;
+        RuleSlot s{};
+        CHECK(simple_rules_add(kCyr12, "ON Event#go DO log x ENDON", &rid) && stub_rule_store_last_dirty(&s) &&
+              std::strcmp(s.name, kCyr11) == 0, "add: a 12-letter Cyrillic name is stored as its first 11 letters");
+        CHECK(simple_rules_update(rid, kCyr12, "ON Event#go DO log y ENDON") && stub_rule_store_last_dirty(&s) &&
+              std::strcmp(s.name, kCyr11) == 0, "update: the same cut, between characters");
+        CHECK(simple_rules_add("plain_ascii_name_of_30_bytes!!", "ON Event#go DO log x ENDON", &rid) &&
+              stub_rule_store_last_dirty(&s) && std::strcmp(s.name, "plain_ascii_name_of_30_") == 0,
+              "an ASCII name keeps its first 23 bytes");
+    }
     return s_failures ? 1 : 0;
 }
