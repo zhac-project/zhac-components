@@ -17,6 +17,7 @@
 #include "remote_allow.h"
 #include "remote_backoff.h"
 #include "remote_nvs.h"
+#include "utf8_seq.h"   // utf8_valid / utf8_scrub: the send guard (the header lives in ws_server)
 #include "sdkconfig.h"
 
 #include <atomic>
@@ -156,6 +157,9 @@ extern "C" void remote_client_publish_event(const char* name,
         heap_caps_free(buf);
         return;
     }
+    // The cloud's UTF-8 guard (utf8_seq.h): Tomcat closes the hub link (1007) on one invalid byte, so each
+    // byte of an invalid sequence goes out as '?'. The buffer is our own copy; the length does not change.
+    utf8_scrub(buf, n);
 
     TxItem item{ buf, n };
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
@@ -286,6 +290,18 @@ static void send_auth_frame() {
 
 extern "C" void remote_client_send_reply(const char* json, size_t len) {
     if (!s_ws || s_state.load(std::memory_order_acquire) != REMOTE_STATE_READY) return;
+    // The cloud's UTF-8 guard (utf8_seq.h), as in publish_event. The caller's buffer is const and almost
+    // always valid, so a copy is made only when a byte needs replacing; a reply that cannot be copied is
+    // dropped rather than sent invalid (the cloud's request then times out instead of the link closing).
+    if (!utf8_valid(json, len)) {
+        char* fixed = static_cast<char*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!fixed) { ESP_LOGW(TAG, "send_reply: invalid UTF-8 and no memory to repair it -- dropped"); return; }
+        std::memcpy(fixed, json, len);
+        utf8_scrub(fixed, len);
+        esp_websocket_client_send_text(s_ws, fixed, len, pdMS_TO_TICKS(2000));
+        heap_caps_free(fixed);
+        return;
+    }
     esp_websocket_client_send_text(s_ws, json, len, pdMS_TO_TICKS(2000));
 }
 
