@@ -39,7 +39,13 @@ inline constexpr uint32_t kZnpRx        = 4096;
 // stack-protection canary. 8 KB gives ~2× margin.
 inline constexpr uint32_t kRuleCron     = 8192;
 inline constexpr uint32_t kDeviceShadow = 4096;
-inline constexpr uint32_t kTaskLua      = 8192;
+// TaskLua is created with CONFIG_LUA_ENGINE_TASK_STACK_BYTES (32 KB with the Lua C-stack limits in
+// lua_engine/lua_limits.cmake); mirrored here so the stack monitor's total / used are right.
+#ifdef CONFIG_LUA_ENGINE_TASK_STACK_BYTES
+inline constexpr uint32_t kTaskLua      = CONFIG_LUA_ENGINE_TASK_STACK_BYTES;
+#else
+inline constexpr uint32_t kTaskLua      = 32768;
+#endif
 inline constexpr uint32_t kMqttPubP4    = 4096;
 inline constexpr uint32_t kInterviewP4  = 8192;   // alias of kZbInterview when used from main
 

@@ -9,6 +9,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- `task_stacks.h`: `kTaskLua` mirrors `CONFIG_LUA_ENGINE_TASK_STACK_BYTES` (32 KB with the Lua C-stack limits) instead of a fixed 8 KB, so the P4 "Stack HWM" log reports TaskLua's real total and use.
 - **Rule names are cut between characters, never inside one** (`simple_rules_add` / `simple_rules_update`), and a name stored cut by older firmware reads back whole (`rule_store_load` / `rule_store_load_all` trim the copy after the CRC check; `rule_store_trim_name()` in `rule_store.h`). The hub page sends names of any length and the slot keeps 23 bytes, so a 12-letter Cyrillic name ended in half a character: invalid UTF-8 in every `rule.added` / `rule.updated` / `rule.list` that carried it, which closes the cloud link and the hub-page tabs. No NVS migration: the next save writes the clean name. Host tests in `simple_rules/test/host` and `rule_store/test/host`.
 
 ### Added
