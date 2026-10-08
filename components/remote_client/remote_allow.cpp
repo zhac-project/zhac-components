@@ -145,15 +145,16 @@ extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, 
     if (!cmd || !*cmd) return "cmd_not_allowed";
     // Only the hub's own page turns the script switch on, whatever the build trusts the cloud with.
     if (local_only_key && std::strcmp(cmd, "settings.set") == 0) return "local_only";
-    if (listed(kRemoteAllowedCmds, cmd)) return nullptr;
+    // The gated lists first, so an op added to kRemoteAllowedCmds by mistake stays gated (fails closed).
     if (listed(kRemoteScriptCmds, cmd)) return scripts_on ? nullptr : "scripts_off";
+    if (listed(kRemotePrivilegedCmds, cmd)) {
 #ifdef CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED
-    // F9: only reachable when the operator explicitly trusts the cloud peer.
-    if (listed(kRemotePrivilegedCmds, cmd)) return nullptr;
+        return nullptr;   // F9: only reachable when the operator explicitly trusts the cloud peer.
 #else
-    (void)kRemotePrivilegedCmds;
+        return "cmd_not_allowed";
 #endif
-    return "cmd_not_allowed";
+    }
+    return listed(kRemoteAllowedCmds, cmd) ? nullptr : "cmd_not_allowed";
 }
 
 extern "C" bool remote_cmd_allowed(const char* cmd) {
