@@ -24,7 +24,12 @@ StubStore g_store{};
 bool g_send_result = true;
 bool g_radio_result = true;
 bool g_have_backend = false;
-const char* g_hex_mode = "xy";
+bool g_colour_light = true;
+const char* g_state_hex = "#45ff74";
+const char* g_state_mode = "xy";
+int g_state_calls = 0;
+int32_t g_ct_sent = -1;
+double g_ct_asked = 0;
 int64_t g_fake_time_us = 0;
 
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu) {
@@ -39,7 +44,8 @@ void stub_pool_clear() { s_have_dev = false; }
 void stub_reset() {
     g_send = StubSend{}; g_shadow = StubShadow{}; g_store = StubStore{};
     g_send_result = true; g_radio_result = true; g_have_backend = false;
-    g_hex_mode = "xy";
+    g_colour_light = true; g_state_hex = "#45ff74"; g_state_mode = "xy"; g_state_calls = 0;
+    g_ct_sent = -1; g_ct_asked = 0;
 }
 bool stub_pool_removed_flag() { return s_have_dev && zap_dev_is_removed(&s_dev); }
 bool stub_pool_has_device()   { return s_have_dev; }
@@ -86,7 +92,16 @@ void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const c
     }
     g_shadow.str_writes++;
 }
-extern "C" const char* zhac_adapter_color_hex_mode(uint64_t, const char*, const char*) { return g_hex_mode; }
+extern "C" bool zhac_adapter_color_state(uint64_t, const char*, const char*, char* hex, const char** mode) {
+    g_state_calls++;
+    std::snprintf(hex, 8, "%s", g_colour_light ? g_state_hex : "");
+    *mode = g_colour_light ? g_state_mode : nullptr;
+    return g_colour_light;
+}
+extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t, const char*, const char*, double mireds) {
+    g_ct_asked = mireds;
+    return g_ct_sent;
+}
 
 // ── cut two: rename / permit join / remove ──────────────────────────────
 void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {

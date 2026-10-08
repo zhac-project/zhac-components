@@ -22,7 +22,7 @@ const char* device_cmd_result_str(DevCmdResult r) {
         case DEVCMD_NO_CONVERTER: return "no zhc converter";
         case DEVCMD_BAD_NAME:     return "name must be 1-29 characters without quotes, backslashes or control characters";
         case DEVCMD_RADIO:        return "radio refused";
-        case DEVCMD_BAD_COLOUR:   return "colour must be #rrggbb";
+        case DEVCMD_BAD_COLOUR:   return "colour must be #rrggbb, not black";
     }
     return "failed";
 }
@@ -47,10 +47,29 @@ bool is_hex_colour(const char* s) {
     for (int i = 1; i < 7; i++) if (!std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
     return true;
 }
-void mirror_mode(uint64_t ieee, const char* suffix, const char* mode) {
+// The keys a colour write uses (the shared converter's): the channel suffix
+// of `key` when it is one of them, else nullptr.
+const char* colour_suffix(const char* key) {
+    static constexpr const char* kColourKeys[] = {
+        "color_hex", "color_xy", "color_hs", "color_x", "color_y", "hue", "saturation"};
+    for (const char* base : kColourKeys)
+        if (const char* sfx = suffix_of(key, base); is_channel_suffix(sfx)) return sfx;
+    return nullptr;
+}
+void mirror_str(uint64_t ieee, const char* base, const char* suffix, const char* text) {
     char key[ATTR_KEY_MAX];
-    std::snprintf(key, sizeof(key), "color_mode%s", suffix);
-    device_shadow_update_optimistic_str(ieee, key, mode);
+    std::snprintf(key, sizeof(key), "%s%s", base, suffix);
+    device_shadow_update_optimistic_str(ieee, key, text);
+}
+// The colour and its mode as the hub will publish them, from the converter's
+// colour memory the write just updated: the colour at full brightness, not the
+// text that was picked, so the optimistic value and the next report agree.
+void mirror_colour(uint64_t ieee, const char* model, const char* manu, const char* suffix) {
+    char hex[8];
+    const char* mode = nullptr;
+    if (!zhac_adapter_color_state(ieee, model, manu, hex, &mode)) return;
+    if (hex[0]) mirror_str(ieee, "color_hex", suffix, hex);
+    if (mode) mirror_str(ieee, "color_mode", suffix, mode);
 }
 }  // namespace
 
@@ -60,10 +79,12 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
     if (v->kind > DEVCMD_STR) return DEVCMD_BAD_VALUE;
     if (v->kind == DEVCMD_FLOAT && v->f != v->f) return DEVCMD_BAD_VALUE;   // NaN
 
-    // A colour is "#rrggbb" or nothing: refused here, before the pool lookup,
-    // the send and the shadow, so garbage never reaches a converter or a UI.
+    // A colour is "#rrggbb" and not black (no colour; off is the power's job):
+    // refused here, before the pool lookup, the send and the shadow, so garbage
+    // never reaches a converter or a UI, and every caller hears why.
     const char* hex_sfx = suffix_of(key, "color_hex");
-    if (hex_sfx && is_channel_suffix(hex_sfx) && (v->kind != DEVCMD_STR || !is_hex_colour(v->s)))
+    if (is_channel_suffix(hex_sfx) &&
+        (v->kind != DEVCMD_STR || !is_hex_colour(v->s) || std::strcmp(v->s, "#000000") == 0))
         return DEVCMD_BAD_COLOUR;
 
     // Copy what the send needs under the pool lock, then let go of it: the
@@ -102,35 +123,32 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
     // Optimistic shadow: many devices (the whole no-report Tuya class) send
     // nothing back after obeying, so without this the UI and the cloud show
     // the old value until the next physical change. A real report overrides.
+    // A light's white and colour are mirrored in the shape its next report
+    // takes: the mireds it was sent (rounded, clamped to its range) and the
+    // colour from the converter's memory, each with the light's colour mode.
+    const char* ct_sfx = suffix_of(key, "color_temp");
+    const bool white = is_channel_suffix(ct_sfx) && (v->kind == DEVCMD_INT || v->kind == DEVCMD_FLOAT);
+    const int32_t ct_sent = white ? zhac_adapter_color_temp_sent(ieee_cp, model_cp, manu_cp,
+                                        v->kind == DEVCMD_INT ? static_cast<double>(v->i) : v->f)
+                                  : -1;
     switch (v->kind) {
         case DEVCMD_BOOL:
             device_shadow_update_optimistic(ieee_cp, key, VAL_BOOL, v->b ? 1 : 0);
             break;
         case DEVCMD_INT: {
             const uint8_t vt = (std::strcmp(key, "state") == 0) ? VAL_BOOL : VAL_INT;
-            device_shadow_update_optimistic(ieee_cp, key, vt, static_cast<int32_t>(v->i));
-            if (const char* sfx = suffix_of(key, "color_temp"); is_channel_suffix(sfx))
-                mirror_mode(ieee_cp, sfx, "color_temp");
+            device_shadow_update_optimistic(ieee_cp, key, vt, ct_sent >= 0 ? ct_sent : static_cast<int32_t>(v->i));
             break;
         }
         case DEVCMD_FLOAT:
-            device_shadow_update_optimistic(ieee_cp, key, VAL_FLOAT, static_cast<int32_t>(std::lround(v->f * 100.0)));
-            if (const char* sfx = suffix_of(key, "color_temp"); is_channel_suffix(sfx))
-                mirror_mode(ieee_cp, sfx, "color_temp");
+            if (ct_sent >= 0) device_shadow_update_optimistic(ieee_cp, key, VAL_INT, ct_sent);
+            else device_shadow_update_optimistic(ieee_cp, key, VAL_FLOAT, static_cast<int32_t>(std::lround(v->f * 100.0)));
             break;
         case DEVCMD_STR:
-            // Text waits for the device's report, except a colour: the UIs need
-            // it back at once, and many lights never report colour.
-            if (hex_sfx && is_channel_suffix(hex_sfx)) {
-                char lower[8];
-                for (int i = 0; i < 7; i++) lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(v->s[i])));
-                lower[7] = '\0';
-                device_shadow_update_optimistic_str(ieee_cp, key, lower);
-                if (const char* mode = zhac_adapter_color_hex_mode(ieee_cp, model_cp, manu_cp))
-                    mirror_mode(ieee_cp, hex_sfx, mode);
-            }
-            break;
+            break;   // text waits for the device's report; a colour is mirrored below
     }
+    if (white) mirror_str(ieee_cp, "color_mode", ct_sfx, "color_temp");
+    if (const char* sfx = colour_suffix(key)) mirror_colour(ieee_cp, model_cp, manu_cp, sfx);
     return DEVCMD_OK;
 }
 

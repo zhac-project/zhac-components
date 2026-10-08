@@ -20,7 +20,12 @@ struct StubStore {
 };
 extern StubSend g_send; extern StubShadow g_shadow; extern StubStore g_store;
 extern bool g_send_result; extern bool g_radio_result; extern bool g_have_backend;
-extern const char* g_hex_mode;   // what zhac_adapter_color_hex_mode returns ("xy" by default)
+// What zhac_adapter_color_state answers: the light's colour as the hub will
+// publish it ("#45ff74" / "xy" by default), false when g_colour_light is false.
+extern bool g_colour_light; extern const char* g_state_hex; extern const char* g_state_mode;
+extern int g_state_calls;
+// What zhac_adapter_color_temp_sent answers (-1 by default: not the shared converter) and was asked.
+extern int32_t g_ct_sent; extern double g_ct_asked;
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu);
 void stub_pool_clear();
 void stub_reset();

@@ -34,7 +34,7 @@
 
 #include "definitions/lumi/_shared.hpp"
 #include "definitions/tuya/_shared.hpp"   // exposes_from_dp_map
-#include "definitions/_generic/_shared.hpp"   // color_hex_support
+#include "definitions/_generic/_shared.hpp"   // color_hex_support, color_state, color_temp_to_send
 #include "zhc/devices/lumi_registry.hpp"
 #include "zhc/devices/efekta_registry.hpp"
 #include "zhc/devices/adeo_registry.hpp"
@@ -2060,10 +2060,33 @@ extern "C" bool zhac_adapter_send_string(uint64_t ieee,
                               key, v);
 }
 
-extern "C" const char* zhac_adapter_color_hex_mode(uint64_t ieee, const char* model_id,
-                                                  const char* manufacturer_name) {
+extern "C" bool zhac_adapter_color_state(uint64_t ieee, const char* model_id,
+                                         const char* manufacturer_name,
+                                         char* hex, const char** mode) {
+    hex[0] = '\0';
+    *mode = nullptr;
     const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
-    if (!def) return nullptr;
-    const zhc::generic::ColorHexSupport hex = zhc::generic::color_hex_support(*def);
-    return hex.write ? hex.mode : nullptr;
+    if (!def || !zhc::generic::color_hex_support(*def).write) return false;
+    // The device's own runtime scratch, where kTzColor / kFzColor keep its colour.
+    zhc::RuntimeContext ctx{};
+    ctx.store        = &g_store;
+    ctx.store_get    = &zhc::RuntimeStore<kMaxDevices>::get;
+    ctx.device_index = resolve_device_index(ieee);
+    const zhc::generic::ColorState s = zhc::generic::color_state(ctx);
+    std::memcpy(hex, s.hex, sizeof(s.hex));
+    *mode = s.mode;
+    return true;
+}
+
+extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t ieee, const char* model_id,
+                                                const char* manufacturer_name, double mireds) {
+    const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
+    if (!def || !def->to_zigbee) return -1;
+    for (std::uint8_t i = 0; i < def->to_zigbee_count; ++i) {
+        if (def->to_zigbee[i] != &zhc::generic::kTzColorTemp) continue;
+        // As zhac_adapter_send_float hands it over; an integer is exact either way.
+        zhc::Value v{}; v.type = zhc::ValueType::Float; v.f = static_cast<float>(mireds);
+        return zhc::generic::color_temp_to_send(*def, v);
+    }
+    return -1;
 }

@@ -328,12 +328,26 @@ bool zhac_adapter_send_number(uint64_t ieee,
                                uint16_t nwk_addr, uint8_t dst_endpoint,
                                const char* key, double value);
 
-// The colour mode a `color_hex` write puts this device's light in ("xy" or
-// "hs"), or NULL when its definition does not take `color_hex`. device_cmd
-// mirrors it into the shadow as `color_mode` after a successful write.
-const char* zhac_adapter_color_hex_mode(uint64_t ieee,
-                                         const char* model_id,
-                                         const char* manufacturer_name);
+// After a colour write (color_hex, color_xy, color_hs, color_x / color_y,
+// hue, saturation): the light's colour as the hub will publish it, from the
+// shared converter's colour memory, which the write has just updated. `hex`
+// (8 bytes) gets "#rrggbb", or "" when no whole colour is known; `*mode`
+// "xy" / "hs" / "color_temp", or NULL. False (hex "", mode NULL) when the
+// definition does not take colour through that converter (kTzColor).
+// device_cmd mirrors both into the shadow.
+bool zhac_adapter_color_state(uint64_t ieee,
+                              const char* model_id,
+                              const char* manufacturer_name,
+                              char* hex, const char** mode);
+
+// The mireds a color_temp write of `mireds` sends to this device: rounded,
+// clamped to its definition's range. -1 when the definition does not write
+// color_temp through the shared converter (kTzColorTemp) or refuses the
+// value. device_cmd mirrors it, so the shadow holds what the light got.
+int32_t zhac_adapter_color_temp_sent(uint64_t ieee,
+                                     const char* model_id,
+                                     const char* manufacturer_name,
+                                     double mireds);
 
 #ifdef __cplusplus
 }  // extern "C"

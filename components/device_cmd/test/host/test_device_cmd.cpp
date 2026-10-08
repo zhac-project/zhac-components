@@ -55,47 +55,103 @@ int main() {
           std::strcmp(g_send.kind, "string") == 0 && std::strcmp(g_send.s, "restore") == 0, "string -> adapter string");
     CHECK(g_shadow.writes == 0 && g_shadow.str_writes == 0, "an ordinary string writes no shadow value");
 
-    // color_hex: refused before any send when it is not #rrggbb
+    // color_hex: refused before any send when it is not #rrggbb, or is black
     arm(); v = device_cmd_str("orange");
     CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_BAD_COLOUR && g_send.calls == 0,
           "bad colour refused, nothing sent");
-    CHECK(std::strcmp(device_cmd_result_str(DEVCMD_BAD_COLOUR), "colour must be #rrggbb") == 0, "bad colour wording");
-    // color_hex: sent as a string, mirrored lower-case with the adapter's mode
-    arm(); v = device_cmd_str("#FF8A3D");
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && std::strcmp(g_send.kind, "string") == 0,
-          "colour goes to the adapter as a string");
+    CHECK(std::strcmp(device_cmd_result_str(DEVCMD_BAD_COLOUR), "colour must be #rrggbb, not black") == 0,
+          "bad colour wording names black");
+    arm(); v = device_cmd_str("#000000");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_BAD_COLOUR &&
+          device_cmd_set_attr(IEEE, 0, "color_hex_l2", &v) == DEVCMD_BAD_COLOUR &&
+          g_send.calls == 0 && g_shadow.writes == 0 && g_shadow.str_writes == 0,
+          "black refused before anything is sent or stored");
+    // color_hex: sent as a string; mirrored as the light will report it (the
+    // adapter's colour state: the colour at full brightness), with its mode
+    arm(); v = device_cmd_str("#34C759");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && std::strcmp(g_send.kind, "string") == 0 &&
+          std::strcmp(g_send.s, "#34C759") == 0, "colour goes to the adapter as a string");
     CHECK(g_shadow.str_writes == 2 && std::strcmp(g_shadow.str_key[0], "color_hex") == 0 &&
-          std::strcmp(g_shadow.str_val[0], "#ff8a3d") == 0 && std::strcmp(g_shadow.str_key[1], "color_mode") == 0 &&
-          std::strcmp(g_shadow.str_val[1], "xy") == 0, "colour and mode mirrored");
-    // a channel suffix carries over to the mode key
+          std::strcmp(g_shadow.str_val[0], "#45ff74") == 0 && std::strcmp(g_shadow.str_key[1], "color_mode") == 0 &&
+          std::strcmp(g_shadow.str_val[1], "xy") == 0, "colour mirrored as the light will report it, with its mode");
+    // a channel suffix carries over to both keys
     arm(); v = device_cmd_str("#00ff00");
     CHECK(device_cmd_set_attr(IEEE, 0, "color_hex_l2", &v) == DEVCMD_OK &&
           std::strcmp(g_shadow.str_key[0], "color_hex_l2") == 0 && std::strcmp(g_shadow.str_key[1], "color_mode_l2") == 0,
           "suffix carried");
-    // no mode from the adapter: only the colour is mirrored
-    arm(); g_hex_mode = nullptr; v = device_cmd_str("#00ff00");
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && g_shadow.str_writes == 1, "mode only when known");
-    // a refused send mirrors nothing
+    // no mode known: only the colour; no colour known: only the mode; not the
+    // shared colour converter: nothing
+    arm(); g_state_mode = nullptr; v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && g_shadow.str_writes == 1 &&
+          std::strcmp(g_shadow.str_key[0], "color_hex") == 0, "mode only when known");
+    arm(); g_state_hex = ""; v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && g_shadow.str_writes == 1 &&
+          std::strcmp(g_shadow.str_key[0], "color_mode") == 0, "colour only when known");
+    arm(); g_colour_light = false; v = device_cmd_str("#00ff00");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_OK && g_shadow.str_writes == 0,
+          "nothing mirrored when the shared colour converter did not take it");
+    // a refused send mirrors nothing (and asks nothing)
     arm(); g_send_result = false; v = device_cmd_str("#00ff00");
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_NO_CONVERTER && g_shadow.str_writes == 0,
-          "failed colour mirrors nothing");
-    // color_temp also mirrors color_mode = color_temp
-    arm(); v = device_cmd_int(300);
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.writes == 1 &&
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_hex", &v) == DEVCMD_NO_CONVERTER && g_shadow.str_writes == 0 &&
+          g_state_calls == 0, "failed colour mirrors nothing");
+    // every other colour key leaves the colour and its mode too (Home Assistant's
+    // color_xy / color_hs, Lua and rules' hue / saturation / color_x / color_y)
+    {
+        struct W { const char* key; DevCmdValue v; const char* hex_key; const char* mode_key; };
+        W writes[] = {
+            {"color_xy", device_cmd_str("0.15,0.06"), "color_hex", "color_mode"},
+            {"color_hs", device_cmd_str("120,100"), "color_hex", "color_mode"},
+            {"hue", device_cmd_int(85), "color_hex", "color_mode"},
+            {"saturation_l2", device_cmd_int(254), "color_hex_l2", "color_mode_l2"},
+            {"color_x", device_cmd_float(0.64), "color_hex", "color_mode"},
+            {"color_y_l1", device_cmd_float(0.33), "color_hex_l1", "color_mode_l1"},
+        };
+        bool all = true;
+        for (W& w : writes) {
+            arm(); g_state_hex = "#ff0000"; g_state_mode = "hs";
+            all = all && device_cmd_set_attr(IEEE, 0, w.key, &w.v) == DEVCMD_OK && g_shadow.str_writes == 2 &&
+                  std::strcmp(g_shadow.str_key[0], w.hex_key) == 0 && std::strcmp(g_shadow.str_val[0], "#ff0000") == 0 &&
+                  std::strcmp(g_shadow.str_key[1], w.mode_key) == 0 && std::strcmp(g_shadow.str_val[1], "hs") == 0;
+        }
+        CHECK(all, "every colour key mirrors color_hex and color_mode");
+        arm(); v = device_cmd_int(85);
+        device_cmd_set_attr(IEEE, 0, "hue", &v);
+        CHECK(g_shadow.writes == 1 && std::strcmp(g_shadow.key, "hue") == 0 && g_shadow.val == 85,
+              "and the key itself as before");
+        arm(); v = device_cmd_int(3);
+        CHECK(device_cmd_set_attr(IEEE, 0, "hue_move", &v) == DEVCMD_OK && g_shadow.str_writes == 0,
+              "a key that only starts like a colour key is no colour");
+    }
+    // color_temp: the mireds the light was sent (the adapter's answer: rounded,
+    // clamped to its range) as an integer, and color_mode = color_temp
+    arm(); g_ct_sent = 370; v = device_cmd_int(500);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_ct_asked == 500.0 &&
+          g_shadow.writes == 1 && g_shadow.vt == VAL_INT && g_shadow.val == 370 &&
           g_shadow.str_writes == 1 && std::strcmp(g_shadow.str_key[0], "color_mode") == 0 &&
-          std::strcmp(g_shadow.str_val[0], "color_temp") == 0, "white mode mirrored");
-    // color_temp_startup is not color_temp
+          std::strcmp(g_shadow.str_val[0], "color_temp") == 0, "white mirrored as sent (clamped), with its mode");
+    arm(); g_ct_sent = 301; v = device_cmd_float(300.5);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_ct_asked == 300.5 &&
+          g_shadow.vt == VAL_INT && g_shadow.val == 301 && g_shadow.str_writes == 1 &&
+          std::strcmp(g_shadow.str_key[0], "color_mode") == 0, "decimal white pick mirrored as the integer sent");
+    // not the shared converter (a Tuya datapoint, say): the value as given
     arm(); v = device_cmd_int(300);
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp_startup", &v) == DEVCMD_OK && g_shadow.str_writes == 0,
-          "startup temperature leaves the mode alone");
-    // a decimal temperature and a channel suffix mirror the mode the same way
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.vt == VAL_INT && g_shadow.val == 300 &&
+          g_shadow.str_writes == 1 && std::strcmp(g_shadow.str_val[0], "color_temp") == 0, "white mode mirrored");
     arm(); v = device_cmd_float(300.5);
-    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.str_writes == 1 &&
-          std::strcmp(g_shadow.str_key[0], "color_mode") == 0, "decimal white pick mirrors the mode");
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_OK && g_shadow.vt == VAL_FLOAT &&
+          g_shadow.val == 30050, "decimal as given when the adapter cannot say");
+    // color_temp_startup is not color_temp
+    arm(); g_ct_sent = 370; v = device_cmd_int(300);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp_startup", &v) == DEVCMD_OK && g_shadow.str_writes == 0 &&
+          g_shadow.val == 300, "startup temperature: as given, mode left alone");
     arm(); v = device_cmd_int(300);
     CHECK(device_cmd_set_attr(IEEE, 0, "color_temp_l2", &v) == DEVCMD_OK &&
           std::strcmp(g_shadow.str_key[0], "color_mode_l2") == 0 && std::strcmp(g_shadow.str_val[0], "color_temp") == 0,
           "white pick on a channel mirrors that channel's mode");
+    // a refused white pick mirrors nothing, its mode included
+    arm(); g_send_result = false; v = device_cmd_int(300);
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_temp", &v) == DEVCMD_NO_CONVERTER && g_shadow.writes == 0 &&
+          g_shadow.str_writes == 0, "refused white pick mirrors no mode");
     // every other way a colour can be malformed: short, long, non-hex digit, no '#', bare '#', not text, suffixed key
     arm();
     {
