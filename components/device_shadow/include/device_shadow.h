@@ -3,6 +3,7 @@
 #pragma once
 #include "zap_common.h"
 #include "zcl_attribute.h"
+#include "no_occupancy_since.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include <cstddef>
@@ -86,6 +87,12 @@ struct DeviceShadowEntry {
                                         // 32-slot attr cap (avoids per-frame spam)
     uint16_t      occupancy_default_s;  // runtime-only: the definition's "no motion"
                                         // default (device_shadow_set_occupancy_default)
+    // runtime-only: "no motion since" (device_shadow_set_no_occupancy_since).
+    // The interval is the caller's to persist; the firmware's device options
+    // store re-applies it at boot.
+    NoOccupancySince no_occ;
+    TimerHandle_t    no_occ_timer;
+    volatile bool    no_occ_pending;    // set by timer cb if queue full (fallback)
 };
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -123,6 +130,12 @@ void device_shadow_process(const ZapDevice* dev,
 // Called after a successful command send when config.optimistic==true.
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,
                                      uint8_t val_type, int32_t int_val);
+
+// The same for a text value (an enum such as keep_time "60"), but only for a
+// key the device already reported as text: the text a UI sends ("ON",
+// "toggle") is not always the form the device reports, so anything else
+// waits for the device's own report.
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value);
 
 // Read current state. Returns number of attrs copied into out[0..max_count-1].
 uint8_t device_shadow_get_attrs(uint64_t ieee,
@@ -195,6 +208,15 @@ uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee);
 inline uint16_t device_shadow_occupancy_effective(const DeviceConfig& c, uint16_t default_s) {
     return (c.occupancy_timeout_set || c.occupancy_timeout_s) ? c.occupancy_timeout_s : default_s;
 }
+
+// "No motion since" for any motion sensor (z2m option no_occupancy_since, one
+// interval; see no_occupancy_since.h): after occupancy = false, the shadow
+// publishes the synthetic attribute `no_occupancy_since` = `seconds` once that
+// many seconds pass without motion, and 0 on the next motion. 0 = off. RAM
+// only -- the caller persists it. Creates the entry, so a boot-time restore
+// works before the device has reported.
+bool     device_shadow_set_no_occupancy_since(uint64_t ieee, uint16_t seconds);
+uint16_t device_shadow_get_no_occupancy_since(uint64_t ieee);
 
 // Set per-device debounce window. 0 = disabled (every attr publishes
 // immediately). Non-zero = coalesce repeated attrs by last-write-wins

@@ -76,6 +76,11 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key, uint8_t val
     g_shadow.writes++; g_shadow.ieee = ieee; g_shadow.vt = val_type; g_shadow.val = val;
     std::snprintf(g_shadow.key, sizeof(g_shadow.key), "%s", key);
 }
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value) {
+    g_shadow.str_writes++; g_shadow.ieee = ieee;
+    std::snprintf(g_shadow.key, sizeof(g_shadow.key), "%s", key);
+    std::snprintf(g_shadow.str_val, sizeof(g_shadow.str_val), "%s", value);
+}
 
 // ── cut two: rename / permit join / remove ──────────────────────────────
 void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {

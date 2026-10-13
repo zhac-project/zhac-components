@@ -830,6 +830,87 @@ int main() {
         CHECK(!device_shadow_remove_attr(0x0DEADULL, "dp_20"), "unknown device is a no-op");
     }
 
+    // ── G18 no_occupancy_since state machine (z2m option, one interval) ─────
+    {
+        printf("\nG18 no_occupancy_since state machine\n");
+        NoOccupancySince n{};
+        CHECK(!n.on_occupancy(false).arm, "off by default: no motion arms nothing");
+
+        n.set_interval(300);
+        auto s = n.on_occupancy(false);
+        CHECK(s.arm && !s.publish, "no motion arms the count");
+        CHECK(!n.on_occupancy(false).arm, "a repeated 'no motion' does not restart it");
+        s = n.on_timer();
+        CHECK(s.publish && s.value == 300, "the count runs out: publish 300");
+        CHECK(!n.on_occupancy(false).arm, "after it fired, 'no motion' repeats arm nothing");
+        s = n.on_occupancy(true);
+        CHECK(s.publish && s.value == 0 && !s.disarm, "motion after it fired: publish 0");
+        s = n.on_occupancy(true);
+        CHECK(!s.publish && !s.disarm, "more motion: nothing new");
+        CHECK(n.on_occupancy(false).arm, "the next quiet period counts again");
+        s = n.on_occupancy(true);
+        CHECK(s.disarm && !s.publish, "motion while counting: stop, nothing to publish");
+        CHECK(!n.on_timer().publish, "a stale timer publishes nothing");
+
+        CHECK(n.on_occupancy(false).arm, "counting again");
+        s = n.set_interval(120);
+        CHECK(s.disarm, "a new interval stops the running count");
+        CHECK(n.on_occupancy(false).arm && n.on_timer().value == 120,
+              "the next quiet period uses the new interval");
+        n.on_occupancy(true);
+        n.set_interval(0);
+        CHECK(!n.on_occupancy(false).arm, "interval 0 turns it off");
+    }
+
+    // ── G19 no_occupancy_since through device_shadow ───────────────────────
+    {
+        printf("\nG19 no_occupancy_since option\n");
+        const uint64_t N = 0x00158D000A0B0C19ULL;
+        CHECK(device_shadow_get_no_occupancy_since(N) == 0, "unknown device: off");
+        CHECK(device_shadow_set_no_occupancy_since(N, 300),
+              "set on a device that has not reported yet (boot-time restore)");
+        CHECK(device_shadow_get_no_occupancy_since(N) == 300, "interval read back");
+
+        ZapDevice nd{};
+        nd.ieee_addr = N;
+        ZclAttribute occ[1]{};
+        const int arms0 = g_stub_change_period_calls;
+        zcl_attr_set_int(&occ[0], "occupancy", 0, VAL_BOOL);
+        device_shadow_process(&nd, occ, 1);
+        CHECK(g_stub_change_period_calls == arms0 + 1 &&
+              g_stub_last_period == pdMS_TO_TICKS(300u * 1000u),
+              "occupancy=0 arms a 300 s count");
+        device_shadow_process(&nd, occ, 1);
+        CHECK(g_stub_change_period_calls == arms0 + 1, "a repeated occupancy=0 does not restart it");
+        ShadowAttr o{};
+        CHECK(!device_shadow_get_attr(N, "no_occupancy_since", &o),
+              "nothing published before the count runs out");
+        CHECK(device_shadow_set_no_occupancy_since(N, 0) &&
+              device_shadow_get_no_occupancy_since(N) == 0, "0 turns it off");
+    }
+
+    // ── G20 optimistic text value (an enum the device reported as text) ────
+    {
+        printf("\nG20 update_optimistic_str\n");
+        const uint64_t T = 0x00158D000A0B0C20ULL;
+        ZapDevice td{};
+        td.ieee_addr = T;
+        ZclAttribute ta[2]{};
+        zcl_attr_set_str(&ta[0], "keep_time", "30");
+        zcl_attr_set_int(&ta[1], "state", 1, VAL_BOOL);
+        device_shadow_process(&td, ta, 2);
+
+        device_shadow_update_optimistic_str(T, "keep_time", "60");
+        ShadowAttr o{};
+        CHECK(device_shadow_get_attr(T, "keep_time", &o) && o.val_type == VAL_STR &&
+              strcmp(o.str_val, "60") == 0, "a text value the device reported takes the new text");
+        device_shadow_update_optimistic_str(T, "state", "ON");
+        CHECK(device_shadow_get_attr(T, "state", &o) && o.val_type == VAL_BOOL && o.int_val == 1,
+              "a non-text value is left alone");
+        device_shadow_update_optimistic_str(T, "mode", "auto");
+        CHECK(!device_shadow_get_attr(T, "mode", &o), "a key the device never reported is not created");
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);
     return s_failures ? 1 : 0;
 }

@@ -16,8 +16,9 @@
 //     converter owns scaling; a converter that only takes integers refuses a
 //     decimal and that comes back as DEVCMD_NO_CONVERTER, never a truncation;
 //   * on success the shadow gets an optimistic value: "state" -> VAL_BOOL,
-//     other integers -> VAL_INT, decimals -> VAL_FLOAT x100, strings -> none
-//     (the shadow holds numbers; the device's report supplies the rest).
+//     other integers -> VAL_INT, decimals -> VAL_FLOAT x100, strings -> the
+//     new text, but only for a key the device itself reported as text (an
+//     enum such as keep_time); other text waits for the device's report.
 #pragma once
 
 #include <stdbool.h>

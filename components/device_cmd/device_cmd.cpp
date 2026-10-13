@@ -85,7 +85,10 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
             device_shadow_update_optimistic(ieee_cp, key, VAL_FLOAT, static_cast<int32_t>(std::lround(v->f * 100.0)));
             break;
         case DEVCMD_STR:
-            break;   // the shadow holds numbers; the device's report supplies text
+            // Kept only for a key the device reported as text (an enum such
+            // as keep_time); other text waits for the device's report.
+            device_shadow_update_optimistic_str(ieee_cp, key, v->s);
+            break;
     }
     return DEVCMD_OK;
 }

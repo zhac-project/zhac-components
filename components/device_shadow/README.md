@@ -45,6 +45,7 @@ frames and reads via REST/WS — it never imports this header.
 |---|---|
 | `void device_shadow_process(const ZapDevice* dev, const ZclAttribute* attrs, uint8_t count)` | Pipeline entry. Looks up / creates the `DeviceShadowEntry`, runs filter → debounce/throttle/occupancy → cache upsert → EventBus emit → NVS persist. Caller may pass any `count` ≤ 32; excess truncated. |
 | `void device_shadow_update_optimistic(uint64_t ieee, const char* key, uint8_t val_type, int32_t int_val)` | Cache update path used after a successful command send when `DeviceConfig.optimistic == true`. Bypasses the pipeline so the UI sees the new value before the device reports it. |
+| `void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value)` | The text form, for a key the device already reported as text (an enum such as `keep_time`); otherwise a no-op, so UI text never replaces a number or creates a key. Publishes `SHADOW_OPTIMISTIC`. |
 
 ### Cache read
 
@@ -62,6 +63,7 @@ frames and reads via REST/WS — it never imports this header.
 | `bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t s)` | The user's "no motion" interval: TTL for `occupancy=1` → auto-clear to `0` after `s` seconds, 0 = never. Marks it chosen (`DeviceConfig::occupancy_timeout_set`), so the definition default below no longer applies. Range checked by the callers (REST/WS). |
 | `bool device_shadow_set_occupancy_default(uint64_t ieee, uint16_t s)` | The device definition's default interval (z2m option `occupancy_timeout`, e.g. 90 s for PIRs that never report "no motion"), used while the user has chosen none. RAM only; `zhc_shadow_bridge` passes it with each occupancy report. |
 | `uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee)` / `device_shadow_occupancy_effective(cfg, default)` | The interval in force: the user's choice (0 = never), else the default. |
+| `bool device_shadow_set_no_occupancy_since(uint64_t ieee, uint16_t s)` / `uint16_t device_shadow_get_no_occupancy_since(uint64_t ieee)` | "No motion since" for any motion sensor (z2m option `no_occupancy_since`, one interval; `no_occupancy_since.h`): after `occupancy = false`, publish the synthetic attribute `no_occupancy_since = s` once `s` seconds pass without motion, and `0` on the next motion. 0 = off. RAM only (the firmware's device options persist it); creates the entry. |
 
 ### Housekeeping
 

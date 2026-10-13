@@ -34,6 +34,7 @@ static constexpr UBaseType_t TASK_QUEUE_DEPTH = 16;
 
 // Canonical internal attribute names.
 static constexpr const char* KEY_OCCUPANCY = "occupancy";
+static constexpr const char* KEY_NO_OCC_SINCE = "no_occupancy_since";
 static constexpr const char* KEY_LAST_SEEN = "_last_seen";
 
 // Cached NVS handle — opened once in init, kept open for firmware lifetime.
@@ -153,7 +154,7 @@ static SemaphoreHandle_t s_emit_mutex;
 // on the SHARED FreeRTOS timer service task and must never block on s_mutex
 // (a stalled shadow lock would freeze every software timer in the firmware) —
 // they do a zero-timeout enqueue and task_shadow does the locked work.
-enum class ShadowMsgKind : uint8_t { DebounceFlush, OccupancyTimeout };
+enum class ShadowMsgKind : uint8_t { DebounceFlush, OccupancyTimeout, NoOccupancySince };
 struct ShadowTaskMsg { uint64_t ieee; ShadowMsgKind kind; };
 static QueueHandle_t s_task_queue;
 
@@ -492,6 +493,50 @@ static void occupancy_timeout_cb(TimerHandle_t timer) {
     }
 }
 
+// "No motion since" count ran out: same lock-free hop as the occupancy TTL.
+static void no_occ_timer_cb(TimerHandle_t timer) {
+    DeviceShadowEntry* e = static_cast<DeviceShadowEntry*>(pvTimerGetTimerID(timer));
+    ShadowTaskMsg msg{ e->ieee, ShadowMsgKind::NoOccupancySince };
+    if (xQueueSend(s_task_queue, &msg, 0) != pdTRUE) e->no_occ_pending = true;
+}
+
+// Carry out one NoOccupancySince step. Caller holds s_emit_mutex + s_mutex
+// and publishes after release (a step that publishes stages a ZCL_ATTR, so
+// rules see `no_occupancy_since` like any reported attribute).
+static void no_occ_do_locked(DeviceShadowEntry* e, const NoOccupancySince::Step& s) {
+    if (s.disarm && e->no_occ_timer) xTimerStop(e->no_occ_timer, 0);
+    if (s.arm) {
+        const TickType_t period = pdMS_TO_TICKS((uint32_t)e->no_occ.interval_s * 1000UL);
+        if (!e->no_occ_timer) {
+            e->no_occ_timer = xTimerCreate("no_occ", period, pdFALSE,
+                                           static_cast<void*>(e), no_occ_timer_cb);
+        }
+        if (e->no_occ_timer) {
+            xTimerChangePeriod(e->no_occ_timer, period, 0);
+            xTimerReset(e->no_occ_timer, 0);
+        } else {
+            e->no_occ.counting = false;   // no timer heap: nothing will fire
+        }
+    }
+    if (s.publish) {
+        ZclAttribute synthetic{};
+        zcl_attr_set_int(&synthetic, KEY_NO_OCC_SINCE, s.value, VAL_INT);
+        synthetic.cluster = 0x0406;
+        synthetic.attr_id = 0xFFFF;   // synthetic, no ZCL attribute behind it
+        upsert_cache(e, &synthetic, 1);
+        stage_attrs(e, &synthetic, 1);
+        mark_attrs_dirty(e);
+    }
+}
+
+static void no_occ_fire_locked(DeviceShadowEntry* e) {
+    e->no_occ_pending = false;
+    // Re-armed between the timer's enqueue and this drain (motion, then a new
+    // "no motion"): this message belongs to the count that motion cancelled.
+    if (e->no_occ_timer && xTimerIsTimerActive(e->no_occ_timer)) return;
+    no_occ_do_locked(e, e->no_occ.on_timer());
+}
+
 // Synthetic occupancy=0 once the per-device TTL expires. Runs on task_shadow.
 // Caller holds s_emit_mutex + s_mutex and publishes after release. Q17
 // (QWEN_FINDINGS triage): persistence stays deferred — mark dirty only, the
@@ -515,6 +560,7 @@ static void occupancy_apply_locked(DeviceShadowEntry* e) {
     upsert_cache(e, &synthetic, 1);
     stage_attrs(e, &synthetic, 1);
     mark_attrs_dirty(e);
+    no_occ_do_locked(e, e->no_occ.on_occupancy(false));
 
     ESP_LOGD(TAG, "occ_ttl: 0x%014llX — synthetic occupancy=0",
              (unsigned long long)(e->ieee & 0x00FFFFFFFFFFFFFFULL));
@@ -613,6 +659,13 @@ static void apply_pipeline_and_stage(DeviceShadowEntry* e,
                 }
                 break;
             }
+        }
+    }
+
+    for (uint8_t i = 0; i < n; i++) {
+        if (strncmp(filtered[i].key, KEY_OCCUPANCY, ATTR_KEY_MAX) == 0) {
+            no_occ_do_locked(e, e->no_occ.on_occupancy(filtered[i].int_val != 0));
+            break;
         }
     }
 
@@ -715,6 +768,8 @@ static void task_shadow(void* arg) {
             if (e) {
                 if (msg.kind == ShadowMsgKind::DebounceFlush) {
                     flush_pending_entry_locked(e);
+                } else if (msg.kind == ShadowMsgKind::NoOccupancySince) {
+                    no_occ_fire_locked(e);
                 } else {
                     occupancy_apply_locked(e);
                 }
@@ -738,6 +793,7 @@ static void task_shadow(void* arg) {
             DeviceShadowEntry* e = &s_shadow[i];
             if (e->debounce_pending_flush)    flush_pending_entry_locked(e);
             if (e->occupancy_timeout_pending) occupancy_apply_locked(e);
+            if (e->no_occ_pending)            no_occ_fire_locked(e);
 
             uint32_t now_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
             if (e->nvs_dirty &&
@@ -1004,6 +1060,28 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
     xSemaphoreGive(s_emit_mutex);
 }
 
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value) {
+    if (!key || !value) return;
+    xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_entry(ieee);
+    bool staged = false;
+    for (uint8_t j = 0; e && j < e->attr_count; j++) {
+        if (strncmp(e->attrs[j].key, key, ATTR_KEY_MAX) != 0) continue;
+        if (e->attrs[j].val_type == VAL_STR) {
+            ZclAttribute a{};
+            zcl_attr_set_str(&a, key, value);
+            upsert_cache(e, &a, 1);
+            stage_attrs(e, &a, 1);
+            staged = true;
+        }
+        break;
+    }
+    xSemaphoreGive(s_mutex);
+    if (staged) publish_staged(EventType::SHADOW_OPTIMISTIC);
+    xSemaphoreGive(s_emit_mutex);
+}
+
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
@@ -1105,11 +1183,14 @@ void device_shadow_clear_attrs(uint64_t ieee) {
         // 0-tick timer posts — non-blocking, allowed under the leaf lock.
         if (e->occupancy_timer) { xTimerDelete(e->occupancy_timer, 0); e->occupancy_timer = nullptr; }
         if (e->debounce_timer)  { xTimerDelete(e->debounce_timer, 0);  e->debounce_timer  = nullptr; }
+        if (e->no_occ_timer)    { xTimerDelete(e->no_occ_timer, 0);    e->no_occ_timer    = nullptr; }
 
         memset(&e->pending, 0, sizeof(e->pending));
         e->throttle_last_ms = 0;
         e->debounce_pending_flush = false;
         e->occupancy_timeout_pending = false;
+        e->no_occ_pending = false;
+        e->no_occ = NoOccupancySince{ e->no_occ.interval_s, false, false, false };  // keep the option
         e->nvs_dirty = false;
         e->nvs_force = false;
         e->attr_overflow_logged = false;  // T27: cache emptied — re-arm the
@@ -1190,6 +1271,7 @@ void device_shadow_remove(uint64_t ieee) {
         // stale callback can't reference the about-to-be-vacated slot.
         if (e->occupancy_timer) { xTimerDelete(e->occupancy_timer, 0); e->occupancy_timer = nullptr; }
         if (e->debounce_timer)  { xTimerDelete(e->debounce_timer, 0);  e->debounce_timer  = nullptr; }
+        if (e->no_occ_timer)    { xTimerDelete(e->no_occ_timer, 0);    e->no_occ_timer    = nullptr; }
 
         // Reclaim the slot via swap-with-last (same O(1) pattern as the
         // zigbee pool's pool_remove). find_or_create_entry only ever appends
@@ -1209,6 +1291,7 @@ void device_shadow_remove(uint64_t ieee) {
             DeviceShadowEntry* moved = &s_shadow[idx];
             if (moved->debounce_timer)  vTimerSetTimerID(moved->debounce_timer,  static_cast<void*>(moved));
             if (moved->occupancy_timer) vTimerSetTimerID(moved->occupancy_timer, static_cast<void*>(moved));
+            if (moved->no_occ_timer)    vTimerSetTimerID(moved->no_occ_timer,    static_cast<void*>(moved));
         }
         memset(&s_shadow[last], 0, sizeof(DeviceShadowEntry));  // wipe the vacated tail slot
         s_count--;
@@ -1305,6 +1388,27 @@ uint16_t device_shadow_get_occupancy_timeout(uint64_t ieee) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     const DeviceShadowEntry* e = find_entry(ieee);
     const uint16_t s = e ? occupancy_interval(e) : 0;
+    xSemaphoreGive(s_mutex);
+    return s;
+}
+
+bool device_shadow_set_no_occupancy_since(uint64_t ieee, uint16_t seconds) {
+    if (!s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    DeviceShadowEntry* e = find_or_create_entry(ieee);
+    if (e) {
+        const NoOccupancySince::Step s = e->no_occ.set_interval(seconds);
+        if (s.disarm && e->no_occ_timer) xTimerStop(e->no_occ_timer, 0);   // never publishes
+    }
+    xSemaphoreGive(s_mutex);
+    return e != nullptr;
+}
+
+uint16_t device_shadow_get_no_occupancy_since(uint64_t ieee) {
+    if (!s_mutex) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    const DeviceShadowEntry* e = find_entry(ieee);
+    const uint16_t s = e ? e->no_occ.interval_s : 0;
     xSemaphoreGive(s_mutex);
     return s;
 }

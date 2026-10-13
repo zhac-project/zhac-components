@@ -6,7 +6,7 @@ struct StubSend {
     char model[64] = {}; char manu[64] = {}; char key[32] = {};
     bool b = false; uint64_t u = 0; double f = 0; char s[64] = {};
 };
-struct StubShadow { int writes = 0; uint64_t ieee = 0; char key[32] = {}; uint8_t vt = 0; int32_t val = 0; };
+struct StubShadow { int writes = 0; uint64_t ieee = 0; char key[32] = {}; uint8_t vt = 0; int32_t val = 0; int str_writes = 0; char str_val[32] = {}; };
 struct StubStore {
     int dirty_marks = 0; int dirty_pri = -1; char dirty_name[30] = {}; uint8_t dirty_flags = 0;
     int deletes = 0; int shadow_removes = 0; int def_cache_invalidates = 0; int fallback_clears = 0;

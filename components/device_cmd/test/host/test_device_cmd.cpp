@@ -49,11 +49,13 @@ int main() {
           std::strcmp(g_send.kind, "float") == 0 && g_send.f == 21.5, "decimal 21.5 -> adapter float 21.5");
     CHECK(g_shadow.writes == 1 && g_shadow.vt == VAL_FLOAT && g_shadow.val == 2150, "decimal mirrors as VAL_FLOAT 2150");
 
-    // string: string path, NO shadow write
+    // string: string path; offered to the shadow as text, which keeps it only
+    // for a key the device itself reported as text
     arm(); v = device_cmd_str("restore");
     CHECK(device_cmd_set_attr(IEEE, 0, "power_outage_memory", &v) == DEVCMD_OK &&
           std::strcmp(g_send.kind, "string") == 0 && std::strcmp(g_send.s, "restore") == 0, "string -> adapter string");
-    CHECK(g_shadow.writes == 0, "string writes no shadow value");
+    CHECK(g_shadow.writes == 0 && g_shadow.str_writes == 1 && std::strcmp(g_shadow.str_val, "restore") == 0 &&
+          std::strcmp(g_shadow.key, "power_outage_memory") == 0, "string offered to the shadow as text");
 
     // explicit endpoint wins over the device default
     arm(); v = device_cmd_bool(false);

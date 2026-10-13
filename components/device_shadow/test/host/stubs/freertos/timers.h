@@ -25,8 +25,9 @@ static inline TimerHandle_t xTimerCreate(const char*, TickType_t, UBaseType_t,
     return &s_timer_obj;
 }
 static inline BaseType_t xTimerReset(TimerHandle_t, TickType_t) { return pdPASS; }
-// Only the occupancy TTL uses xTimerChangePeriod: count those (re)arms and keep
-// the last period, so a test can see which interval armed it.
+// The occupancy TTL and the "no motion since" count use xTimerChangePeriod:
+// count those (re)arms and keep the last period, so a test can see which
+// interval armed it.
 inline int        g_stub_change_period_calls = 0;
 inline TickType_t g_stub_last_period         = 0;
 static inline BaseType_t xTimerChangePeriod(TimerHandle_t, TickType_t period, TickType_t) {
@@ -35,6 +36,7 @@ static inline BaseType_t xTimerChangePeriod(TimerHandle_t, TickType_t period, Ti
     return pdPASS;
 }
 static inline BaseType_t xTimerDelete(TimerHandle_t, TickType_t) { return pdPASS; }
+static inline BaseType_t xTimerStop(TimerHandle_t, TickType_t) { return pdPASS; }
 static inline BaseType_t xTimerIsTimerActive(TimerHandle_t) { return pdFALSE; }
 static inline void*      pvTimerGetTimerID(TimerHandle_t) { return nullptr; }
 static inline void       vTimerSetTimerID(TimerHandle_t, void*) {}

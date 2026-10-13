@@ -312,6 +312,7 @@ const char* stub_shadow_opt_key(void)   { return s_opt_key; }
 uint8_t     stub_shadow_opt_vt(void)    { return s_opt_vt; }
 int32_t     stub_shadow_opt_val(void)   { return s_opt_val; }
 
+void device_shadow_update_optimistic_str(uint64_t, const char*, const char*) {}
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,
                                      uint8_t val_type, int32_t int_val) {
     s_opt_count++;
