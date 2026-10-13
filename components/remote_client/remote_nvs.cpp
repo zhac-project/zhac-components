@@ -58,9 +58,11 @@ extern "C" bool kv_commit(const char* ns) {
     return e == ESP_OK;
 }
 
+// The base MAC: on Wi-Fi chips it is the STA MAC (same id as before); the P4
+// has no Wi-Fi MAC, and asking for one left every P4 hub as "000000000000".
 static void default_devid(char* out, size_t cap) {
     uint8_t mac[6] = {};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    esp_read_mac(mac, ESP_MAC_BASE);
     snprintf(out, cap, "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
