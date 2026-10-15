@@ -17,6 +17,7 @@
 #include "remote_allow.h"
 #include "remote_backoff.h"
 #include "remote_nvs.h"
+#include "utf8_seq.h"   // utf8_valid / utf8_scrub: the send guard (the header lives in ws_server)
 #include "sdkconfig.h"
 
 #include <atomic>
@@ -51,6 +52,12 @@
 // ArduinoJson is already in this component's REQUIRES list, so the
 // JsonDocument type is available via the include above.
 extern "C" void dispatch_envelope_for_remote(int fd, JsonDocument& doc);
+
+// Weak and empty: dual-chip and mono add nothing to remote.auth. See remote_client.h.
+extern "C" __attribute__((weak)) size_t remote_hello_extra(char* out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
 
 static const char* TAG = "remote_client";
 
@@ -150,6 +157,9 @@ extern "C" void remote_client_publish_event(const char* name,
         heap_caps_free(buf);
         return;
     }
+    // The cloud's UTF-8 guard (utf8_seq.h): Tomcat closes the hub link (1007) on one invalid byte, so each
+    // byte of an invalid sequence goes out as '?'. The buffer is our own copy; the length does not change.
+    utf8_scrub(buf, n);
 
     TxItem item{ buf, n };
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
@@ -258,22 +268,40 @@ static void send_auth_frame() {
     static uint32_t s_boot_epoch = 0;
     if (s_boot_epoch == 0) s_boot_epoch = (esp_random() & 0x7FFFFFFFu) | 1u;
     const esp_app_desc_t* app = esp_app_get_description();
-    char buf[320];
+    char extra[160];
+    const size_t xn = remote_hello_extra(extra, sizeof(extra));
+    // 512, not 320: token (95) + device id (31) + version (31) + the caps fields (~60) no longer fit 320,
+    // and a frame that does not fit is never sent -- the hub would never authenticate.
+    char buf[512];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%u,\"cmd\":\"remote.auth\","
         "\"args\":{\"token\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\","
-        "\"boot_epoch\":%u}}",
+        "\"boot_epoch\":%u%.*s}}",
         (unsigned)s_auth_id, s_cfg.token, s_cfg.devid, app ? app->version : "unknown",
-        (unsigned)s_boot_epoch);
-    if (n > 0 && (size_t)n < sizeof(buf) && s_ws) {
-        esp_websocket_client_send_text(s_ws, buf, n, pdMS_TO_TICKS(2000));
+        (unsigned)s_boot_epoch, (int)(xn < sizeof(extra) ? xn : 0), extra);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) {
+        ESP_LOGE(TAG, "auth frame does not fit (%d B) -- not sent", n);
+        return;
     }
+    if (s_ws) esp_websocket_client_send_text(s_ws, buf, n, pdMS_TO_TICKS(2000));
 }
 
 // ── RX dispatch ──────────────────────────────────────────────────────────
 
 extern "C" void remote_client_send_reply(const char* json, size_t len) {
     if (!s_ws || s_state.load(std::memory_order_acquire) != REMOTE_STATE_READY) return;
+    // The cloud's UTF-8 guard (utf8_seq.h), as in publish_event. The caller's buffer is const and almost
+    // always valid, so a copy is made only when a byte needs replacing; a reply that cannot be copied is
+    // dropped rather than sent invalid (the cloud's request then times out instead of the link closing).
+    if (!utf8_valid(json, len)) {
+        char* fixed = static_cast<char*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!fixed) { ESP_LOGW(TAG, "send_reply: invalid UTF-8 and no memory to repair it -- dropped"); return; }
+        std::memcpy(fixed, json, len);
+        utf8_scrub(fixed, len);
+        esp_websocket_client_send_text(s_ws, fixed, len, pdMS_TO_TICKS(2000));
+        heap_caps_free(fixed);
+        return;
+    }
     esp_websocket_client_send_text(s_ws, json, len, pdMS_TO_TICKS(2000));
 }
 
@@ -327,14 +355,24 @@ static void handle_rx_frame(const char* data, size_t len) {
         return;
     }
 
-    // Allow-list gate.
-    if (!remote_cmd_allowed(cmd)) {
-        char err_buf[160];
+    // Relay gate (spec 2026-10-05 §3.1): the allow-list, the hub's script switch, and the setting only
+    // the hub's own page may change. Each refusal has its own code, so the cloud can tell "turn the
+    // switch on" (scripts_off) from "not supported" (cmd_not_allowed).
+    const bool local_only_key = !doc["args"]["remote_scripts"].isNull();
+    if (const char* refusal = remote_cmd_refusal(cmd, local_only_key, remote_scripts_allowed())) {
+        char err_buf[96];
         int en = snprintf(err_buf, sizeof(err_buf),
-            "{\"id\":%d,\"ok\":false,\"err\":\"cmd_not_allowed\"}",
-            doc["id"] | 0);
+            "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}", doc["id"] | 0, refusal);
         if (en > 0) remote_client_send_reply(err_buf, en);
         return;
+    }
+
+    // Every change the cloud makes goes in the hub log with the person's account id (§3.7), before the
+    // dispatch: system.restart does not come back.
+    char line[160];
+    if (remote_change_log_line(cmd, doc["args"]["by"] | "", doc["args"]["id"] | -1L,
+                               doc["args"]["name"] | "", line, sizeof(line))) {
+        ESP_LOGI("cloud", "%s", line);
     }
 
     // Hand off to the shared ws_bridge dispatcher.

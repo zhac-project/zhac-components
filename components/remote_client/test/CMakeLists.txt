@@ -42,3 +42,22 @@ add_executable(remote_nvs_tests
 target_include_directories(remote_nvs_tests PRIVATE ../include)
 target_compile_definitions(remote_nvs_tests PRIVATE REMOTE_NVS_HOST_TEST)
 add_test(NAME remote_nvs COMMAND remote_nvs_tests)
+
+# utf8_seq.h (the one strict UTF-8 table and the send guard) lives in ws_server: the lowest component both
+# send paths (the cloud link here, the hub page there) can include.
+set(WS_SERVER_INC ${CMAKE_CURRENT_SOURCE_DIR}/../../ws_server/include)
+
+# Staging slot + page cutter (remote script editing)
+find_package(Threads REQUIRED)
+add_executable(remote_xfer_tests
+    remote_xfer_test.cpp
+    ../remote_xfer.cpp
+)
+target_include_directories(remote_xfer_tests PRIVATE ../include ${WS_SERVER_INC})
+target_link_libraries(remote_xfer_tests PRIVATE Threads::Threads)
+add_test(NAME remote_xfer COMMAND remote_xfer_tests)
+
+# The UTF-8 guard at the send choke points (publish_event, send_reply, ws_server's frame writer)
+add_executable(utf8_guard_tests utf8_guard_test.cpp)
+target_include_directories(utf8_guard_tests PRIVATE ../include ${WS_SERVER_INC})
+add_test(NAME utf8_guard COMMAND utf8_guard_tests)

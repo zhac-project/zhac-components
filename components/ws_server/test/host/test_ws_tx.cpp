@@ -462,6 +462,26 @@ int main() {
     ws_server_register_reply_hook(0, nullptr);
     ws_server_set_api_token(nullptr);
 
+    // The one frame writer is also the hub page's UTF-8 guard: Chrome closes the socket on one invalid byte in a
+    // text frame. Each byte of an invalid sequence goes out as '?', the frame keeps its length (JSON's structural
+    // bytes are ASCII), and the caller's buffer is not touched.
+    {
+        read_frames(sv[1], f);              // forget what was sent above
+        const std::string cut   = "{\"id\":7,\"ok\":true,\"data\":[{\"name\":\"\xd0\xb0\xd0\"}]}";   // "а" + half a letter
+        const std::string fixed = "{\"id\":7,\"ok\":true,\"data\":[{\"name\":\"\xd0\xb0?\"}]}";
+        const std::string ev    = "{\"event\":\"log\",\"data\":{\"line\":\"x\xff\xe2\x82\"}}";
+        const std::string evfix = "{\"event\":\"log\",\"data\":{\"line\":\"x???\"}}";
+        const std::string cut_copy = cut, ev_copy = ev;
+        ws_server_reply(sv[0], cut.data(), cut.size());
+        ws_server_broadcast(ev.data(), ev.size());
+        CHECK(read_frames(sv[1], f) && f.size() == 2 && f[0] == fixed && f[1] == evfix,
+              "UTF-8 guard: a reply and a broadcast with invalid bytes go out with '?' in their place, same length");
+        CHECK(cut == cut_copy && ev == ev_copy, "UTF-8 guard: the caller's buffers are left as they were");
+        const std::string fine = "{\"name\":\"Привіт €\xf0\x9f\x98\x80\"}";
+        ws_server_reply(sv[0], fine.data(), fine.size());
+        CHECK(read_frames(sv[1], f) && f.size() == 1 && f[0] == fine, "UTF-8 guard: valid text goes out unchanged");
+    }
+
     CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");
     return g_failures ? 1 : 0;
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "ws_server.h"
+#include "utf8_seq.h"   // utf8_valid / utf8_scrub: the send guard in send_locked
 #include "sdkconfig.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -484,10 +485,26 @@ static bool fd_may_receive(int fd) {
 // Lock order: s_tx_mutex, then s_mutex (fd_may_receive, remove_fd_quiet), and
 // never the other way round: s_mutex is a leaf lock — nothing is called while it
 // is held.
+//
+// Also the hub page's UTF-8 guard (utf8_seq.h): Chrome closes the socket on one
+// invalid byte in a text frame, so a frame with any is sent from a copy with '?'
+// for each such byte (same length; JSON's structural bytes are ASCII). The
+// caller's buffer is left alone, and a frame that cannot be copied is dropped
+// rather than sent invalid. Silent on purpose: a log line from here would come
+// back through the wired log sink.
 static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool recheck, const char* who) {
+    char* fixed = nullptr;
+    if (!utf8_valid(reinterpret_cast<const char*>(pkt->payload), pkt->len)) {
+        fixed = static_cast<char*>(heap_caps_malloc(pkt->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!fixed) fixed = static_cast<char*>(malloc(pkt->len));
+        if (!fixed) return;
+        memcpy(fixed, pkt->payload, pkt->len);
+        utf8_scrub(fixed, pkt->len);
+        pkt->payload = reinterpret_cast<uint8_t*>(fixed);
+    }
     esp_err_t err[MAX_WS_CLIENTS];
     int       left[MAX_WS_CLIENTS];   // table size after we removed that fd; -1: it did not fail, or was already gone
-    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) { free(fixed); return; }
     s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     // NOTE: no early returns between the guard stores — in_broadcast must clear.
     for (int i = 0; i < n; i++) {
@@ -499,6 +516,7 @@ static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool reche
     }
     s_broadcast_task.store(nullptr, std::memory_order_release);
     xSemaphoreGive(s_tx_mutex);
+    free(fixed);   // httpd_ws_send_frame_async has written the frame by the time it returns
 
     for (int i = 0; i < n; i++) {
         if (err[i] == ESP_OK) continue;
