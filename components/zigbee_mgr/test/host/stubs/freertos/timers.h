@@ -28,6 +28,7 @@ static inline BaseType_t xTimerReset(TimerHandle_t, TickType_t) { return pdPASS;
 static inline BaseType_t xTimerStart(TimerHandle_t, TickType_t) { return pdPASS; }
 static inline BaseType_t xTimerChangePeriod(TimerHandle_t, TickType_t, TickType_t) { return pdPASS; }
 static inline BaseType_t xTimerDelete(TimerHandle_t, TickType_t) { return pdPASS; }
+static inline BaseType_t xTimerStop(TimerHandle_t, TickType_t) { return pdPASS; }
 static inline BaseType_t xTimerIsTimerActive(TimerHandle_t) { return pdFALSE; }
 static inline void*      pvTimerGetTimerID(TimerHandle_t) { return nullptr; }
 static inline void       vTimerSetTimerID(TimerHandle_t, void*) {}
