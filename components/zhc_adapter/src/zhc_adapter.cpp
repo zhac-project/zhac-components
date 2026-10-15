@@ -34,6 +34,7 @@
 
 #include "definitions/lumi/_shared.hpp"
 #include "definitions/tuya/_shared.hpp"   // exposes_from_dp_map
+#include "definitions/_generic/_shared.hpp"   // color_hex_support, color_state, color_temp_to_send
 #include "zhc/devices/lumi_registry.hpp"
 #include "zhc/devices/efekta_registry.hpp"
 #include "zhc/devices/adeo_registry.hpp"
@@ -1380,6 +1381,18 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
             emit_one(e);
         }
     }
+    // Colour lights publish `color_hex` (kFzColor) and take it (kTzColor);
+    // the UIs' colour pickers key on this row. Definitions never list it.
+    if (def && !already_emitted_name("color_hex", def) &&
+        !already_emitted_name("color_hex", supp)) {
+        const zhc::generic::ColorHexSupport hex = zhc::generic::color_hex_support(*def);
+        if (hex.read) {
+            if (emitted++) write(",");
+            write("{\"name\":\"color_hex\",\"type\":\"color\",\"access\":");
+            write_num(hex.write ? 0b011u : 0b001u);
+            write("}");
+        }
+    }
     write("]");
     if (pos + 1 >= cap) return 0;   // truncated
     buf[pos] = '\0';
@@ -2045,4 +2058,35 @@ extern "C" bool zhac_adapter_send_string(uint64_t ieee,
     zhc::Value v{}; v.type = zhc::ValueType::StringRef; v.str = value;
     return dispatch_and_send(ieee, model_id, manu_name, nwk_addr, dst_ep,
                               key, v);
+}
+
+extern "C" bool zhac_adapter_color_state(uint64_t ieee, const char* model_id,
+                                         const char* manufacturer_name,
+                                         char* hex, const char** mode) {
+    hex[0] = '\0';
+    *mode = nullptr;
+    const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
+    if (!def || !zhc::generic::color_hex_support(*def).write) return false;
+    // The device's own runtime scratch, where kTzColor / kFzColor keep its colour.
+    zhc::RuntimeContext ctx{};
+    ctx.store        = &g_store;
+    ctx.store_get    = &zhc::RuntimeStore<kMaxDevices>::get;
+    ctx.device_index = resolve_device_index(ieee);
+    const zhc::generic::ColorState s = zhc::generic::color_state(ctx);
+    std::memcpy(hex, s.hex, sizeof(s.hex));
+    *mode = s.mode;
+    return true;
+}
+
+extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t ieee, const char* model_id,
+                                                const char* manufacturer_name, double mireds) {
+    const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
+    if (!def || !def->to_zigbee) return -1;
+    for (std::uint8_t i = 0; i < def->to_zigbee_count; ++i) {
+        if (def->to_zigbee[i] != &zhc::generic::kTzColorTemp) continue;
+        // As zhac_adapter_send_float hands it over; an integer is exact either way.
+        zhc::Value v{}; v.type = zhc::ValueType::Float; v.f = static_cast<float>(mireds);
+        return zhc::generic::color_temp_to_send(*def, v);
+    }
+    return -1;
 }

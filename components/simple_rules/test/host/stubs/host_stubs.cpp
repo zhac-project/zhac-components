@@ -312,7 +312,7 @@ const char* stub_shadow_opt_key(void)   { return s_opt_key; }
 uint8_t     stub_shadow_opt_vt(void)    { return s_opt_vt; }
 int32_t     stub_shadow_opt_val(void)   { return s_opt_val; }
 
-void device_shadow_update_optimistic_str(uint64_t, const char*, const char*) {}
+void device_shadow_update_optimistic_text(uint64_t, const char*, const char*) {}
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,
                                      uint8_t val_type, int32_t int_val) {
     s_opt_count++;
@@ -322,6 +322,14 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
     s_opt_vt  = val_type;
     s_opt_val = int_val;
 }
+
+// device_cmd mirrors a light's colour and white as the adapter says the light
+// will report them; no rule test writes a colour, so these record nothing.
+void device_shadow_update_optimistic_str(uint64_t, const char*, const char*) {}
+extern "C" bool zhac_adapter_color_state(uint64_t, const char*, const char*, char* hex, const char** mode) {
+    hex[0] = '\0'; *mode = nullptr; return false;
+}
+extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t, const char*, const char*, double) { return -1; }
 
 // ── zhc_adapter / mqtt_gw: sinks ─────────────────────────────────────────
 // Send result is settable so a test can exercise the failure path (no

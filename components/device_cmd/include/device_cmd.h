@@ -18,7 +18,15 @@
 //   * on success the shadow gets an optimistic value: "state" -> VAL_BOOL,
 //     other integers -> VAL_INT, decimals -> VAL_FLOAT x100, strings -> the
 //     new text, but only for a key the device itself reported as text (an
-//     enum such as keep_time); other text waits for the device's report.
+//     enum such as keep_time); other text waits for the device's report. A
+//     light's white and colour are mirrored as its next report will carry
+//     them: color_temp as the integer mireds it was sent (rounded, clamped to
+//     the light's range), plus color_mode = "color_temp"; any colour key
+//     (color_hex, color_xy, color_hs, color_x / color_y, hue, saturation)
+//     also sets color_hex (the colour at full brightness) and color_mode from
+//     the converter's memory;
+//   * a color_hex that is not "#rrggbb", or is black, is refused as
+//     DEVCMD_BAD_COLOUR before anything is sent or stored.
 #pragma once
 
 #include <stdbool.h>
@@ -52,6 +60,7 @@ typedef enum {
     DEVCMD_NO_CONVERTER,   // no converter claims the key for this device, or it refused the value
     DEVCMD_BAD_NAME,       // rename: empty, longer than 29 bytes, or holds a quote, backslash or control character
     DEVCMD_RADIO,          // the radio refused (permit join)
+    DEVCMD_BAD_COLOUR,     // color_hex that is not "#rrggbb", or is black (set_attr)
 } DevCmdResult;
 
 // The words every transport answers with. Stable: the web UI and the docs use them.

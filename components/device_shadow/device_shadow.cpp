@@ -1060,26 +1060,42 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
     xSemaphoreGive(s_emit_mutex);
 }
 
-void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value) {
-    if (!key || !value) return;
+// The string twin of the above: same lock order (s_emit_mutex outermost, held
+// across stage + publish; s_mutex released before publish_staged), same
+// SHADOW_OPTIMISTIC emit, same find-only rule (an unknown device is a no-op).
+// only_reported_text: store only over a key the device itself reported as text.
+static void optimistic_str(uint64_t ieee, const char* key, const char* str_val, bool only_reported_text)
+{
+    if (!key || !str_val) return;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
-    bool staged = false;
-    for (uint8_t j = 0; e && j < e->attr_count; j++) {
-        if (strncmp(e->attrs[j].key, key, ATTR_KEY_MAX) != 0) continue;
-        if (e->attrs[j].val_type == VAL_STR) {
-            ZclAttribute a{};
-            zcl_attr_set_str(&a, key, value);
-            upsert_cache(e, &a, 1);
-            stage_attrs(e, &a, 1);
-            staged = true;
+    bool store = e != nullptr;
+    if (e && only_reported_text) {
+        store = false;
+        for (uint8_t j = 0; j < e->attr_count; j++) {
+            if (strncmp(e->attrs[j].key, key, ATTR_KEY_MAX) != 0) continue;
+            store = e->attrs[j].val_type == VAL_STR;
+            break;
         }
-        break;
+    }
+    if (store) {
+        ZclAttribute a{};
+        zcl_attr_set_str(&a, key, str_val);
+        upsert_cache(e, &a, 1);
+        stage_attrs(e, &a, 1);
     }
     xSemaphoreGive(s_mutex);
-    if (staged) publish_staged(EventType::SHADOW_OPTIMISTIC);
+    if (store) publish_staged(EventType::SHADOW_OPTIMISTIC);
     xSemaphoreGive(s_emit_mutex);
+}
+
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* str_val) {
+    optimistic_str(ieee, key, str_val, false);
+}
+
+void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value) {
+    optimistic_str(ieee, key, value, true);
 }
 
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {

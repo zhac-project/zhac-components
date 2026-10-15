@@ -6,7 +6,11 @@ struct StubSend {
     char model[64] = {}; char manu[64] = {}; char key[32] = {};
     bool b = false; uint64_t u = 0; double f = 0; char s[64] = {};
 };
-struct StubShadow { int writes = 0; uint64_t ieee = 0; char key[32] = {}; uint8_t vt = 0; int32_t val = 0; int str_writes = 0; char str_val[32] = {}; };
+struct StubShadow {
+    int writes = 0; uint64_t ieee = 0; char key[32] = {}; uint8_t vt = 0; int32_t val = 0;
+    int str_writes = 0; char str_key[4][32] = {}; char str_val[4][48] = {};
+    int text_writes = 0; char text_key[32] = {}; char text_val[32] = {};
+};
 struct StubStore {
     int dirty_marks = 0; int dirty_pri = -1; char dirty_name[30] = {}; uint8_t dirty_flags = 0;
     int deletes = 0; int shadow_removes = 0; int def_cache_invalidates = 0; int fallback_clears = 0;
@@ -17,6 +21,12 @@ struct StubStore {
 };
 extern StubSend g_send; extern StubShadow g_shadow; extern StubStore g_store;
 extern bool g_send_result; extern bool g_radio_result; extern bool g_have_backend;
+// What zhac_adapter_color_state answers: the light's colour as the hub will
+// publish it ("#45ff74" / "xy" by default), false when g_colour_light is false.
+extern bool g_colour_light; extern const char* g_state_hex; extern const char* g_state_mode;
+extern int g_state_calls;
+// What zhac_adapter_color_temp_sent answers (-1 by default: not the shared converter) and was asked.
+extern int32_t g_ct_sent; extern double g_ct_asked;
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu);
 void stub_pool_clear();
 void stub_reset();

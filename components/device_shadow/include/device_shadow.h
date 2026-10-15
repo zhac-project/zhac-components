@@ -131,11 +131,15 @@ void device_shadow_process(const ZapDevice* dev,
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,
                                      uint8_t val_type, int32_t int_val);
 
+// The string twin of device_shadow_update_optimistic (a colour "#rrggbb", a
+// colour mode): stores VAL_STR and emits SHADOW_OPTIMISTIC. The caller
+// validates the text (the push path does not re-check UTF-8).
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* str_val);
 // The same for a text value (an enum such as keep_time "60"), but only for a
 // key the device already reported as text: the text a UI sends ("ON",
 // "toggle") is not always the form the device reports, so anything else
 // waits for the device's own report.
-void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value);
+void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value);
 
 // Read current state. Returns number of attrs copied into out[0..max_count-1].
 uint8_t device_shadow_get_attrs(uint64_t ieee,

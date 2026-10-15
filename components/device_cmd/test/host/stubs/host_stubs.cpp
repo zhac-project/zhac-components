@@ -24,6 +24,12 @@ StubStore g_store{};
 bool g_send_result = true;
 bool g_radio_result = true;
 bool g_have_backend = false;
+bool g_colour_light = true;
+const char* g_state_hex = "#45ff74";
+const char* g_state_mode = "xy";
+int g_state_calls = 0;
+int32_t g_ct_sent = -1;
+double g_ct_asked = 0;
 int64_t g_fake_time_us = 0;
 
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu) {
@@ -38,6 +44,8 @@ void stub_pool_clear() { s_have_dev = false; }
 void stub_reset() {
     g_send = StubSend{}; g_shadow = StubShadow{}; g_store = StubStore{};
     g_send_result = true; g_radio_result = true; g_have_backend = false;
+    g_colour_light = true; g_state_hex = "#45ff74"; g_state_mode = "xy"; g_state_calls = 0;
+    g_ct_sent = -1; g_ct_asked = 0;
 }
 bool stub_pool_removed_flag() { return s_have_dev && zap_dev_is_removed(&s_dev); }
 bool stub_pool_has_device()   { return s_have_dev; }
@@ -76,10 +84,28 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key, uint8_t val
     g_shadow.writes++; g_shadow.ieee = ieee; g_shadow.vt = val_type; g_shadow.val = val;
     std::snprintf(g_shadow.key, sizeof(g_shadow.key), "%s", key);
 }
-void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value) {
-    g_shadow.str_writes++; g_shadow.ieee = ieee;
-    std::snprintf(g_shadow.key, sizeof(g_shadow.key), "%s", key);
-    std::snprintf(g_shadow.str_val, sizeof(g_shadow.str_val), "%s", value);
+void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value) {
+    g_shadow.text_writes++; g_shadow.ieee = ieee;
+    std::snprintf(g_shadow.text_key, sizeof(g_shadow.text_key), "%s", key);
+    std::snprintf(g_shadow.text_val, sizeof(g_shadow.text_val), "%s", value);
+}
+void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* val) {
+    g_shadow.ieee = ieee;
+    if (g_shadow.str_writes < 4) {
+        std::snprintf(g_shadow.str_key[g_shadow.str_writes], sizeof(g_shadow.str_key[0]), "%s", key ? key : "");
+        std::snprintf(g_shadow.str_val[g_shadow.str_writes], sizeof(g_shadow.str_val[0]), "%s", val ? val : "");
+    }
+    g_shadow.str_writes++;
+}
+extern "C" bool zhac_adapter_color_state(uint64_t, const char*, const char*, char* hex, const char** mode) {
+    g_state_calls++;
+    std::snprintf(hex, 8, "%s", g_colour_light ? g_state_hex : "");
+    *mode = g_colour_light ? g_state_mode : nullptr;
+    return g_colour_light;
+}
+extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t, const char*, const char*, double mireds) {
+    g_ct_asked = mireds;
+    return g_ct_sent;
 }
 
 // ── cut two: rename / permit join / remove ──────────────────────────────
