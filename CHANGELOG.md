@@ -7,10 +7,17 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Fixed
+
+- `task_stacks.h`: `kTaskLua` mirrors `CONFIG_LUA_ENGINE_TASK_STACK_BYTES` (32 KB with the Lua C-stack limits) instead of a fixed 8 KB, so the P4 "Stack HWM" log reports TaskLua's real total and use.
+- **Rule names are cut between characters, never inside one** (`simple_rules_add` / `simple_rules_update`), and a name stored cut by older firmware reads back whole (`rule_store_load` / `rule_store_load_all` trim the copy after the CRC check; `rule_store_trim_name()` in `rule_store.h`). The hub page sends names of any length and the slot keeps 23 bytes, so a 12-letter Cyrillic name ended in half a character: invalid UTF-8 in every `rule.added` / `rule.updated` / `rule.list` that carried it, which closes the cloud link and the hub-page tabs. No NVS migration: the next save writes the clean name. Host tests in `simple_rules/test/host` and `rule_store/test/host`.
+
 ### Added
 
 - **"No motion since" for any motion sensor** (`device_shadow`, z2m option `no_occupancy_since` with one interval): `device_shadow_set_no_occupancy_since(ieee, s)` makes the shadow publish the synthetic attribute `no_occupancy_since = s` once a sensor has said "no motion" (its own report or the hub's `occupancy_timeout`) and `s` seconds pass without motion, and `0` on the next motion, so an edge-triggered rule `ON hall#no_occupancy_since=300 DO …` fires once per quiet period. A repeated "no motion" report does not restart a running count. RAM only; the firmware persists the option. Policy in `no_occupancy_since.h`, host-tested.
 - **A text value the hub writes shows at once** (`device_cmd`, `device_shadow_update_optimistic_str`): after a successful write of an enum the device reports as text (Tuya PIR `keep_time` "60"), the shadow takes the new text instead of keeping the old value until the device reports again, which a battery PIR never does by itself. Only for keys the device already reported as text.
+- **`simple_rules_check(dsl, err, cap)`** (`simple_rules`): parses a rule as a save would (the 499-byte limit, then the parser) and stores nothing, with no `RULE_CHANGED`; for the hubs' `rule.check` (remote rules editing, spec 2026-10-05). Host test `test/host/test_check.cpp`.
+- **Rule saves name every parse failure**: a missing ON, DO or ENDON, a bad trigger or action and too many actions now come back as "rule must start with ON", "missing DO", "missing ENDON", "bad trigger", "bad action", "too many actions (max 4)" instead of an empty or stale message, and an update of an unknown rule says "rule not found".
 
 - **A raw `dp_<id>` row goes away once the device's definition decodes that datapoint** (`zhc_adapter`, `zigbee_mgr` shadow bridge, `device_shadow`). While a Tuya datapoint is unmapped the hub shows it as `dp_<id>` and saves it with the device's state, so after a definition update the old raw value stayed on the States tab forever next to the new key (a Smart Air Housekeeper kept `dp_20 = 5` beside its new `formaldehyd`). After each decoded Tuya frame the adapter now asks the shadow to forget `dp_<id>` for every datapoint that embedded-zhc's `tuya::definition_decodes_dp()` says the definition maps, unless the frame still surfaced it raw. It goes through the existing shadow callback with the new kind `ZHAC_SHADOW_KIND_REMOVE` (0xFF, `zhc_adapter.h`); new `device_shadow_remove_attr()` drops the key from RAM and from NVS at the device's next sweep. Host tests: device_shadow G17, zigbee_mgr G12.
 

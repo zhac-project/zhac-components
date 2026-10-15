@@ -182,6 +182,13 @@ bool     simple_rules_add(const char* name, const char* dsl,
                            uint16_t* out_rule_id);
 bool     simple_rules_update(uint16_t rule_id,
                               const char* name, const char* dsl);
+
+// rule.check (spec 2026-10-05 §3.3): parses `dsl` as a save would -- the 499-byte limit first, then the
+// parser -- and stores nothing (no RULE_CHANGED). False with the reason in `err`: the parser's own words,
+// or a name for the structural errors it leaves unnamed. Takes the rules mutex: the parser's last-error
+// text is shared state.
+bool     simple_rules_check(const char* dsl, char* err, size_t cap);
+
 bool     simple_rules_delete(uint16_t rule_id);
 bool     simple_rules_enable(uint16_t rule_id, bool enabled);
 

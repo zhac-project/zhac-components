@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <ctime>
 #include <cinttypes>
+#include <new>
 #include <time.h>    // clock_gettime(CLOCK_MONOTONIC): last-run times survive the clock being set
 #include "task_stacks.h"
 
@@ -952,6 +953,43 @@ void simple_rules_reload() {
     xSemaphoreGiveRecursive(s_mutex);
 }
 
+// dsl_parse names its field errors but not the structural ones (no ON / DO / ENDON, a bad trigger or
+// action, too many actions), and never clears the previous message: a save or a check of such text
+// answered with an empty or stale reason. Called after a failed parse, under s_mutex, with the message
+// cleared before the parse.
+static void name_parse_failure(ParseResult r) {
+    if (dsl_last_error()[0]) return;
+    switch (r) {
+        case ParseResult::ERR_NO_ON:            dsl_set_last_error("rule must start with ON"); break;
+        case ParseResult::ERR_NO_DO:            dsl_set_last_error("missing DO"); break;
+        case ParseResult::ERR_NO_ENDON:         dsl_set_last_error("missing ENDON"); break;
+        case ParseResult::ERR_BAD_TRIGGER:      dsl_set_last_error("bad trigger"); break;
+        case ParseResult::ERR_TOO_MANY_ACTIONS: dsl_set_last_error("too many actions (max 4)"); break;
+        default:                                dsl_set_last_error("bad action"); break;
+    }
+}
+
+bool simple_rules_check(const char* dsl, char* err, size_t cap) {
+    if (err && cap) err[0] = '\0';
+    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
+    bool ok = false;
+    const size_t dsl_len = dsl ? strlen(dsl) : 0;
+    if (dsl_len >= sizeof(((RuleSlot*)nullptr)->src)) {
+        dsl_set_last_error("rule DSL too long (max 499 bytes)");
+    } else if (ParsedRule* r = new (std::nothrow) ParsedRule{}) {   // heap: a ParsedRule is large for a task stack
+        dsl_set_last_error(nullptr);
+        const ParseResult pr = dsl_parse(dsl ? dsl : "", 0, r);
+        ok = pr == ParseResult::OK;
+        if (!ok) name_parse_failure(pr);
+        delete r;
+    } else {
+        dsl_set_last_error("out of memory");
+    }
+    if (!ok && err && cap) snprintf(err, cap, "%s", dsl_last_error());
+    xSemaphoreGiveRecursive(s_mutex);
+    return ok;
+}
+
 bool simple_rules_add(const char* name, const char* dsl,
                        uint16_t* out_rule_id) {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
@@ -976,7 +1014,10 @@ bool simple_rules_add(const char* name, const char* dsl,
     }
     uint16_t id = next_rule_id();
     ParsedRule r{};
-    if (dsl_parse(dsl, id, &r) != ParseResult::OK) {
+    dsl_set_last_error(nullptr);
+    const ParseResult pr = dsl_parse(dsl, id, &r);
+    if (pr != ParseResult::OK) {
+        name_parse_failure(pr);
         xSemaphoreGiveRecursive(s_mutex);
         return false;
     }
@@ -988,7 +1029,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     slot.trigger_type = (uint8_t)r.trigger.type;
     if (name) {
         strncpy(slot.name, name, sizeof(slot.name) - 1);
-        slot.name[sizeof(slot.name) - 1] = '\0';
+        rule_store_trim_name(slot.name, sizeof(slot.name));   // cut between characters, not inside one
     }
     slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
     memcpy(slot.src, dsl, dsl_len);
@@ -1021,7 +1062,10 @@ bool simple_rules_update(uint16_t rule_id,
         return false;
     }
     ParsedRule r{};
-    if (dsl_parse(dsl, rule_id, &r) != ParseResult::OK) {
+    dsl_set_last_error(nullptr);
+    const ParseResult pr = dsl_parse(dsl, rule_id, &r);
+    if (pr != ParseResult::OK) {
+        name_parse_failure(pr);
         xSemaphoreGiveRecursive(s_mutex);
         return false;
     }
@@ -1040,6 +1084,7 @@ bool simple_rules_update(uint16_t rule_id,
     } else {
         RuleSlot existing{};
         if (!rule_store_load(rule_id, &existing)) {
+            dsl_set_last_error("rule not found");
             xSemaphoreGiveRecursive(s_mutex);
             return false;   // unknown rule_id — do not persist an orphan
         }
@@ -1054,7 +1099,7 @@ bool simple_rules_update(uint16_t rule_id,
     slot.trigger_type = (uint8_t)r.trigger.type;
     if (name) {
         strncpy(slot.name, name, sizeof(slot.name) - 1);
-        slot.name[sizeof(slot.name) - 1] = '\0';
+        rule_store_trim_name(slot.name, sizeof(slot.name));   // cut between characters, not inside one
     }
     slot.src_len      = (uint16_t)dsl_len;   // validated < sizeof(slot.src) above
     memcpy(slot.src, dsl, dsl_len);

@@ -132,12 +132,14 @@ bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
     // must NOT fall through to NVS, otherwise the deleted rule reappears
     // until the next flush tick (up to ~5 s) and permanently on power-cut.
     bool tombstoned = false;
-    if (rule_store_load_overlay(rule_id, out, &tombstoned)) return true;
-    if (tombstoned) return false;
-    if (!s_nvs) return false;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool ok = rule_store_load_unlocked(rule_id, out);
-    xSemaphoreGive(s_mutex);
+    bool ok = rule_store_load_overlay(rule_id, out, &tombstoned);
+    if (!ok && !tombstoned && s_nvs) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        ok = rule_store_load_unlocked(rule_id, out);
+        xSemaphoreGive(s_mutex);
+    }
+    // After the CRC check, on the copy only: a name stored cut inside a character reads back whole.
+    if (ok) rule_store_trim_name(out->name, sizeof(out->name));
     return ok;
 }
 
@@ -274,6 +276,7 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     MergeCtx mctx{ out, &count, max_count };
     rule_store_foreach_dirty(merge_cb, &mctx);
     xSemaphoreGive(s_mutex);
+    for (uint16_t i = 0; i < count; i++) rule_store_trim_name(out[i].name, sizeof(out[i].name));   // as rule_store_load
     return count;
 }
 

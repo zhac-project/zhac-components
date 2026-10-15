@@ -3,6 +3,22 @@
 #pragma once
 #include "zap_common.h"
 #include <stdbool.h>
+#include <string.h>
+
+// A rule name cut to fit RuleSlot::name (23 bytes; the hub page sends names of any length) can end inside
+// a UTF-8 character, and one invalid byte in a WebSocket text frame closes the socket (the hub page's and
+// the cloud's). Terminates `name` within `cap` bytes and drops a character cut short at its end; anything
+// else is left as it is. simple_rules applies it when it stores a name, rule_store_load / _load_all when
+// they read one, which repairs names stored before the cut was fixed.
+static inline void rule_store_trim_name(char* name, size_t cap) {
+    size_t n = strnlen(name, cap);
+    if (n == cap) name[--n] = '\0';
+    size_t i = n, cont = 0;
+    while (i > 0 && cont < 3 && ((unsigned char)name[i - 1] & 0xC0) == 0x80) { i--; cont++; }
+    const unsigned char lead = i > 0 ? (unsigned char)name[i - 1] : 0;
+    const size_t need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : 0;
+    if (cont < need) name[i - 1] = '\0';
+}
 
 // Initialise NVS namespace zap_rules. Call once from app_main.
 void rule_store_init();
