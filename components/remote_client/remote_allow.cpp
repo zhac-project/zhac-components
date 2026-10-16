@@ -111,7 +111,12 @@ constexpr const char* kRemoteAllowedEvents[] = {
     "alert",
     // Remote editing (spec 2026-10-05 §3.6): the cloud's script mirror and the switch.
     "script.added", "script.updated", "script.deleted", "script.error", "hub.caps",
+    // Cloud logs (spec 2026-10-06 §4.3, §4.4): log batches and, once per run, the restart tail.
+    "log.batch", "log.tail",
 };
+
+// settings.set keys only the hub's own page may change (the relay answers local_only).
+constexpr const char* kRemoteLocalOnlyKeys[] = { "remote_scripts", "log_to_cloud" };
 
 // Changes the hub logs with the `cloud` tag (spec 2026-10-05 §3.7).
 constexpr const char* kLoggedCmds[] = {
@@ -163,6 +168,10 @@ extern "C" bool remote_cmd_allowed(const char* cmd) {
 
 extern "C" bool remote_event_allowed(const char* name) {
     return name && *name && listed(kRemoteAllowedEvents, name);
+}
+
+extern "C" bool remote_is_local_only_key(const char* key) {
+    return key && *key && listed(kRemoteLocalOnlyKeys, key);
 }
 
 extern "C" bool remote_script_name_ok(const char* name) {

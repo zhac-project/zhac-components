@@ -192,6 +192,22 @@ extern "C" void remote_client_get_status(RemoteStatusSnap* out) {
     out->auth_fails      = s_auth_fails.load();
 }
 
+// This run's boot id (remote_client.h). The first caller picks it, which may be cloud logs' boot code long
+// before the link starts, so it is set once by compare-exchange instead of a lazy local in send_auth_frame.
+static std::atomic<uint32_t> s_boot_epoch{0};
+
+extern "C" uint32_t remote_client_boot_epoch(void) {
+    uint32_t v = s_boot_epoch.load(std::memory_order_acquire);
+    if (v != 0) return v;
+    const uint32_t fresh = (esp_random() & 0x7FFFFFFFu) | 1u;
+    return s_boot_epoch.compare_exchange_strong(v, fresh, std::memory_order_acq_rel) ? fresh : v;
+}
+
+extern "C" size_t remote_client_tx_free(void) {
+    QueueHandle_t q = s_tx_queue;    // created once, never deleted (remote_objects_init_once)
+    return q ? (size_t)uxQueueSpacesAvailable(q) : 0;
+}
+
 // ── esp_websocket_client event handler ───────────────────────────────────
 // Runs on the IDF websocket-client internal task. Posts to event group
 // or RX queue and returns fast — no processing on this task's stack.
@@ -265,8 +281,7 @@ static void send_auth_frame() {
     // hub restarted and its cache must be reloaded cold; the version lets it
     // pick the right protocol expectations. "vDEV" and no boot_epoch made
     // every reconnect look like a warm one.
-    static uint32_t s_boot_epoch = 0;
-    if (s_boot_epoch == 0) s_boot_epoch = (esp_random() & 0x7FFFFFFFu) | 1u;
+    const uint32_t boot_epoch = remote_client_boot_epoch();
     const esp_app_desc_t* app = esp_app_get_description();
     char extra[160];
     const size_t xn = remote_hello_extra(extra, sizeof(extra));
@@ -278,7 +293,7 @@ static void send_auth_frame() {
         "\"args\":{\"token\":\"%s\",\"device_id\":\"%s\",\"fw_version\":\"%s\","
         "\"boot_epoch\":%u%.*s}}",
         (unsigned)s_auth_id, s_cfg.token, s_cfg.devid, app ? app->version : "unknown",
-        (unsigned)s_boot_epoch, (int)(xn < sizeof(extra) ? xn : 0), extra);
+        (unsigned)boot_epoch, (int)(xn < sizeof(extra) ? xn : 0), extra);
     if (n <= 0 || (size_t)n >= sizeof(buf)) {
         ESP_LOGE(TAG, "auth frame does not fit (%d B) -- not sent", n);
         return;
@@ -358,7 +373,9 @@ static void handle_rx_frame(const char* data, size_t len) {
     // Relay gate (spec 2026-10-05 §3.1): the allow-list, the hub's script switch, and the setting only
     // the hub's own page may change. Each refusal has its own code, so the cloud can tell "turn the
     // switch on" (scripts_off) from "not supported" (cmd_not_allowed).
-    const bool local_only_key = !doc["args"]["remote_scripts"].isNull();
+    bool local_only_key = false;   // remote_scripts, log_to_cloud: remote_allow.cpp kRemoteLocalOnlyKeys
+    for (JsonPairConst kv : doc["args"].as<JsonObjectConst>())
+        if (!kv.value().isNull() && remote_is_local_only_key(kv.key().c_str())) local_only_key = true;
     if (const char* refusal = remote_cmd_refusal(cmd, local_only_key, remote_scripts_allowed())) {
         char err_buf[96];
         int en = snprintf(err_buf, sizeof(err_buf),

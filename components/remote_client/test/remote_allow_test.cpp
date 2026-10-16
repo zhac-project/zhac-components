@@ -114,6 +114,16 @@ int main() {
         assert(!remote_change_log_line(c, "00000000-0000-4000-8000-000000000001", -1, "", line, sizeof line));
     }
 
+    // Cloud logs (spec 2026-10-06 §4.1, §4.3): the batches and the restart tail reach the cloud, and
+    // log_to_cloud joins remote_scripts as a setting only the hub's own page may change.
+    assert(remote_event_allowed("log.batch"));
+    assert(remote_event_allowed("log.tail"));
+    assert(remote_is_local_only_key("remote_scripts"));
+    assert(remote_is_local_only_key("log_to_cloud"));
+    assert(!remote_is_local_only_key("timezone"));
+    assert(!remote_is_local_only_key(""));
+    assert(!remote_is_local_only_key(nullptr));
+
     printf("remote_allow_tests: ok\n");
     return 0;
 }

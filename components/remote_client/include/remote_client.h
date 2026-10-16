@@ -125,6 +125,14 @@ void remote_client_get_status(RemoteStatusSnap* out);
 // 2026-10-05 §3.6); hubs that send neither stay read-only in the cloud.
 size_t remote_hello_extra(char* out, size_t cap);
 
+// Free slots in the event TX queue; 0 before remote_client_init() created it. Cloud logs sends a batch only
+// while at least half of it is free, so device events always find room (spec 2026-10-06 §4.3).
+size_t remote_client_tx_free(void);
+
+// This run's boot id: random, 31 bits, never 0, the same for the whole run. remote.auth carries it as
+// boot_epoch; cloud logs stamps log.batch and log.tail with it. Safe from any task, also before the link starts.
+uint32_t remote_client_boot_epoch(void);
+
 #else  // CONFIG_ZHAC_REMOTE_CLIENT_ENABLE not set
 
 // Inline no-op stubs. The compiler eliminates these at -O2; no
@@ -141,6 +149,8 @@ static inline void remote_client_send_reply(const char* /*json*/, size_t /*len*/
 static inline void remote_client_get_status(RemoteStatusSnap* out) {
     if (out) *out = (RemoteStatusSnap){};
 }
+static inline size_t   remote_client_tx_free(void)    { return 0; }
+static inline uint32_t remote_client_boot_epoch(void) { return 0; }
 
 #endif // CONFIG_ZHAC_REMOTE_CLIENT_ENABLE
 
