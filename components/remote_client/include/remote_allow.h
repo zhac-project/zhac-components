@@ -15,9 +15,14 @@ extern "C" {
 //                     system.restart) and a direct script.run. It does not gate a rule's script.run
 //                     action: the cloud, not the hub, limits such rules to owners and admins;
 //   "cmd_not_allowed" anything else the relay does not pass.
-// `local_only_key`: the args carry `remote_scripts`. `scripts_on`: the switch.
+// `local_only_key`: the args carry a key `remote_is_local_only_key` accepts. `scripts_on`: the switch.
 // LINEAR SCANS over static arrays (~70 entries), once per cloud frame.
 const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on);
+
+// True for a settings.set key that only the hub's own page may change; the relay answers settings.set
+// carrying one of them (with any non-null value) with local_only. remote_scripts: spec 2026-10-05 §3.1;
+// log_to_cloud: spec 2026-10-06 §4.1.
+bool remote_is_local_only_key(const char* key);
 
 // True iff `cmd` passes now: remote_cmd_refusal(cmd, false, remote_scripts_allowed()) == nullptr.
 bool remote_cmd_allowed(const char* cmd);
