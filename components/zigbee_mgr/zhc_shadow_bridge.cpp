@@ -12,6 +12,7 @@
 #include "device_shadow.h"
 #include "zap_store.h"
 #include "zigbee_pool.h"
+#include "event_bus.h"
 
 #include "esp_log.h"
 #include <cstdint>
@@ -168,6 +169,14 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
             static_assert(sizeof(out->manufacturer_name) == sizeof(d.manufacturer_name));
             memcpy(out->model_id, d.model_id, sizeof(out->model_id));
             memcpy(out->manufacturer_name, d.manufacturer_name, sizeof(out->manufacturer_name));
+            // ponytail: herdsman pings the first endpoint serving genBasic; the
+            // pool cannot tell Basic (0x0000) from an empty cluster slot, so
+            // take the first endpoint that is not Green Power (242). Basic sits
+            // there on every device seen so far.
+            out->ping_ep = 0;
+            for (uint8_t e = 0; e < d.endpoint_count && e < sizeof(d.endpoints); ++e) {
+                if (d.endpoints[e] && d.endpoints[e] != 242) { out->ping_ep = d.endpoints[e]; break; }
+            }
         } else {
             out->ieee = 0;
         }
@@ -176,9 +185,19 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
     return more;
 }
 
+// A frame ended a long silence (zhac_adapter_register_seen): tell the
+// subscribers, who push the device's new last_seen.
+void zhc_device_seen(uint64_t ieee) {
+    Event ev{};
+    ev.type = EventType::DEVICE_SEEN;
+    memcpy(ev.data, &ieee, sizeof(ieee));
+    event_bus_publish(ev);
+}
+
 }  // namespace
 
 extern "C" void zhc_shadow_bridge_register(void) {
     zhac_adapter_register_shadow(&zhc_shadow_update_cb);
     zhac_adapter_register_poll_source(&zhc_poll_device_at);
+    zhac_adapter_register_seen(&zhc_device_seen);
 }

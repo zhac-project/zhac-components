@@ -31,10 +31,10 @@ static int s_failures = 0;
 } while (0)
 
 // ── EVENT_TYPE_COUNT derives from the enum sentinel (fix 6) ──────────────
-// 13 = types 1..12 (RULE_CHANGED is 12) plus the unused 0 slot. If a
+// 14 = types 1..13 (DEVICE_SEEN is 13) plus the unused 0 slot. If a
 // type is added without growing the table, this trips at compile time now
 // instead of silently truncating the subscriber table at runtime.
-static_assert(static_cast<uint8_t>(EventType::_COUNT) == 13,
+static_assert(static_cast<uint8_t>(EventType::_COUNT) == 14,
               "EventType::_COUNT must track the enum (was hand-maintained 13)");
 
 static Event make_event(EventType t, uint8_t tag) {

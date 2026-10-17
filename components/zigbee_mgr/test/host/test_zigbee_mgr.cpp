@@ -47,6 +47,7 @@
 #include "zap_store.h"
 #include "zhc_adapter.h"   // zhac_shadow_update_fn_t (G12 battery mirroring)
 #include "device_shadow.h"  // device_shadow_init (G12)
+#include "event_bus.h"      // DEVICE_SEEN from the seen hook
 #include "znp_stub.h"      // includes znp_driver.h (MtFrame, MT_SREQ/AREQ, ZNP_*)
 
 #include <cstdio>
@@ -111,6 +112,7 @@ static bool init_responder(const ZnpRecordedReq& req, MtFrame& srsp) {
 // lets the test drive the real bridge callback.
 extern zhac_shadow_update_fn_t g_stub_shadow_fn;
 extern zhac_poll_device_fn_t g_stub_poll_source;
+extern zhac_seen_fn_t g_stub_seen_fn;
 extern "C" void zhc_shadow_bridge_register(void);
 
 int main() {
@@ -737,6 +739,9 @@ int main() {
         plug->power_source = 0x01;
         strcpy(plug->model_id, "TS011F");
         strcpy(plug->manufacturer_name, "_TZ3000_okaz9tjs");
+        plug->endpoint_count = 2;
+        plug->endpoints[0] = 242;            // Green Power: never the ping endpoint
+        plug->endpoints[1] = 11;
         ZapDevice* gone = pool_add();
         gone->ieee_addr = 0xA4C1380000000002ULL;
         strcpy(gone->model_id, "TS011F");
@@ -750,9 +755,27 @@ int main() {
               strcmp(pd.model_id, "TS011F") == 0 &&
               strcmp(pd.manufacturer_name, "_TZ3000_okaz9tjs") == 0,
               "live device listed with nwk, power source and identity");
+        CHECK(pd.ping_ep == 11, "pings go to the first endpoint that is not Green Power");
         CHECK(g_stub_poll_source(1, &pd) && pd.ieee == 0, "removed device blanked");
         CHECK(g_stub_poll_source(2, &pd) && pd.ieee == 0, "device without model blanked");
         CHECK(!g_stub_poll_source(3, &pd), "false past the end");
+
+        // A frame that ended a long silence (an answered ping) reaches the
+        // event bus as DEVICE_SEEN with the ieee, for the last_seen push.
+        CHECK(g_stub_seen_fn != nullptr, "shadow bridge registers the seen hook");
+        event_bus_init();   // nothing earlier in this harness started the bus
+        uint64_t seen_ieee = 0;
+        // This harness's queues never deliver; a subscriber filter runs inside
+        // event_bus_publish itself, so it sees the event.
+        const EventSubHandle h = event_bus_subscribe(EventType::DEVICE_SEEN, [](const Event&) {},
+            [&seen_ieee](const Event& e) {
+                memcpy(&seen_ieee, e.data, sizeof(seen_ieee));
+                return true;
+            });
+        CHECK(h != EVENT_SUB_INVALID, "subscribe DEVICE_SEEN");
+        if (g_stub_seen_fn) g_stub_seen_fn(0xA4C1380000000001ULL);
+        CHECK(seen_ieee == 0xA4C1380000000001ULL, "seen hook publishes DEVICE_SEEN with the ieee");
+        event_bus_unsubscribe(h);
     }
 
     printf("\n%s (failures=%d)\n", s_failures ? "FAILED" : "OK", s_failures);

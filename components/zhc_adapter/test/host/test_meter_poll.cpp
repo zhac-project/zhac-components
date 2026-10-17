@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Meter polling policy (src/meter_poll.hpp): which devices are read, which
-// attributes, how often, staggered, capped, and when polling stops.
+// attributes, how often, staggered, capped, and when polling stops. Then the
+// availability pings: who is pinged, when, and how they back off.
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -165,6 +166,132 @@ static void test_wraparound() {
     assert(poll(s, now + stagger(kPlug, kMin)) == 1);   // crosses 2^32 fine
 }
 
+// ── Availability pings (z2m availability.active) ─────────────────────
+
+static const std::uint32_t kPing = 10u * kMin;   // z2m availability.active.timeout
+
+// Take the pings due at `now` (one per tick, as meter_tick does) and ack them as sent.
+static std::size_t ping(Scheduler& s, std::uint32_t now, Due* out = nullptr) {
+    Due tmp[1];
+    Due* d = out ? out : tmp;
+    const std::size_t n = s.take_ping_due(now, d, 1);
+    for (std::size_t i = 0; i < n; ++i) s.pinged(d[i].ieee, now, kPing);
+    return n;
+}
+
+static void add_awake(Scheduler& s, std::uint64_t ieee, std::uint32_t now = 0, std::uint8_t ep = 1) {
+    assert(s.add(ieee, 0x1234, 0, now, kMin, true, ep, kPing));
+}
+
+static void test_quiet_device_is_pinged() {
+    Scheduler s;
+    add_awake(s, kPlug, 0, 11);
+    const std::uint32_t at = kPing + stagger(kPlug, kPingJitterMs);
+    assert(ping(s, at - 1) == 0);
+    Due d[1];
+    assert(ping(s, at, d) == 1);
+    assert(d[0].ieee == kPlug && d[0].nwk == 0x1234 && d[0].ep == 11);
+    assert(poll(s, at) == 0);                      // no meter read: its def has no meter_poll
+}
+
+static void test_heard_device_is_not_pinged() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    const std::uint32_t j = stagger(kPlug, kPingJitterMs);
+    for (std::uint32_t t = 0; t < 5 * kPing; t += kMin) {   // reports every minute
+        s.heard(kPlug, t, kPing);
+        assert(ping(s, t) == 0);
+    }
+    const std::uint32_t last = 5 * kPing - kMin;
+    assert(ping(s, last + kPing + j - 1) == 0);
+    assert(ping(s, last + kPing + j) == 1);        // quiet since the last report
+}
+
+static void test_sleepy_device_is_never_pinged() {
+    Scheduler s;
+    assert(s.add(kPlug, 1, 0, 0, kMin, false, 1, kPing));
+    assert(s.add(kPlug2, 2, 0, 0, kMin, true, 1, 0));     // pings off (interval 0)
+    for (std::uint32_t t = 0; t < 48u * 60u * kMin; t += kMin) assert(ping(s, t) == 0);
+}
+
+// z2m's backoff: an unanswered ping is tried again after 1.5x the timeout,
+// then twice as long each time (10, 15, 30, 60, 120 min ...), up to a day.
+static void test_unanswered_pings_back_off() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    const std::uint32_t j = stagger(kPlug, kPingJitterMs);
+    std::uint32_t t = kPing + j;
+    assert(ping(s, t) == 1);
+    const std::uint32_t gaps_min[] = {15, 30, 60, 120, 240, 480, 960, 1440, 1440};
+    for (const std::uint32_t gap : gaps_min) {
+        const std::uint32_t next = t + gap * kMin + j;
+        assert(ping(s, next - 1) == 0);
+        assert(ping(s, next) == 1);
+        t = next;
+    }
+}
+
+static void test_answer_resets_the_backoff() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    const std::uint32_t j = stagger(kPlug, kPingJitterMs);
+    std::uint32_t t = kPing + j;
+    assert(ping(s, t) == 1);                       // unanswered
+    t += 15 * kMin + j;
+    assert(ping(s, t) == 1);                       // this one is answered:
+    s.heard(kPlug, t + 2000, kPing);
+    assert(ping(s, t + 2000 + kPing + j - 1) == 0);
+    assert(ping(s, t + 2000 + kPing + j) == 1);    // back to the plain timeout
+}
+
+// pinged() says true when the ping before went unanswered, once per silence.
+static void test_unanswered_ping_warns_once() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    assert(!s.pinged(kPlug, 0, kPing));            // first ping: nothing missed yet
+    assert(s.pinged(kPlug, 0, kPing));             // the one before got no answer
+    assert(!s.pinged(kPlug, 0, kPing));            // still silent: said already
+    s.heard(kPlug, 0, kPing);
+    assert(!s.pinged(kPlug, 0, kPing));
+    assert(s.pinged(kPlug, 0, kPing));             // a new silence warns again
+}
+
+// heard() says true for the frame that ends a silence of a ping interval or
+// more (in practice the answer to a ping), so the hub can tell the cloud the
+// device's last_seen moved although no state changed. Once per silence.
+static void test_heard_reports_the_end_of_a_silence() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    assert(!s.heard(kPlug, kMin, kPing));                 // talking: nothing to report
+    assert(!s.heard(kPlug, 2 * kMin, kPing));
+    const std::uint32_t due = 2 * kMin + kPing + stagger(kPlug, kPingJitterMs);
+    assert(!s.heard(kPlug, due - 1, kPing));             // just under the interval
+    assert(ping(s, due - 1 + kPing + kPingJitterMs) == 1);  // silent: pinged
+    assert(s.heard(kPlug, due + kPing + kPingJitterMs, kPing));  // the answer ends the silence
+    assert(!s.heard(kPlug, due + kPing + kPingJitterMs + 1000, kPing));
+    // Quiet past the due time but not pinged yet (the queue was busy): still a silence.
+    s.add(kPlug2, 2, 0, 0, kMin, true, 1, kPing);
+    assert(s.heard(kPlug2, kPing + kPingJitterMs, kPing));
+    assert(!s.heard(0xDEADull, kPing, kPing));           // unknown device
+}
+
+static void test_pings_go_one_per_tick() {
+    Scheduler s;
+    for (std::uint64_t i = 1; i <= 5; ++i) add_awake(s, i);
+    std::size_t total = 0;
+    for (std::uint32_t t = kPing + kPingJitterMs; t < kPing + kPingJitterMs + 5 * kTickMs; t += kTickMs) {
+        total += ping(s, t);
+    }
+    assert(total == 5);                            // none lost, none twice
+}
+
+static void test_ping_wraparound() {
+    Scheduler s;
+    const std::uint32_t now = 0xFFFFFFFFu - 1000u;
+    add_awake(s, kPlug, now);
+    assert(ping(s, now + kPing + stagger(kPlug, kPingJitterMs)) == 1);
+}
+
 int main() {
     test_reads_carry_z2m_attrs();
     test_mains_only();
@@ -178,6 +305,15 @@ int main() {
     test_in_flight_cap();
     test_table_full();
     test_wraparound();
+    test_quiet_device_is_pinged();
+    test_heard_device_is_not_pinged();
+    test_sleepy_device_is_never_pinged();
+    test_unanswered_pings_back_off();
+    test_answer_resets_the_backoff();
+    test_unanswered_ping_warns_once();
+    test_heard_reports_the_end_of_a_silence();
+    test_pings_go_one_per_tick();
+    test_ping_wraparound();
     std::puts("meter_poll: all passed");
     return 0;
 }
