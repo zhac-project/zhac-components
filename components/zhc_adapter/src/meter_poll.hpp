@@ -104,8 +104,9 @@ public:
                 bool ok = true);
 
     // The device just sent something: its next ping is a full interval away
-    // and the backoff starts over.
-    void heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
+    // and the backoff starts over. True when this ends a silence of at least
+    // the interval (in practice: the answer to a ping), once per silence.
+    bool heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
 
     // Up to `max` devices to ping at `now_ms`. They stay due until pinged().
     std::size_t take_ping_due(std::uint32_t now_ms, Due* out, std::size_t max);

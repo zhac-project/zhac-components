@@ -256,6 +256,25 @@ static void test_unanswered_ping_warns_once() {
     assert(s.pinged(kPlug, 0, kPing));             // a new silence warns again
 }
 
+// heard() says true for the frame that ends a silence of a ping interval or
+// more (in practice the answer to a ping), so the hub can tell the cloud the
+// device's last_seen moved although no state changed. Once per silence.
+static void test_heard_reports_the_end_of_a_silence() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    assert(!s.heard(kPlug, kMin, kPing));                 // talking: nothing to report
+    assert(!s.heard(kPlug, 2 * kMin, kPing));
+    const std::uint32_t due = 2 * kMin + kPing + stagger(kPlug, kPingJitterMs);
+    assert(!s.heard(kPlug, due - 1, kPing));             // just under the interval
+    assert(ping(s, due - 1 + kPing + kPingJitterMs) == 1);  // silent: pinged
+    assert(s.heard(kPlug, due + kPing + kPingJitterMs, kPing));  // the answer ends the silence
+    assert(!s.heard(kPlug, due + kPing + kPingJitterMs + 1000, kPing));
+    // Quiet past the due time but not pinged yet (the queue was busy): still a silence.
+    s.add(kPlug2, 2, 0, 0, kMin, true, 1, kPing);
+    assert(s.heard(kPlug2, kPing + kPingJitterMs, kPing));
+    assert(!s.heard(0xDEADull, kPing, kPing));           // unknown device
+}
+
 static void test_pings_go_one_per_tick() {
     Scheduler s;
     for (std::uint64_t i = 1; i <= 5; ++i) add_awake(s, i);
@@ -292,6 +311,7 @@ int main() {
     test_unanswered_pings_back_off();
     test_answer_resets_the_backoff();
     test_unanswered_ping_warns_once();
+    test_heard_reports_the_end_of_a_silence();
     test_pings_go_one_per_tick();
     test_ping_wraparound();
     std::puts("meter_poll: all passed");

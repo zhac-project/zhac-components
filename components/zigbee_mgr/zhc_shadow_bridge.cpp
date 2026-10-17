@@ -12,6 +12,7 @@
 #include "device_shadow.h"
 #include "zap_store.h"
 #include "zigbee_pool.h"
+#include "event_bus.h"
 
 #include "esp_log.h"
 #include <cstdint>
@@ -184,9 +185,19 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
     return more;
 }
 
+// A frame ended a long silence (zhac_adapter_register_seen): tell the
+// subscribers, who push the device's new last_seen.
+void zhc_device_seen(uint64_t ieee) {
+    Event ev{};
+    ev.type = EventType::DEVICE_SEEN;
+    memcpy(ev.data, &ieee, sizeof(ieee));
+    event_bus_publish(ev);
+}
+
 }  // namespace
 
 extern "C" void zhc_shadow_bridge_register(void) {
     zhac_adapter_register_shadow(&zhc_shadow_update_cb);
     zhac_adapter_register_poll_source(&zhc_poll_device_at);
+    zhac_adapter_register_seen(&zhc_device_seen);
 }

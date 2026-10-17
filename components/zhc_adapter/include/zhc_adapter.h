@@ -149,6 +149,13 @@ typedef struct {
 typedef bool (*zhac_poll_device_fn_t)(uint16_t index, zhac_poll_device_t* out);
 void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn);
 
+// Called (on the RX path, keep it short) when a frame ends a silence of at
+// least CONFIG_ZHAC_PING_S -- in practice the answer to a ping, which changes
+// no state. The platform tells its listeners the device's last_seen moved, as
+// zigbee2mqtt publishes last_seen for such frames.
+typedef void (*zhac_seen_fn_t)(uint64_t ieee);
+void zhac_adapter_register_seen(zhac_seen_fn_t fn);
+
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame
 // before invoking `zhac_adapter_try_decode`. Required so fz

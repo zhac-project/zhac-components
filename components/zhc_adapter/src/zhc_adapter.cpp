@@ -1721,13 +1721,16 @@ void meter_forget(uint64_t ieee) {
     if (l.ok) g_meter.forget(ieee);
 }
 
+zhac_seen_fn_t g_seen_cb = nullptr;
+
 // On the RX path, so a short wait: a frame missed here only means one ping
 // that was not needed.
 void ping_heard(uint64_t ieee) {
     if (kPingIntervalMs == 0 || !g_meter_mtx) return;
     if (xSemaphoreTake(g_meter_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
-    g_meter.heard(ieee, wake_now_ms(), kPingIntervalMs);
+    const bool silence_ended = g_meter.heard(ieee, wake_now_ms(), kPingIntervalMs);
     xSemaphoreGive(g_meter_mtx);
+    if (silence_ended && g_seen_cb) g_seen_cb(ieee);
 }
 
 // Keeps its receiver on: mains-powered, or an unknown power source (interview
@@ -2035,6 +2038,10 @@ extern "C" void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn) {
 extern "C" void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn) {
     ensure_worker();
     g_poll_source = fn;
+}
+
+extern "C" void zhac_adapter_register_seen(zhac_seen_fn_t fn) {
+    g_seen_cb = fn;
 }
 
 extern "C" void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk) {
