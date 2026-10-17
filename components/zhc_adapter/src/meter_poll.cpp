@@ -29,23 +29,39 @@ std::uint32_t stagger(std::uint64_t ieee, std::uint32_t interval_ms) {
     return static_cast<std::uint32_t>((h >> 32) % interval_ms);
 }
 
+namespace {
+
+// The interval times the backoff, capped, plus the device's own jitter.
+std::uint32_t ping_wait(std::uint64_t ieee, std::uint32_t interval_ms, std::uint32_t backoff_x2) {
+    const std::uint64_t ms = static_cast<std::uint64_t>(interval_ms) * backoff_x2 / 2;
+    return static_cast<std::uint32_t>(ms < kPingMaxMs ? ms : kPingMaxMs) + stagger(ieee, kPingJitterMs);
+}
+
+}  // namespace
+
 Scheduler::Slot* Scheduler::find(std::uint64_t ieee) {
     for (auto& s : slots_) if (s.ieee == ieee) return &s;
     return nullptr;
 }
 
 bool Scheduler::add(std::uint64_t ieee, std::uint16_t nwk, std::uint8_t flags,
-                    std::uint32_t now_ms, std::uint32_t interval_ms) {
+                    std::uint32_t now_ms, std::uint32_t interval_ms,
+                    bool awake, std::uint8_t ping_ep, std::uint32_t ping_interval_ms) {
     if (ieee == 0) return false;
     Slot* s = find(ieee);
     if (!s) {
         s = find(0);
         if (!s) return false;
-        *s = Slot{ieee, now_ms + stagger(ieee, interval_ms), nwk, flags, true, false};
-        return true;
+        *s = Slot{};
+        s->ieee        = ieee;
+        s->due_ms      = now_ms + stagger(ieee, interval_ms);
+        s->backoff_x2  = 2;
+        s->ping_due_ms = now_ms + ping_wait(ieee, ping_interval_ms, 2);
     }
     s->nwk = nwk;
     s->flags = flags;
+    s->awake = awake && ping_interval_ms != 0;
+    s->ping_ep = ping_ep ? ping_ep : 1;
     s->seen = true;
     return true;
 }
@@ -83,7 +99,7 @@ std::size_t Scheduler::take_due(std::uint32_t now_ms, Due* out, std::size_t max)
         if (n >= max) break;
         if (!s.ieee || !s.flags) continue;
         if (static_cast<std::int32_t>(now_ms - s.due_ms) < 0) continue;
-        out[n++] = Due{s.ieee, s.nwk, s.flags};
+        out[n++] = Due{s.ieee, s.nwk, s.flags, 0};
     }
     return n;
 }
@@ -97,6 +113,35 @@ bool Scheduler::polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t i
     if (s->warned) return false;
     s->warned = true;
     return true;
+}
+
+void Scheduler::heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms) {
+    Slot* s = ieee ? find(ieee) : nullptr;
+    if (!s || !s->awake) return;
+    s->backoff_x2 = 2;
+    s->ping_due_ms = now_ms + ping_wait(ieee, interval_ms, 2);
+}
+
+std::size_t Scheduler::take_ping_due(std::uint32_t now_ms, Due* out, std::size_t max) {
+    std::size_t n = 0;
+    for (const auto& s : slots_) {
+        if (n >= max) break;
+        if (!s.ieee || !s.awake) continue;
+        if (static_cast<std::int32_t>(now_ms - s.ping_due_ms) < 0) continue;
+        out[n++] = Due{s.ieee, s.nwk, s.flags, s.ping_ep};
+    }
+    return n;
+}
+
+bool Scheduler::pinged(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms) {
+    Slot* s = find(ieee);
+    if (!s || !s->awake) return false;
+    const bool missed = s->backoff_x2 == 3;   // set by the previous ping, not reset by an answer
+    if (static_cast<std::uint64_t>(interval_ms) * s->backoff_x2 / 2 < kPingMaxMs) {
+        s->backoff_x2 = s->backoff_x2 == 2 ? 3 : s->backoff_x2 * 2;
+    }
+    s->ping_due_ms = now_ms + ping_wait(ieee, interval_ms, s->backoff_x2);
+    return missed;
 }
 
 }  // namespace zhac_meter

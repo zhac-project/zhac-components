@@ -168,6 +168,14 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
             static_assert(sizeof(out->manufacturer_name) == sizeof(d.manufacturer_name));
             memcpy(out->model_id, d.model_id, sizeof(out->model_id));
             memcpy(out->manufacturer_name, d.manufacturer_name, sizeof(out->manufacturer_name));
+            // ponytail: herdsman pings the first endpoint serving genBasic; the
+            // pool cannot tell Basic (0x0000) from an empty cluster slot, so
+            // take the first endpoint that is not Green Power (242). Basic sits
+            // there on every device seen so far.
+            out->ping_ep = 0;
+            for (uint8_t e = 0; e < d.endpoint_count && e < sizeof(d.endpoints); ++e) {
+                if (d.endpoints[e] && d.endpoints[e] != 242) { out->ping_ep = d.endpoints[e]; break; }
+            }
         } else {
             out->ieee = 0;
         }

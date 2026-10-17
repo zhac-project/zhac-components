@@ -737,6 +737,9 @@ int main() {
         plug->power_source = 0x01;
         strcpy(plug->model_id, "TS011F");
         strcpy(plug->manufacturer_name, "_TZ3000_okaz9tjs");
+        plug->endpoint_count = 2;
+        plug->endpoints[0] = 242;            // Green Power: never the ping endpoint
+        plug->endpoints[1] = 11;
         ZapDevice* gone = pool_add();
         gone->ieee_addr = 0xA4C1380000000002ULL;
         strcpy(gone->model_id, "TS011F");
@@ -750,6 +753,7 @@ int main() {
               strcmp(pd.model_id, "TS011F") == 0 &&
               strcmp(pd.manufacturer_name, "_TZ3000_okaz9tjs") == 0,
               "live device listed with nwk, power source and identity");
+        CHECK(pd.ping_ep == 11, "pings go to the first endpoint that is not Green Power");
         CHECK(g_stub_poll_source(1, &pd) && pd.ieee == 0, "removed device blanked");
         CHECK(g_stub_poll_source(2, &pd) && pd.ieee == 0, "device without model blanked");
         CHECK(!g_stub_poll_source(3, &pd), "false past the end");

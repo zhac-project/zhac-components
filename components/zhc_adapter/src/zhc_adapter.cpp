@@ -781,9 +781,13 @@ void log_payload(std::uint64_t ieee,
                 zcl_len >= 1 && (zcl[0] & 0x03) == 0x01;
             // Global responses to our own requests: default response (0x0B),
             // write-attributes response (0x04), configure-reporting response
-            // (0x07). Never device state; logging them as "(no match)" sent
-            // owners hunting for a decoder that does not need to exist.
+            // (0x07), and a Basic read response nothing decodes (the answer
+            // to an availability ping or the interview's reads). Never device
+            // state; logging them as "(no match)" sent owners hunting for a
+            // decoder that does not need to exist.
             if (!cluster_specific && (cmd == 0x0B || cmd == 0x04 || cmd == 0x07)) {
+                protocol_noise = true;
+            } else if (cluster_id == 0x0000 && !cluster_specific && cmd == 0x01) {
                 protocol_noise = true;
             } else if (cluster_id == 0xEF00 && cluster_specific &&
                        (cmd == 0x10 || cmd == 0x11 ||
@@ -871,8 +875,10 @@ namespace {
 void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
                uint16_t cluster, const uint8_t* bytes, size_t len);
 void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result);
-// Meter polling (defined with the send path below): stop polling a device.
+// Meter polling (defined with the send path below): stop polling a device;
+// note that a device was heard, so it needs no availability ping yet.
 void meter_forget(uint64_t ieee);
+void ping_heard(uint64_t ieee);
 
 zhac_configure_bind_fn_t   g_cfg_bind   = nullptr;
 zhac_configure_report_fn_t g_cfg_report = nullptr;
@@ -1672,6 +1678,7 @@ void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
 }
 
 void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result) {
+    ping_heard(ieee);
     if (!g_wake_mtx || !g_wake_task) return;
     if (xSemaphoreTake(g_wake_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
     const std::size_t due = g_wake.on_wake(ieee, nwk, wake_now_ms(), [result](const char* k) {
@@ -1681,7 +1688,7 @@ void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result) {
     if (due) xTaskNotifyGive(g_wake_task);
 }
 
-// ── Meter polling ────────────────────────────────────────────────────
+// ── Meter polling and availability pings ─────────────────────────────
 // Policy in src/meter_poll.hpp. Runs on the wake task (one tick per
 // kTickMs): the reads go out through the configure read hook, the same
 // transport configure steps use, and their responses decode like reports.
@@ -1694,6 +1701,10 @@ static_assert(zhac_meter::kSlots == kMaxDevices, "one meter slot per pool device
 #define CONFIG_ZHAC_METER_POLL_S 60
 #endif
 constexpr std::uint32_t kMeterIntervalMs = CONFIG_ZHAC_METER_POLL_S * 1000u;
+#ifndef CONFIG_ZHAC_PING_S
+#define CONFIG_ZHAC_PING_S 600
+#endif
+constexpr std::uint32_t kPingIntervalMs = CONFIG_ZHAC_PING_S * 1000u;
 
 zhac_poll_device_fn_t g_poll_source = nullptr;
 EXT_RAM_BSS_ATTR zhac_meter::Scheduler g_meter;
@@ -1710,15 +1721,29 @@ void meter_forget(uint64_t ieee) {
     if (l.ok) g_meter.forget(ieee);
 }
 
+// On the RX path, so a short wait: a frame missed here only means one ping
+// that was not needed.
+void ping_heard(uint64_t ieee) {
+    if (kPingIntervalMs == 0 || !g_meter_mtx) return;
+    if (xSemaphoreTake(g_meter_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    g_meter.heard(ieee, wake_now_ms(), kPingIntervalMs);
+    xSemaphoreGive(g_meter_mtx);
+}
+
+// Keeps its receiver on: mains-powered, or an unknown power source (interview
+// missed Basic 0x0007) on a device the radio says does not sleep. z2m calls
+// these "active" devices.
+bool stays_awake(const zhac_poll_device_t& d) {
+    return zhac_meter::mains_powered(d.power_source) ||
+           (d.power_source == 0 && g_is_sleepy && !g_is_sleepy(d.ieee));
+}
+
 // Look a device up once: its def's meter_poll, and only when it stays awake.
-// Unknown power source (interview missed Basic 0x0007) counts as mains when
-// the radio says the device keeps its receiver on.
 std::uint8_t meter_flags_for(const zhac_poll_device_t& d) {
+    if (kMeterIntervalMs == 0) return 0;
     const zhc::PreparedDefinition* def = find_definition(d.model_id, d.manufacturer_name);
     if (!def || !def->meter_poll) return 0;
-    const bool awake = zhac_meter::mains_powered(d.power_source) ||
-                       (d.power_source == 0 && g_is_sleepy && !g_is_sleepy(d.ieee));
-    if (!awake) return 0;
+    if (!stays_awake(d)) return 0;
     ESP_LOGI(TAG, "[meter] 0x%016llx %s/%s: meter read every %u s",
              static_cast<unsigned long long>(d.ieee), d.model_id, d.manufacturer_name,
              static_cast<unsigned>(CONFIG_ZHAC_METER_POLL_S));
@@ -1726,7 +1751,10 @@ std::uint8_t meter_flags_for(const zhac_poll_device_t& d) {
 }
 
 void meter_tick() {
-    if (kMeterIntervalMs == 0 || !g_poll_source || !g_cfg_read || !g_meter_mtx) return;
+    if ((kMeterIntervalMs == 0 && kPingIntervalMs == 0) || !g_poll_source || !g_cfg_read ||
+        !g_meter_mtx) {
+        return;
+    }
     static std::uint32_t s_last = 0;
     static bool s_ran = false;
     const std::uint32_t now = wake_now_ms();
@@ -1746,8 +1774,10 @@ void meter_tick() {
         d.model_id[sizeof(d.model_id) - 1] = '\0';
         d.manufacturer_name[sizeof(d.manufacturer_name) - 1] = '\0';
         const std::uint8_t flags = meter_flags_for(d);
+        const bool awake = stays_awake(d);
         MeterLock l;
-        if (l.ok) (void)g_meter.add(d.ieee, d.nwk, flags, now, kMeterIntervalMs);
+        if (l.ok) (void)g_meter.add(d.ieee, d.nwk, flags, now, kMeterIntervalMs,
+                                    awake, d.ping_ep, kPingIntervalMs);
     }
     zhac_meter::Due due[zhac_meter::kMaxPerTick];
     std::size_t n = 0;
@@ -1788,6 +1818,28 @@ void meter_tick() {
         MeterLock l;
         if (l.ok) g_meter.polled(due[i].ieee, now, kMeterIntervalMs);
     }
+
+    // Availability: one ping per tick to a quiet device that stays awake, as
+    // herdsman's Device.ping() (Basic zclVersion). Its answer decodes like any
+    // frame, which refreshes last_seen and, through wake_seen, ping_heard.
+    zhac_meter::Due p{};
+    {
+        MeterLock l;
+        if (!l.ok || g_meter.take_ping_due(now, &p, 1) == 0) return;
+    }
+    static const std::uint8_t kZclVersion[2] = {0x00, 0x00};
+    const bool sent = g_cfg_read(p.ieee, p.nwk, p.ep, 0x0000, kZclVersion, 1, 0);
+    bool missed = false;
+    {
+        MeterLock l;
+        if (l.ok) missed = g_meter.pinged(p.ieee, now, kPingIntervalMs);
+    }
+    if (missed) {
+        ESP_LOGW(TAG, "[ping] 0x%016llx did not answer its last ping -- pinging less often until it is heard",
+                 static_cast<unsigned long long>(p.ieee));
+    }
+    ESP_LOGD(TAG, "[ping] 0x%016llx quiet -- pinged ep %u%s", static_cast<unsigned long long>(p.ieee),
+             static_cast<unsigned>(p.ep), sent ? "" : " (not sent)");
 }
 
 void wake_task(void*) {

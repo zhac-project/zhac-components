@@ -13,4 +13,17 @@ config ZHAC_METER_POLL_S
       measurement_poll_interval (default 60). Mains-powered devices only.
       0 turns polling off.
 
+config ZHAC_PING_S
+    int "Ping quiet mains devices after (s), 0 = off"
+    default 600
+    range 0 86400
+    help
+      A mains-powered device (or one that keeps its receiver on) the hub has
+      not heard from for this many seconds gets a ping, a read of Basic
+      zclVersion, like zigbee2mqtt's availability (active timeout, default
+      10 min). A device that answers keeps a fresh last_seen even when it
+      never reports, e.g. a light driven only by its own remote. Unanswered
+      pings back off as z2m's do: 1.5x, then twice as long each time, up to
+      a day. 0 turns pings off.
+
 endmenu

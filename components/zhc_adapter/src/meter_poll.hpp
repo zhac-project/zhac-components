@@ -17,6 +17,15 @@
 // sent stays due and goes again next tick. Pure C++, no ESP-IDF, so the
 // policy has a host test (test/host); the adapter adds the lock, the task,
 // the device pool and the radio.
+//
+// The same table pings quiet devices, as zigbee2mqtt's availability does for
+// "active" ones (mains-powered, receiver always on): a device the hub has not
+// heard from for the ping interval gets a genBasic zclVersion read, which is
+// herdsman's Device.ping(). So a light that never reports, driven only by its
+// own remote, still answers and keeps a fresh last_seen. An unanswered ping
+// backs off as z2m's does: 1.5x the interval, then twice as long each time
+// (10, 15, 30, 60, 120 min ... with the default 10 min), up to kPingMaxMs.
+// Anything heard from the device resets it.
 #pragma once
 
 #include <cstddef>
@@ -35,6 +44,9 @@ constexpr std::uint32_t kTickMs     = 5u * 1000u;
 // the radio load; with more than ~24 polled plugs the effective interval
 // simply stretches past 60 s. Track outstanding TSNs if that ever matters.
 constexpr std::size_t   kMaxPerTick = 2;
+
+constexpr std::uint32_t kPingJitterMs = 30u * 1000u;              // z2m max_jitter
+constexpr std::uint32_t kPingMaxMs    = 24u * 60u * 60u * 1000u;  // longest backoff
 
 // ZCL Basic powerSource (bit 7 = backup battery): mains, 3-phase, DC,
 // emergency mains. 0x03 battery and 0x00 unknown are not.
@@ -56,14 +68,18 @@ struct Due {
     std::uint64_t ieee;
     std::uint16_t nwk;
     std::uint8_t  flags;
+    std::uint8_t  ep;               // ping endpoint (take_ping_due only)
 };
 
 class Scheduler {
 public:
-    // Track a device. `flags` 0 = never poll it. A known IEEE only gets its
-    // nwk and flags updated (its schedule stays). False if the table is full.
+    // Track a device. `flags` 0 = never poll it. `awake` with a non-zero
+    // `ping_interval_ms` = ping it when quiet, on `ping_ep`. A known IEEE only
+    // gets its nwk, flags and ping settings updated (its schedules stay).
+    // False if the table is full.
     bool add(std::uint64_t ieee, std::uint16_t nwk, std::uint8_t flags,
-             std::uint32_t now_ms, std::uint32_t interval_ms);
+             std::uint32_t now_ms, std::uint32_t interval_ms,
+             bool awake = false, std::uint8_t ping_ep = 1, std::uint32_t ping_interval_ms = 0);
     bool known(std::uint64_t ieee) const;
     void forget(std::uint64_t ieee);
 
@@ -87,12 +103,28 @@ public:
     bool polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms,
                 bool ok = true);
 
+    // The device just sent something: its next ping is a full interval away
+    // and the backoff starts over.
+    void heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
+
+    // Up to `max` devices to ping at `now_ms`. They stay due until pinged().
+    std::size_t take_ping_due(std::uint32_t now_ms, Due* out, std::size_t max);
+
+    // A ping went out (or could not): the next one waits the backed-off
+    // interval unless heard() comes first. Returns true when the ping before
+    // this one went unanswered, once per silence -- the caller logs it.
+    bool pinged(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
+
 private:
     struct Slot {
         std::uint64_t ieee;         // 0 = free
         std::uint32_t due_ms;
+        std::uint32_t ping_due_ms;
+        std::uint32_t backoff_x2;   // ping backoff, doubled: 2 = 1x, 3 = 1.5x
         std::uint16_t nwk;
         std::uint8_t  flags;
+        std::uint8_t  ping_ep;
+        bool          awake;        // pinged when quiet
         bool          seen;
         bool          warned;       // already logged this failure streak
     };

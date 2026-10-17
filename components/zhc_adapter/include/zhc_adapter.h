@@ -135,12 +135,16 @@ void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn);
 // The platform lists its devices through this hook: fill `out` for the
 // index-th pool entry and return true, false past the end. A pool entry that
 // must not be polled (removed, no model yet) is returned with ieee 0.
+// The same walk drives availability pings: a device that stays awake and is
+// quiet for CONFIG_ZHAC_PING_S seconds gets a genBasic zclVersion read on
+// `ping_ep`, as zigbee2mqtt's availability does (see src/meter_poll.hpp).
 typedef struct {
     uint64_t ieee;
     uint16_t nwk;
     uint8_t  power_source;           // ZCL Basic 0x0007 as stored; 0 = unknown
     char     model_id[34];
     char     manufacturer_name[34];
+    uint8_t  ping_ep;                // endpoint pings go to; 0 = endpoint 1
 } zhac_poll_device_t;
 typedef bool (*zhac_poll_device_fn_t)(uint16_t index, zhac_poll_device_t* out);
 void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn);
