@@ -654,6 +654,12 @@ const zhc::PreparedDefinition* resolve_supplement(std::uint64_t ieee,
                                                     const zhc::PreparedDefinition* primary) {
     if (ieee == 0 || !primary) return nullptr;
     if (find_definition(model_id, manu_name) == nullptr) return nullptr;
+    // None for Aqara/Xiaomi. Their definitions decode what the devices send and
+    // bind only where z2m does, mostly nothing; a fill-in would bind and set up
+    // reporting z2m leaves alone (a sleeping sensor never answers) and decode
+    // OnOff or illuminance a second time, on the generic scale.
+    for (std::size_t i = 0; i < zhc::devices::lumi::kLumiRegistryCount; ++i)
+        if (zhc::devices::lumi::kLumiRegistry[i] == primary) return nullptr;
 
     // Check per-slot cache before running synth. The snapshot reads the
     // cached_supplement state under s_slots_mtx and copies it out — synth
