@@ -3,6 +3,7 @@
 #pragma once
 
 #include "zap_common.h"
+#include <cstddef>
 #include <cstdint>
 
 // Build the endpoint probe order for Basic-cluster identity reads.
@@ -21,7 +22,8 @@ uint8_t zigbee_interview_build_basic_probe_order(const ZapDevice& dev,
 // Writes NUL-terminated strings to model_out / mfg_out when attr 0x0005
 // (modelIdentifier) / 0x0004 (manufacturerName) are present; writes the
 // little-endian u16 manufacturerCode to mfg_code_out when attr 0x0001 is
-// present. Any of the out-pointers may be NULL (skip).
+// present. Any of the out-pointers may be NULL (skip). The strings are stored
+// as zigbee_copy_text leaves them.
 //
 // Returns true if at least one identity field was extracted. Tolerates
 // partial frames and unknown attribute types (skips them where possible).
@@ -29,3 +31,10 @@ bool zigbee_parse_basic_identity(const uint8_t* data, uint8_t data_len,
                                  char* model_out, uint8_t model_cap,
                                  char* mfg_out, uint8_t mfg_cap,
                                  uint16_t* mfg_code_out);
+
+// Copy text a device sent (a ZCL string, a decoded string value) into a C
+// string the hub can put in any JSON it writes: each control byte (< 0x20,
+// 0x7F) and each byte of an invalid UTF-8 sequence becomes '?', a NUL ends
+// the text, and a cut at `cap` never splits a character (review 2026-10-24
+// ZR-03). `dst` may be `src` (in place). Returns the length written.
+size_t zigbee_copy_text(char* dst, size_t cap, const uint8_t* src, size_t len);

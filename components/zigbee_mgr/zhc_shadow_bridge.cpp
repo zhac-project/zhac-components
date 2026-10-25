@@ -11,6 +11,7 @@
 #include "zhc_adapter.h"
 #include "device_shadow.h"
 #include "zap_store.h"
+#include "zigbee_interview_utils.h"   // zigbee_copy_text
 #include "zigbee_pool.h"
 #include "event_bus.h"
 
@@ -136,8 +137,9 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
         case kValueKindString:
             if (!str_val) return;
             attr.val_type = VAL_STR;
-            strncpy(attr.str_val, str_val, ATTR_STR_MAX - 1);
-            attr.str_val[ATTR_STR_MAX - 1] = '\0';
+            // Often radio bytes (a keypad's action_code): made JSON-safe (ZR-03).
+            zigbee_copy_text(attr.str_val, ATTR_STR_MAX, reinterpret_cast<const uint8_t*>(str_val),
+                             strnlen(str_val, ATTR_STR_MAX));
             break;
         default:
             return;   // None / BytesRef / ObjectRef — not shadowable
