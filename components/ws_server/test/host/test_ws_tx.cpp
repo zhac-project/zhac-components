@@ -496,6 +496,18 @@ int main() {
         add_client(9002);
         CHECK(ws_server_client_count() == before + 1 && g_closes.empty(), "upgrade filter: an accepted upgrade registers");
         ws_server_set_upgrade_filter(nullptr);
+
+        // Sign-in switched off: a socket that never signed in is closed, a signed-in one stays.
+        ws_server_set_api_token("0123456789abcdef0123456789abcdef");
+        add_client(9003);                               // no token at the handshake: not signed in
+        add_client(9004);
+        ws_server_fd_set_authed(9004);                  // signed in with the first message
+        g_closes.clear();
+        ws_server_close_unauthed();
+        bool closed_9003 = false, closed_9004 = false;
+        for (const auto& c : g_closes) { closed_9003 |= c.fd == 9003; closed_9004 |= c.fd == 9004; }
+        CHECK(closed_9003 && !closed_9004, "close_unauthed: the socket that never signed in goes, the signed-in one stays");
+        ws_server_set_api_token(nullptr);
     }
 
     CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");

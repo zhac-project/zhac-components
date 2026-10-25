@@ -164,6 +164,19 @@ void ws_server_fd_deauth_all() {
     xSemaphoreGive(s_mutex);
 }
 
+// Review 2026-10-24 HS-01: once sign-in is off the dispatcher trusts every
+// socket, so one that never signed in -- a page of another site may have
+// opened it while sign-in was on -- must not stay. Its reconnect then meets the
+// upgrade filter. Closed outside the lock (close_fn takes it).
+void ws_server_close_unauthed() {
+    int fds[MAX_WS_CLIENTS];
+    int n = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_fd_count; i++) if (!s_fd_authed[i]) fds[n++] = s_fds[i];
+    xSemaphoreGive(s_mutex);
+    for (int i = 0; i < n; i++) httpd_sess_trigger_close(s_server, fds[i]);
+}
+
 // F18 (FINDINGS.md): the socket may OPEN unauthenticated; auth is enforced
 // per-message in the dispatch layer. If the client presents a valid token at
 // handshake (X-Api-Key header, or the legacy ?token= query) we mark it authed

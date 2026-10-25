@@ -57,6 +57,9 @@ void             ws_server_fd_set_authed(int fd);
 // Q48: clear every client's authed flag (e.g. on token rotation) so sockets that
 // authenticated with the now-stale token must re-auth with the new one.
 void             ws_server_fd_deauth_all();
+// Close every client that never signed in. For the switch from sign-in on to
+// off, after which every socket is trusted (review 2026-10-24 HS-01).
+void             ws_server_close_unauthed();
 
 // ── Reply hook for sentinel fds ─────────────────────────────────────────
 //
