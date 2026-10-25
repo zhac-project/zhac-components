@@ -107,6 +107,23 @@ int main() {
           "a frame over 8 KB fails its session (httpd closes it) and leaves the client table");
     g_ws_frame_len = 0;
     g_close_fn(nullptr, 110);
+    // Every frame that reaches the handler is read to its end: binary frames,
+    // continuations and (IDF 6.1) PONGs too. Only text is handed on.
+    add_client(111);
+    httpd_req_t f111{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(111))};
+    for (httpd_ws_type_t t : {HTTPD_WS_TYPE_BINARY, HTTPD_WS_TYPE_CONTINUE, HTTPD_WS_TYPE_PONG}) {
+        g_ws_frame_type = t;
+        g_ws_frame_len = 100;
+        s_rx_len = 0;
+        CHECK(g_ws_uri->handler(&f111) == ESP_OK && g_ws_frame_len == 0 && s_rx_len == 0,
+              "a binary, continuation or PONG frame is read away, not handed on");
+    }
+    g_ws_frame_type = HTTPD_WS_TYPE_BINARY;
+    g_ws_frame_len = 8 * 1024 + 1;
+    CHECK(g_ws_uri->handler(&f111) == ESP_FAIL, "a binary frame over 8 KB fails its session too");
+    g_ws_frame_len = 0;
+    g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
+    g_close_fn(nullptr, 111);
 
     std::printf("%s (%d failure(s))\n", s_fail ? "FAILED" : "ALL PASS", s_fail);
     return s_fail ? 1 : 0;

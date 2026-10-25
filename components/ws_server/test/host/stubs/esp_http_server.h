@@ -17,7 +17,7 @@ typedef int esp_err_t;
 typedef void* httpd_handle_t;
 enum httpd_method_t { HTTP_DELETE = 0, HTTP_GET = 1 };   // data frames after the handshake arrive with method 0
 struct httpd_req_t { httpd_method_t method; void* user_ctx; };   // user_ctx carries the fake sockfd
-enum httpd_ws_type_t { HTTPD_WS_TYPE_TEXT = 1 };
+enum httpd_ws_type_t { HTTPD_WS_TYPE_CONTINUE = 0, HTTPD_WS_TYPE_TEXT = 1, HTTPD_WS_TYPE_BINARY = 2, HTTPD_WS_TYPE_PONG = 0xA };
 enum httpd_ws_client_info_t { HTTPD_WS_CLIENT_INVALID, HTTPD_WS_CLIENT_HTTP, HTTPD_WS_CLIENT_WEBSOCKET };
 struct httpd_ws_frame_t { bool final; bool fragmented; httpd_ws_type_t type; uint8_t* payload; size_t len; };
 struct httpd_uri_t {
@@ -58,13 +58,15 @@ inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, s
 inline size_t httpd_req_get_url_query_len(httpd_req_t*) { return 0; }
 inline esp_err_t httpd_req_get_url_query_str(httpd_req_t*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) { return ESP_FAIL; }
-// The next data frame's length (0: none, and the read fails). Like IDF, a read with len 0 takes
-// the header and reports the length; a read with the length set takes the payload.
+// The next frame's length (0: none, and the read fails) and type. Like IDF, a read with len 0
+// takes the header and reports the length; a read with the length set takes the payload, which
+// sets g_ws_frame_len back to 0.
 inline size_t g_ws_frame_len = 0;
+inline httpd_ws_type_t g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
 inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t* f, size_t max_len) {
     if (!g_ws_frame_len) return ESP_FAIL;
     if (f->len == 0) {
-        f->type = HTTPD_WS_TYPE_TEXT;
+        f->type = g_ws_frame_type;
         f->len  = g_ws_frame_len;
         if (max_len == 0) return ESP_OK;
     }

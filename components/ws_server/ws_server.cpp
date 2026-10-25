@@ -25,10 +25,11 @@
 #error "ws_server needs CONFIG_HTTPD_QUEUE_WORK_BLOCKING=n: it queues httpd work from the httpd task, so a full queue would deadlock it"
 #endif
 
-// DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL and a
+// DS10 (DS_FINDINGS): cap on an inbound WS frame. Covers rule DSL and a
 // short script.check source; a frame beyond this closes its session (a
 // misbehaving/hostile client can't force a huge per-frame allocation). The SPA
-// sends nothing bigger: it checks long scripts over REST.
+// sends nothing bigger: on wired and single-chip hubs it checks a long script
+// over REST, and on the dual-chip hub it does not check it as it is typed.
 #define WS_RX_MAX (8 * 1024)
 
 static const char*       TAG      = "ws_server";
@@ -355,29 +356,30 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     httpd_ws_frame_t pkt{};
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
     if (ret != ESP_OK) { remove_fd(fd); return ret; }
-    // Control frames (PING/PONG/CLOSE) never reach this handler:
-    // handle_ws_control_frames is false, so httpd answers PING with PONG and
-    // replies to CLOSE itself (RFC 6455 5.5.1/5.5.2), then tears the session
-    // down — our close_fn does the table cleanup.
-    if (pkt.type != HTTPD_WS_TYPE_TEXT || pkt.len == 0 || !s_rx_cb) return ESP_OK;
+    // Every frame that reaches this handler is read to its end: a payload left
+    // in the stream is taken for the next frame's header (review 2026-10-24
+    // HS-12). Text, binary and continuation frames come here, and on IDF 6.1
+    // PONGs too; PING and CLOSE do not (handle_ws_control_frames is false:
+    // httpd answers PING with PONG and replies to CLOSE itself, RFC 6455
+    // 5.5.1/5.5.2, then tears the session down — our close_fn does the table
+    // cleanup). Only text is handed on.
     if (pkt.len > WS_RX_MAX) {
-        // Its payload is still in the stream, so skipping the frame made the
-        // next read take those bytes for a frame header (review 2026-10-24
-        // HS-12). A failed handler makes httpd close the session; reading the
-        // payload away instead would hold the httpd task as long as the
-        // client cares to trickle it.
+        // A failed handler makes httpd close the session; reading the payload
+        // away instead would hold the httpd task as long as the client cares
+        // to trickle it.
         ESP_LOGW(TAG, "ws frame %u B exceeds cap %u — closing the session",
                  (unsigned)pkt.len, (unsigned)WS_RX_MAX);
         remove_fd(fd);
         return ESP_FAIL;
     }
+    if (pkt.len == 0) return ESP_OK;
     uint8_t* buf = static_cast<uint8_t*>(
         heap_caps_malloc(pkt.len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!buf) buf = static_cast<uint8_t*>(malloc(pkt.len + 1));
     if (!buf) return ESP_ERR_NO_MEM;
     pkt.payload = buf;
     ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
-    if (ret == ESP_OK) {
+    if (ret == ESP_OK && pkt.type == HTTPD_WS_TYPE_TEXT && s_rx_cb) {
         buf[pkt.len] = '\0';
         s_rx_cb(fd, reinterpret_cast<const char*>(buf), pkt.len);
     }
