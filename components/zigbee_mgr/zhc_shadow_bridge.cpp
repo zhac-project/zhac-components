@@ -15,6 +15,7 @@
 #include "event_bus.h"
 
 #include "esp_log.h"
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -128,8 +129,9 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
             // guessed by key name (a hardcoded float-key list), so an integer
             // humidity got wrongly ÷100 (→0.49) on the live path while a float
             // temperature showed un-unscaled (×100 → 2900) on the snapshot path.
+            // Rounded, not truncated: 20.05f is 20.0499…, which was stored as 2004.
             attr.val_type = VAL_FLOAT;
-            attr.int_val  = static_cast<int32_t>(float_val * 100.0f);
+            attr.int_val  = static_cast<int32_t>(lroundf(float_val * 100.0f));
             break;
         case kValueKindString:
             if (!str_val) return;

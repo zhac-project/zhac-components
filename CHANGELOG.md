@@ -9,6 +9,8 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Fixed
 
+- **Decimal values are stored to the nearest hundredth** (`zhc_shadow_bridge`). A Float is kept as value × 100, and the conversion truncated: 20.05 °C is 20.0499… as a float and was stored, shown and compared by rules as 20.04 (about one value in twenty in -40..60 °C read 0.01 low). It now rounds. Found with review 2026-10-24 F-01, where embedded-zhc's generic thermostats start reporting °C as Float. Host test zigbee_mgr G12.
+
 - **The stores never erase NVS on their own** (`zap_store`, `device_shadow`, `rule_store`; review 2026-10-24 PB-01). `zap_store_init()` no longer runs `nvs_flash_init()` and, on `ESP_ERR_NVS_NO_FREE_PAGES` / `ESP_ERR_NVS_NEW_VERSION_FOUND`, `nvs_flash_erase()`: that wiped the device database, names, rules, sign-in and the coordinator pin right after the firmware had chosen to boot "locked and empty" instead, and any other init error aborted. A store that cannot be opened now stays shut (`zap_store_is_ready()` false; saves and loads refused). A device store, shadow cache or rule set written by a newer firmware (this one is a downgrade) is kept and left unloaded rather than wiped; an older schema is still migrated by wiping, as before. Host tests: zap_store G17, rule_store.
 - **A device delete survives a power cut** (`zap_store_delete_device`, review 2026-09 CC-01). `nvs_commit()` is a no-op on IDF, so the erase-every-record-then-rewrite delete could lose the whole pool in its window. It now copies the last record into the freed slot, shrinks the count and erases the old tail key (three writes instead of rewriting the pool); `zap_store_init()` finishes a delete a restart cut short, and a load keeps one record per device. Host test G18.
 

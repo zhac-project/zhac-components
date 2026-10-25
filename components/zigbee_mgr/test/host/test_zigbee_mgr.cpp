@@ -721,6 +721,15 @@ int main() {
         CHECK(!device_shadow_get_attr(kBatIeee, "dp_20", &sa), "REMOVE kind drops the saved dp_20");
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
               "and leaves the device alone");
+
+        // A float is stored ×100 to the nearest hundredth: 20.05f is 20.0499…,
+        // which truncation stored as 2004 (shown 20.04).
+        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, 20.05f, false, nullptr);
+        CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == 2005,
+              "float 20.05 is stored as 2005, not 2004");
+        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, -5.05f, false, nullptr);
+        CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == -505,
+              "float -5.05 is stored as -505");
     }
 
     // ── G13: meter-poll device source (zhc_shadow_bridge) ───────────────
