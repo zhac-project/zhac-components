@@ -6,10 +6,12 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <sys/socket.h>
@@ -36,9 +38,40 @@ static WsRxCallback      s_rx_cb  = nullptr;
 static char              s_api_token[33] = {};
 
 #define MAX_WS_CLIENTS 3
-static int  s_fds[MAX_WS_CLIENTS];
-static bool s_fd_authed[MAX_WS_CLIENTS] = {};   // F18: per-fd WS auth state
-static int  s_fd_count = 0;
+static int     s_fds[MAX_WS_CLIENTS];
+static bool    s_fd_authed[MAX_WS_CLIENTS] = {};   // F18: per-fd WS auth state
+static int64_t s_fd_since[MAX_WS_CLIENTS]  = {};   // when it joined (HS-04 sign-in deadline)
+static int     s_fd_count = 0;
+
+// Review 2026-10-24 HS-04: while a token is set, a socket that has not signed
+// in within this long is closed, and a full table makes room by closing the
+// oldest such socket rather than refusing the new one -- three idle unsigned
+// sockets (any page on the LAN can open them) used to lock the hub page out.
+static constexpr int64_t kSignInDeadlineUs = 5 * 1000 * 1000;
+
+// Sockets this server asked httpd to close: a frame they send before the close
+// runs must not adopt them again (ensure_fd). Cleared by close_fn. Under s_mutex.
+static int s_closing[MAX_WS_CLIENTS * 2];
+static int s_closing_n = 0;
+
+static bool closing_has_locked(int fd) {
+    for (int i = 0; i < s_closing_n; i++) if (s_closing[i] == fd) return true;
+    return false;
+}
+
+// Close a client socket from any task; nothing logged (callers may sit under
+// the log sink).
+static void close_client(int fd) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!closing_has_locked(fd)) {
+        if (s_closing_n == (int)(sizeof(s_closing) / sizeof(s_closing[0]))) s_closing_n--;   // drop the oldest
+        for (int i = s_closing_n; i > 0; i--) s_closing[i] = s_closing[i - 1];
+        s_closing[0] = fd;
+        s_closing_n++;
+    }
+    xSemaphoreGive(s_mutex);
+    httpd_sess_trigger_close(s_server, fd);
+}
 
 // Single-entry hook table. Suitable while there's only one
 // non-httpd transport (remote_client). Easy to extend to a small
@@ -57,18 +90,33 @@ static WsReplyHook  s_hook_func = nullptr;
 static bool add_fd(int fd, bool authed) {
     bool added = false;
     int  total = 0;
+    int  evicted = -1;
+    const int64_t now = esp_timer_get_time();
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) { s_fd_authed[i] = authed; xSemaphoreGive(s_mutex); return true; }
     }
+    int slot = -1;
     if (s_fd_count < MAX_WS_CLIENTS) {
-        s_fds[s_fd_count]       = fd;
-        s_fd_authed[s_fd_count] = authed;
-        s_fd_count++;
+        slot = s_fd_count++;
+    } else if (s_api_token[0]) {
+        // Full: the oldest socket that has not signed in makes room (HS-04).
+        for (int i = 0; i < s_fd_count; i++)
+            if (!s_fd_authed[i] && (slot < 0 || s_fd_since[i] < s_fd_since[slot])) slot = i;
+        if (slot >= 0) evicted = s_fds[slot];
+    }
+    if (slot >= 0) {
+        s_fds[slot]       = fd;
+        s_fd_authed[slot] = authed;
+        s_fd_since[slot]  = now;
         added = true;
         total = s_fd_count;
     }
     xSemaphoreGive(s_mutex);
+    if (evicted >= 0) {
+        close_client(evicted);
+        ESP_LOGW(TAG, "WS client table full: closed fd=%d, which had not signed in", evicted);
+    }
     if (added) ESP_LOGI(TAG, "WS client added fd=%d authed=%d total=%d", fd, authed, total);
     return added;
 }
@@ -93,7 +141,7 @@ static void adopt_client(int fd, bool authed) {
     if (!add_fd(fd, authed)) {
         ESP_LOGW(TAG, "WS client limit (%d) reached, closing fd=%d",
                  MAX_WS_CLIENTS, fd);
-        httpd_sess_trigger_close(s_server, fd);
+        close_client(fd);
     }
 }
 
@@ -108,8 +156,9 @@ static void ensure_fd(int fd, bool authed_if_new) {
     for (int i = 0; i < s_fd_count; i++) {
         if (s_fds[i] == fd) { present = true; break; }
     }
+    const bool closing = closing_has_locked(fd);   // its close is queued: not a client any more
     xSemaphoreGive(s_mutex);
-    if (!present) adopt_client(fd, authed_if_new);
+    if (!present && !closing) adopt_client(fd, authed_if_new);
 }
 
 // Take the fd out of the table WITHOUT logging; returns the table size afterwards,
@@ -123,6 +172,7 @@ static int remove_fd_quiet(int fd) {
             --s_fd_count;
             s_fds[i]       = s_fds[s_fd_count];
             s_fd_authed[i] = s_fd_authed[s_fd_count];   // F18: keep auth state aligned
+            s_fd_since[i]  = s_fd_since[s_fd_count];
             left = s_fd_count;
             break;
         }
@@ -174,7 +224,22 @@ void ws_server_close_unauthed() {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) if (!s_fd_authed[i]) fds[n++] = s_fds[i];
     xSemaphoreGive(s_mutex);
-    for (int i = 0; i < n; i++) httpd_sess_trigger_close(s_server, fds[i]);
+    for (int i = 0; i < n; i++) close_client(fds[i]);
+}
+
+// HS-04: while a token is set, close the sockets that joined more than
+// kSignInDeadlineUs before `now_us` and have not signed in. The browser page
+// signs in with its first frame, so only a socket nobody signs in on goes.
+// Runs once a second from ws_server_init's timer.
+void ws_server_sign_in_sweep(int64_t now_us) {
+    int fds[MAX_WS_CLIENTS];
+    int n = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_api_token[0])
+        for (int i = 0; i < s_fd_count; i++)
+            if (!s_fd_authed[i] && now_us - s_fd_since[i] > kSignInDeadlineUs) fds[n++] = s_fds[i];
+    xSemaphoreGive(s_mutex);
+    for (int i = 0; i < n; i++) close_client(fds[i]);
 }
 
 // F18 (FINDINGS.md): the socket may OPEN unauthenticated; auth is enforced
@@ -231,7 +296,7 @@ static esp_err_t ws_pre_handshake(httpd_req_t* req) {
 // socket is closed before it is ever registered.
 static void register_client(httpd_req_t* req, int fd) {
     if (!upgrade_allowed(req)) {
-        httpd_sess_trigger_close(s_server, fd);
+        close_client(fd);
         return;
     }
     adopt_client(fd, detect_handshake_auth(req));
@@ -343,9 +408,83 @@ static const httpd_uri_t s_ws_uri = {
 // remove_fd() is a no-op for fds that never joined the WS table, so plain
 // HTTP sockets pass straight through. With a custom close_fn installed the
 // server no longer close()s the socket itself — we must do it here.
+// ── Request deadline (review 2026-10-24 HS-03) ───────────────────────────
+// One httpd task serves every request in turn, and the receive timeout
+// bounds only each read: a client trickling a byte per timeout held it, and
+// every other request and WS frame behind it, for as long as it liked. Each
+// HTTP request now has kRequestDeadlineUs from its first byte to its answer;
+// past that its reads fail and httpd closes the session. The clock starts at
+// a request's first read and stops when the hub sends anything back; a session
+// upgraded to WebSocket is exempt (its frames are read as they come). All of
+// this runs on the httpd task (reads, answers, open and close), so the table
+// needs no lock; WS frames sent from other tasks leave it alone.
+static constexpr int64_t kRequestDeadlineUs = 8 * 1000 * 1000;
+struct ReqClock { int fd; int64_t start_us; };   // fd 0 = free slot; start 0 = no request running
+static ReqClock s_clock[16];                     // >= max_open_sockets
+
+static ReqClock* clock_of(int fd, bool add) {
+    ReqClock* free_slot = nullptr;
+    for (auto& c : s_clock) {
+        if (c.fd == fd) return &c;
+        if (!c.fd && !free_slot) free_slot = &c;
+    }
+    if (add && free_slot) { free_slot->fd = fd; free_slot->start_us = 0; return free_slot; }
+    return nullptr;
+}
+
+// httpd's own socket errors (IDF httpd_txrx.c httpd_sock_err).
+static int sock_err() {
+    switch (errno) {
+    case EAGAIN: case EINTR:                      return HTTPD_SOCK_ERR_TIMEOUT;
+    case EINVAL: case EBADF: case EFAULT: case ENOTSOCK: return HTTPD_SOCK_ERR_INVALID;
+    default:                                      return HTTPD_SOCK_ERR_FAIL;
+    }
+}
+
+static bool is_ws_session(httpd_handle_t hd, int fd) {
+    return httpd_ws_get_fd_info(hd, fd) == HTTPD_WS_CLIENT_WEBSOCKET;
+}
+
+static int deadline_recv(httpd_handle_t hd, int fd, char* buf, size_t len, int flags) {
+    if (!buf) return HTTPD_SOCK_ERR_INVALID;
+    if (!is_ws_session(hd, fd)) {
+        if (ReqClock* c = clock_of(fd, true)) {
+            const int64_t now = esp_timer_get_time();
+            if (!c->start_us) c->start_us = now;
+            else if (now - c->start_us > kRequestDeadlineUs) return HTTPD_SOCK_ERR_FAIL;
+        }
+    }
+    const int r = recv(fd, buf, len, flags);
+    return r < 0 ? sock_err() : r;
+}
+
+static int clock_send(httpd_handle_t hd, int fd, const char* buf, size_t len, int flags) {
+    if (!buf) return HTTPD_SOCK_ERR_INVALID;
+    if (!is_ws_session(hd, fd))
+        if (ReqClock* c = clock_of(fd, false)) c->start_us = 0;   // answered: the next request starts afresh
+    const int r = send(fd, buf, len, flags);
+    return r < 0 ? sock_err() : r;
+}
+
+static esp_err_t ws_httpd_open_fn(httpd_handle_t hd, int sockfd) {
+    clock_of(sockfd, true);
+    httpd_sess_set_recv_override(hd, sockfd, deadline_recv);
+    httpd_sess_set_send_override(hd, sockfd, clock_send);
+    return ESP_OK;
+}
+
 static void ws_httpd_close_fn(httpd_handle_t hd, int sockfd) {
     (void)hd;
     remove_fd(sockfd);
+    if (ReqClock* c = clock_of(sockfd, false)) *c = ReqClock{};
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_closing_n; i++) {
+        if (s_closing[i] != sockfd) continue;
+        for (int j = i + 1; j < s_closing_n; j++) s_closing[j - 1] = s_closing[j];
+        s_closing_n--;
+        break;
+    }
+    xSemaphoreGive(s_mutex);
     close(sockfd);
 }
 
@@ -407,8 +546,10 @@ void ws_server_init() {
     cfg.keep_alive_count    = 3;
     // F33 (FINDINGS.md): bound slow / half-open clients (slowloris) so a few
     // trickle connections can't pin the small (9) socket pool indefinitely.
-    cfg.recv_wait_timeout   = 10;
+    // 3 s per read, and kRequestDeadlineUs per request (HS-03, open_fn).
+    cfg.recv_wait_timeout   = 3;
     cfg.send_wait_timeout   = 10;
+    cfg.open_fn             = ws_httpd_open_fn;
     // Slot cleanup on ANY socket close (see ws_httpd_close_fn above).
     cfg.close_fn            = ws_httpd_close_fn;
 
@@ -417,6 +558,13 @@ void ws_server_init() {
         return;
     }
     httpd_register_uri_handler(s_server, &s_ws_uri);
+    // HS-04: the sign-in deadline for unsigned sockets.
+    static esp_timer_handle_t sweep = nullptr;
+    const esp_timer_create_args_t args = {
+        .callback = [](void*) { ws_server_sign_in_sweep(esp_timer_get_time()); },
+        .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "ws_signin", .skip_unhandled_events = true,
+    };
+    if (!sweep && esp_timer_create(&args, &sweep) == ESP_OK) esp_timer_start_periodic(sweep, 1000 * 1000);
     ESP_LOGI(TAG, "ws_server started on :80/ws");
 }
 

@@ -60,6 +60,10 @@ void             ws_server_fd_deauth_all();
 // Close every client that never signed in. For the switch from sign-in on to
 // off, after which every socket is trusted (review 2026-10-24 HS-01).
 void             ws_server_close_unauthed();
+// While a token is set, close the clients that joined more than 5 s before
+// `now_us` and have not signed in (review 2026-10-24 HS-04). Called once a
+// second by the server's own timer; public for the host test.
+void             ws_server_sign_in_sweep(int64_t now_us);
 
 // ── Reply hook for sentinel fds ─────────────────────────────────────────
 //

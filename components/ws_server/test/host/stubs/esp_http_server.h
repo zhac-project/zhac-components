@@ -26,17 +26,32 @@ struct httpd_uri_t {
 };
 typedef bool (*httpd_uri_match_func_t)(const char*, const char*, size_t);
 typedef void (*httpd_close_func_t)(httpd_handle_t, int);
+typedef esp_err_t (*httpd_open_func_t)(httpd_handle_t, int);
+typedef int (*httpd_recv_func_t)(httpd_handle_t, int, char*, size_t, int);
+typedef int (*httpd_send_func_t)(httpd_handle_t, int, const char*, size_t, int);
+#define HTTPD_SOCK_ERR_FAIL    -1
+#define HTTPD_SOCK_ERR_INVALID -2
+#define HTTPD_SOCK_ERR_TIMEOUT -3
 struct httpd_config_t {
     uint16_t server_port; size_t stack_size; size_t max_open_sockets; size_t max_uri_handlers;
     bool lru_purge_enable; bool keep_alive_enable; int keep_alive_idle, keep_alive_interval, keep_alive_count;
     int recv_wait_timeout, send_wait_timeout; httpd_uri_match_func_t uri_match_fn; httpd_close_func_t close_fn;
+    httpd_open_func_t open_fn;
 };
 #define HTTPD_DEFAULT_CONFIG() httpd_config_t{}
 
 inline const httpd_uri_t* g_ws_uri = nullptr;   // captured by httpd_register_uri_handler
 inline httpd_close_func_t g_close_fn = nullptr;  // captured by httpd_start: what httpd runs when a session ends
+inline httpd_open_func_t  g_open_fn  = nullptr;  // captured by httpd_start: what httpd runs when a session opens
+inline httpd_recv_func_t  g_recv_override = nullptr;   // the session read/write functions open_fn installs
+inline httpd_send_func_t  g_send_override = nullptr;
+inline httpd_ws_client_info_t g_fd_info_result = HTTPD_WS_CLIENT_WEBSOCKET;   // what httpd_ws_get_fd_info answers
 inline std::atomic<int> g_fd_info_calls{0};      // httpd_ws_get_fd_info calls (a broadcaster calls it once per snapshot fd)
-inline esp_err_t httpd_start(httpd_handle_t* h, const httpd_config_t* c) { *h = reinterpret_cast<httpd_handle_t>(1); g_close_fn = c->close_fn; return ESP_OK; }
+inline esp_err_t httpd_start(httpd_handle_t* h, const httpd_config_t* c) {
+    *h = reinterpret_cast<httpd_handle_t>(1); g_close_fn = c->close_fn; g_open_fn = c->open_fn; return ESP_OK;
+}
+inline esp_err_t httpd_sess_set_recv_override(httpd_handle_t, int, httpd_recv_func_t f) { g_recv_override = f; return ESP_OK; }
+inline esp_err_t httpd_sess_set_send_override(httpd_handle_t, int, httpd_send_func_t f) { g_send_override = f; return ESP_OK; }
 inline esp_err_t httpd_register_uri_handler(httpd_handle_t, const httpd_uri_t* u) { g_ws_uri = u; return ESP_OK; }
 inline int httpd_req_to_sockfd(httpd_req_t* r) { return static_cast<int>(reinterpret_cast<intptr_t>(r->user_ctx)); }
 inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, size_t) { return ESP_FAIL; }
@@ -44,7 +59,7 @@ inline size_t httpd_req_get_url_query_len(httpd_req_t*) { return 0; }
 inline esp_err_t httpd_req_get_url_query_str(httpd_req_t*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t*, size_t) { return ESP_FAIL; }
-inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return HTTPD_WS_CLIENT_WEBSOCKET; }
+inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return g_fd_info_result; }
 inline bool httpd_uri_match_wildcard(const char*, const char*, size_t) { return true; }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* frame);   // supplied by the test
 esp_err_t httpd_sess_trigger_close(httpd_handle_t, int fd);                             // supplied by the test
