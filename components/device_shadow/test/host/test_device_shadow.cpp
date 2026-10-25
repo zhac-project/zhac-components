@@ -956,6 +956,64 @@ int main() {
         CHECK(!device_shadow_get_attr(T, "mode", &o), "a key the device never reported is not created");
     }
 
+    // ── G21 the saved blob holds what a restore needs, and only rewrites when it changed ──
+    // Review 2026-10-24 PB-02: every report changed the bytes (the uptime stamp
+    // ts, _last_seen, linkquality), so each device's whole blob was rewritten
+    // every 5 min whether or not anything changed, wearing the flash.
+    {
+        printf("\nG21 persistence: restore content only, identical bytes are not rewritten\n");
+        nvs_stub_reset();
+        g_fake_now = T0;                   // clock set: process injects _last_seen
+        const uint64_t P = 0x0FA0ULL;
+        ZapDevice pd{};
+        pd.ieee_addr = P;
+        ZclAttribute pa[2]{};
+        zcl_attr_set_int(&pa[0], "state", 1, VAL_BOOL);
+        zcl_attr_set_int(&pa[1], "linkquality", 120, VAL_INT);
+        device_shadow_process(&pd, pa, 2);
+        device_shadow_flush_now();
+        ShadowAttr o{};
+        CHECK(read_attr_blob(P, "state", &o) && o.int_val == 1, "the state is saved");
+        CHECK(!read_attr_blob(P, "linkquality", &o) && !read_attr_blob(P, "_last_seen", &o),
+              "linkquality and _last_seen are not (the device store keeps last_seen)");
+
+        // Stand-in blob: if the shadow writes again, it is replaced.
+        const ShadowAttr mark = make_attr("sentinel", VAL_INT, 1, 0);
+        seed_attr_blob(P, &mark, 1, false);
+        g_fake_now = T0 + 60;              // a later report of the same state, new lqi
+        zcl_attr_set_int(&pa[1], "linkquality", 90, VAL_INT);
+        device_shadow_process(&pd, pa, 2);
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(P, "sentinel", &o), "the same state again writes nothing");
+        zcl_attr_set_int(&pa[0], "state", 0, VAL_BOOL);
+        device_shadow_process(&pd, pa, 1);
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(P, "state", &o) && o.int_val == 0 && !read_attr_blob(P, "sentinel", &o),
+              "a changed state is written");
+
+        // A restored device that reports what it had: nothing to write. Its
+        // restored attrs carry the old boot's ts, which is not saved again.
+        const uint64_t Q = 0x0FA1ULL;
+        ShadowAttr qa[3] = { make_attr("state", VAL_BOOL, 1, 7), make_attr("power", VAL_INT, 40, 7),
+                             make_attr("mode", VAL_INT, 2, 7) };
+        seed_attr_blob(Q, qa, 3, false);
+        ZapDevice qd{};
+        qd.ieee_addr = Q;
+        device_shadow_restore_from_pool(&qd, 1);
+        seed_attr_blob(Q, &mark, 1, false);
+        ZclAttribute qs[1]{};
+        zcl_attr_set_int(&qs[0], "state", 1, VAL_BOOL);
+        device_shadow_process(&qd, qs, 1);
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(Q, "sentinel", &o), "restored, then the same value: nothing written");
+        zcl_attr_set_int(&qs[0], "power", 41, VAL_INT);
+        device_shadow_process(&qd, qs, 1);
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(Q, "mode", &o) && o.int_val == 2 && o.ts == 0,
+              "a restored attr is saved without its old ts");
+        g_fake_now = 0;
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);
     return s_failures ? 1 : 0;
 }

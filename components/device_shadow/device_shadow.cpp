@@ -26,6 +26,10 @@
 static const char* TAG = "device_shadow";
 static const char* NVS_NS = "zap_shadow";
 static constexpr uint32_t NVS_MIN_INTERVAL_S = 300; // max one NVS write per 5min per device
+// A device whose cached keys are those on flash and only their values moved:
+// at most one write per 30 min (review 2026-10-24 PB-02). A graceful restart or
+// an OTA writes the rest first (device_shadow_flush_now).
+static constexpr uint32_t NVS_VALUE_INTERVAL_S = 1800;
 // task_shadow cadence: the queue-drain timeout AND the housekeeping/
 // persistence sweep period. Comments below cite this constant by name.
 static constexpr uint32_t SWEEP_PERIOD_MS = 100;
@@ -163,21 +167,47 @@ static DeviceShadowEntry* find_entry(uint64_t ieee);   // fwd — used by persis
 
 // ── NVS helpers ───────────────────────────────────────────────────────────
 
+// Keys a restore does not need, which change with every frame: _last_seen (the
+// device store keeps last_seen) and linkquality. Saving them made every blob
+// differ from the one on flash, so each device was rewritten every 5 min.
+static bool persisted_key(const char* key) {
+    return strncmp(key, KEY_LAST_SEEN, ATTR_KEY_MAX) != 0 && strncmp(key, "linkquality", ATTR_KEY_MAX) != 0;
+}
+
 // Serialize [ShadowBlobHdr][attrs] into `buf` (capacity must be at least
 // sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX*sizeof(ShadowAttr)). Pure RAM work
 // — safe under s_mutex. F26: prepends version + count + CRC header (see
-// ShadowBlobHdr). Returns the total blob length.
+// ShadowBlobHdr). Only what a restore needs (PB-02): the volatile keys above
+// are left out and `ts` (seconds since that boot) is saved as 0, so the same
+// values give the same bytes. Returns the total blob length.
 static size_t attr_blob_serialize(uint8_t* buf, const ShadowAttr* attrs, uint8_t count) {
     if (count > SHADOW_ATTR_MAX) count = SHADOW_ATTR_MAX;
-    const size_t plen = (size_t)count * sizeof(ShadowAttr);
     auto* h   = reinterpret_cast<ShadowBlobHdr*>(buf);
     auto* pay = buf + sizeof(ShadowBlobHdr);
-    memcpy(pay, attrs, plen);
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        if (!persisted_key(attrs[i].key)) continue;
+        uint8_t* p = pay + (size_t)n++ * sizeof(ShadowAttr);
+        memcpy(p, &attrs[i], sizeof(ShadowAttr));
+        memset(p + offsetof(ShadowAttr, ts), 0, sizeof(uint32_t));
+    }
+    const size_t plen = (size_t)n * sizeof(ShadowAttr);
     h->ver   = SHADOW_ATTR_BLOB_VER;
-    h->count = count;
+    h->count = n;
     h->_pad  = 0;
     h->crc   = esp_rom_crc32_le(0, pay, plen);
     return sizeof(ShadowBlobHdr) + plen;
+}
+
+// Caller holds s_mutex; `blob` was just serialized from `e`. False when flash
+// already holds these bytes (nothing to write); else books them as written.
+static bool persist_changed_locked(DeviceShadowEntry* e, const uint8_t* blob) {
+    const uint32_t crc = reinterpret_cast<const ShadowBlobHdr*>(blob)->crc;
+    e->nvs_attr_count = e->attr_count;
+    if (e->nvs_crc_valid && crc == e->nvs_crc) return false;
+    e->nvs_crc       = crc;
+    e->nvs_crc_valid = true;
+    return true;
 }
 
 // Flash half — tens to hundreds of ms incl. page erase, so it must run with
@@ -797,8 +827,11 @@ static void task_shadow(void* arg) {
             if (e->no_occ_pending)            no_occ_fire_locked(e);
 
             uint32_t now_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
+            // The keys on flash, only their values moved: the longer wait.
+            const uint32_t wait_s = (e->nvs_crc_valid && e->attr_count == e->nvs_attr_count)
+                                        ? NVS_VALUE_INTERVAL_S : NVS_MIN_INTERVAL_S;
             if (e->nvs_dirty &&
-                (e->nvs_force || (now_s - e->nvs_last_write_s) >= NVS_MIN_INTERVAL_S)) {
+                (e->nvs_force || (now_s - e->nvs_last_write_s) >= wait_s)) {
                 ieee     = e->ieee;
                 blob_len = attr_blob_serialize(s_sweep_blob, e->attrs, e->attr_count);
                 // Stamp + clear optimistically under the lock. An update
@@ -809,7 +842,8 @@ static void task_shadow(void* arg) {
                 // flash (and spamming ESP_LOGE) every SWEEP_PERIOD_MS.
                 e->nvs_dirty        = false;
                 e->nvs_force        = false;
-                e->nvs_last_write_s = now_s;
+                if (persist_changed_locked(e, s_sweep_blob)) e->nvs_last_write_s = now_s;
+                else blob_len = 0;   // flash holds these bytes already
             }
             xSemaphoreGive(s_mutex);
             publish_staged();
@@ -824,7 +858,7 @@ static void task_shadow(void* arg) {
                 // device was removed mid-write (nothing left to persist).
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
                 DeviceShadowEntry* re = find_entry(ieee);
-                if (re) re->nvs_dirty = true;
+                if (re) { re->nvs_dirty = true; re->nvs_crc_valid = false; }
                 xSemaphoreGive(s_mutex);
             }
         }
@@ -948,6 +982,11 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
         if (has_attrs && ac > 0) {
             memcpy(e->attrs, sc.attrs, (size_t)ac * sizeof(ShadowAttr));
             e->attr_count = ac;
+            // Book what flash holds, so a device that reports the values it
+            // had writes nothing (PB-02). s_attr_blob is free again: the load
+            // above copied out of it.
+            attr_blob_serialize(s_attr_blob, e->attrs, ac);
+            (void)persist_changed_locked(e, s_attr_blob);
         }
         // The time of the device's last report, saved with its attrs.
         for (uint8_t j = 0; j < e->attr_count; j++) {
@@ -995,12 +1034,13 @@ void device_shadow_flush_now() {
             len  = attr_blob_serialize(blob, e->attrs, e->attr_count);
             e->nvs_dirty = false;
             e->nvs_force = false;
+            if (!persist_changed_locked(e, blob)) len = 0;   // already on flash
         }
         xSemaphoreGive(s_mutex);
         if (!len) continue;
         if (nvs_write_attr_blob(ieee, blob, len)) { written++; continue; }
         xSemaphoreTake(s_mutex, portMAX_DELAY);   // failed: the sweep retries it
-        if (DeviceShadowEntry* re = find_entry(ieee)) re->nvs_dirty = true;
+        if (DeviceShadowEntry* re = find_entry(ieee)) { re->nvs_dirty = true; re->nvs_crc_valid = false; }
         xSemaphoreGive(s_mutex);
     }
     heap_caps_free(blob);
@@ -1220,6 +1260,7 @@ void device_shadow_clear_attrs(uint64_t ieee) {
         e->no_occ = NoOccupancySince{ e->no_occ.interval_s, false, false, false };  // keep the option
         e->nvs_dirty = false;
         e->nvs_force = false;
+        e->nvs_crc_valid = false;   // the blob is erased below
         e->attr_overflow_logged = false;  // T27: cache emptied — re-arm the
                                           // once-per-device overflow log so a
                                           // refill that overflows again is seen
