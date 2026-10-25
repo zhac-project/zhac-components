@@ -819,6 +819,17 @@ int main() {
         CHECK(zigbee_parse_basic_identity(g, sizeof(g), mo, sizeof(mo), nullptr, 0, nullptr) &&
               strcmp(mo, "??Z") == 0, "invalid UTF-8 becomes '?', a NUL ends the text");
 
+        // Two definitions match on such text and carry these stored forms (embedded-zhc
+        // lumi/SJCGQ12LM_ES.cpp, lonsonho/generated/Lon_ZB_RGBCW.cpp): keep them in step.
+        char t[40];
+        const uint8_t es[] = {'l', 'u', 'm', 'i', '.', 'f', 'l', 'o', 'o', 'd', '.', 'a', 'g', 'l', '0', '2',
+                              '\t', 'F', 0x01};
+        zigbee_copy_text(t, sizeof(t), es, sizeof(es));
+        CHECK(strcmp(t, "lumi.flood.agl02?F?") == 0, "Aqara SJCGQ12LM-ES modelID as stored");
+        const uint8_t ew[] = {'e', 'W', 'e', 'L', 'i', 0x01, 0x00, 0x10};
+        zigbee_copy_text(t, sizeof(t), ew, sizeof(ew));
+        CHECK(strcmp(t, "eWeLi?") == 0, "Lonsonho manufacturer eWeLi 01 00 10 as stored (the NUL ends it)");
+
         // A record stored before this fix is cleaned when it is restored.
         pool_clear();
         ZapDevice old{};
