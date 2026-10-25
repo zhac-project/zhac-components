@@ -197,8 +197,30 @@ static bool detect_handshake_auth(httpd_req_t* req) {
     return false;
 }
 
-// Register a freshly handshaken socket (see adopt_client).
+// The firmware's cross-site filter for the upgrade (review 2026-10-24 HS-01):
+// a browser opens a WebSocket for any page it shows, with no CORS check, so
+// the page's Origin is all that tells the hub's own page from another site's.
+static WsUpgradeFilter s_upgrade_filter = nullptr;
+
+static bool upgrade_allowed(httpd_req_t* req) {
+    return !s_upgrade_filter || s_upgrade_filter(req);
+}
+
+#ifdef CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+// Before the 101: a refused upgrade never becomes a socket.
+static esp_err_t ws_pre_handshake(httpd_req_t* req) {
+    return upgrade_allowed(req) ? ESP_OK : ESP_FAIL;
+}
+#endif
+
+// Register a freshly handshaken socket (see adopt_client). Without the
+// pre-handshake callback the filter runs here, after the 101, and a refused
+// socket is closed before it is ever registered.
 static void register_client(httpd_req_t* req, int fd) {
+    if (!upgrade_allowed(req)) {
+        httpd_sess_trigger_close(s_server, fd);
+        return;
+    }
     adopt_client(fd, detect_handshake_auth(req));
 }
 
@@ -287,6 +309,9 @@ static const httpd_uri_t s_ws_uri = {
     // Session teardown after CLOSE runs through close_fn below.
     .handle_ws_control_frames = false,
     .supported_subprotocol    = nullptr,
+#ifdef CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+    .ws_pre_handshake_cb      = ws_pre_handshake,
+#endif
 #ifdef CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
     // Field exists only on IDF >= 6.1 and only when the option is enabled;
     // both the struct member and the callback are compiled out otherwise, so
@@ -385,6 +410,10 @@ httpd_handle_t ws_server_get_handle() {
 
 void ws_server_set_rx_callback(WsRxCallback cb) {
     s_rx_cb = cb;
+}
+
+void ws_server_set_upgrade_filter(WsUpgradeFilter fn) {
+    s_upgrade_filter = fn;
 }
 
 void ws_server_set_api_token(const char* token) {

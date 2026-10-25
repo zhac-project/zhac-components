@@ -482,6 +482,22 @@ int main() {
         CHECK(read_frames(sv[1], f) && f.size() == 1 && f[0] == fine, "UTF-8 guard: valid text goes out unchanged");
     }
 
+    // The firmware's cross-site filter (review 2026-10-24 HS-01): without the pre-handshake callback a refused
+    // upgrade is closed at once and never becomes a client; an accepted one registers as before.
+    {
+        const int before = ws_server_client_count();
+        g_closes.clear();
+        ws_server_set_upgrade_filter([](httpd_req_t*) { return false; });
+        add_client(9001);
+        CHECK(ws_server_client_count() == before && g_closes.size() == 1 && g_closes[0].fd == 9001,
+              "upgrade filter: a refused upgrade is closed and not registered");
+        ws_server_set_upgrade_filter([](httpd_req_t*) { return true; });
+        g_closes.clear();
+        add_client(9002);
+        CHECK(ws_server_client_count() == before + 1 && g_closes.empty(), "upgrade filter: an accepted upgrade registers");
+        ws_server_set_upgrade_filter(nullptr);
+    }
+
     CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");
     return g_failures ? 1 : 0;
 }

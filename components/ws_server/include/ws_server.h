@@ -36,6 +36,11 @@ void             ws_server_reply(int fd, const char* json, size_t len);
 httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
+// Optional: asked about every WebSocket upgrade; false refuses it -- before the
+// handshake with CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT, else by closing the
+// new socket at once. The firmware's cross-site filter (review 2026-10-24 HS-01).
+using WsUpgradeFilter = bool(*)(httpd_req_t* req);
+void             ws_server_set_upgrade_filter(WsUpgradeFilter fn);
 int              ws_server_client_count();
 // True when the CALLING task is currently inside a send to a WS client: the
 // broadcast fan-out or ws_server_reply (the TX lock is held, the marker set).
