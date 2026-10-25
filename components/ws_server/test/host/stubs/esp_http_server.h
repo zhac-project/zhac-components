@@ -58,7 +58,21 @@ inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t*, const char*, char*, s
 inline size_t httpd_req_get_url_query_len(httpd_req_t*) { return 0; }
 inline esp_err_t httpd_req_get_url_query_str(httpd_req_t*, char*, size_t) { return ESP_FAIL; }
 inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) { return ESP_FAIL; }
-inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t*, size_t) { return ESP_FAIL; }
+// The next data frame's length (0: none, and the read fails). Like IDF, a read with len 0 takes
+// the header and reports the length; a read with the length set takes the payload.
+inline size_t g_ws_frame_len = 0;
+inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t* f, size_t max_len) {
+    if (!g_ws_frame_len) return ESP_FAIL;
+    if (f->len == 0) {
+        f->type = HTTPD_WS_TYPE_TEXT;
+        f->len  = g_ws_frame_len;
+        if (max_len == 0) return ESP_OK;
+    }
+    if (f->len > max_len || !f->payload) return ESP_FAIL;
+    for (size_t i = 0; i < f->len; i++) f->payload[i] = 'x';
+    g_ws_frame_len = 0;
+    return ESP_OK;
+}
 inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return g_fd_info_result; }
 inline bool httpd_uri_match_wildcard(const char*, const char*, size_t) { return true; }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* frame);   // supplied by the test

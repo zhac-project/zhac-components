@@ -92,6 +92,22 @@ int main() {
     g_close_fn(nullptr, sv[0]);
     close(sv[1]);
 
+    // ── HS-12: a frame over the cap ends its session ──────────────────────
+    // Skipping it left its payload in the stream, read as the next frame's header.
+    static size_t s_rx_len = 0;
+    ws_server_set_rx_callback([](int, const char*, size_t len) { s_rx_len = len; });
+    add_client(110);
+    httpd_req_t f110{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(110))};
+    g_ws_frame_len = 8 * 1024;
+    CHECK(g_ws_uri->handler(&f110) == ESP_OK && s_rx_len == 8 * 1024, "a frame of 8 KB is read and handed on");
+    const int before = ws_server_client_count();
+    s_rx_len = 0;
+    g_ws_frame_len = 8 * 1024 + 1;
+    CHECK(g_ws_uri->handler(&f110) == ESP_FAIL && s_rx_len == 0 && ws_server_client_count() == before - 1,
+          "a frame over 8 KB fails its session (httpd closes it) and leaves the client table");
+    g_ws_frame_len = 0;
+    g_close_fn(nullptr, 110);
+
     std::printf("%s (%d failure(s))\n", s_fail ? "FAILED" : "ALL PASS", s_fail);
     return s_fail ? 1 : 0;
 }

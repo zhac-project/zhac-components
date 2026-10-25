@@ -25,9 +25,10 @@
 #error "ws_server needs CONFIG_HTTPD_QUEUE_WORK_BLOCKING=n: it queues httpd work from the httpd task, so a full queue would deadlock it"
 #endif
 
-// DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL +
-// script.check Lua source; frames beyond this are dropped (a misbehaving/hostile
-// client can't force a huge per-frame allocation).
+// DS10 (DS_FINDINGS): cap on an inbound WS text frame. Covers rule DSL and a
+// short script.check source; a frame beyond this closes its session (a
+// misbehaving/hostile client can't force a huge per-frame allocation). The SPA
+// sends nothing bigger: it checks long scripts over REST.
 #define WS_RX_MAX (8 * 1024)
 
 static const char*       TAG      = "ws_server";
@@ -360,9 +361,15 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     // down — our close_fn does the table cleanup.
     if (pkt.type != HTTPD_WS_TYPE_TEXT || pkt.len == 0 || !s_rx_cb) return ESP_OK;
     if (pkt.len > WS_RX_MAX) {
-        ESP_LOGW(TAG, "ws frame %u B exceeds cap %u — dropped",
+        // Its payload is still in the stream, so skipping the frame made the
+        // next read take those bytes for a frame header (review 2026-10-24
+        // HS-12). A failed handler makes httpd close the session; reading the
+        // payload away instead would hold the httpd task as long as the
+        // client cares to trickle it.
+        ESP_LOGW(TAG, "ws frame %u B exceeds cap %u — closing the session",
                  (unsigned)pkt.len, (unsigned)WS_RX_MAX);
-        return ESP_OK;
+        remove_fd(fd);
+        return ESP_FAIL;
     }
     uint8_t* buf = static_cast<uint8_t*>(
         heap_caps_malloc(pkt.len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
