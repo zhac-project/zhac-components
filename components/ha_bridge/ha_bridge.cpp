@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "mqtt_gw.h"
 #include "nvs.h"
+#include "zcl_attribute.h"   // kZclSecretKeys
 #include "zhac_task.h"   // zhac_task_create: PSRAM stacks only where flash access is safe
 
 static const char* TAG = "ha_bridge";
@@ -131,10 +132,22 @@ void retract_topics(const char* topics) {
     }
 }
 
+// Older firmware published a secret (a keypad's code, review ZR-06) retained,
+// and a publish without retain neither removes nor replaces a retained
+// message: an empty retained one clears it.
+void clear_secret_state(uint64_t ieee) {
+    for (const char* key : kZclSecretKeys) {
+        char topic[128];
+        if (ha::state_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee, key) >= 0)
+            publish(topic, "", 1, true);
+    }
+}
+
 void retract_device(uint64_t ieee) {
     Published* s = slot_for(ieee, false);
     if (!s) return;
     retract_topics(s->topics);
+    clear_secret_state(ieee);
     if (s->passive) {
         // Clear the retained availability too, or HA keeps a stale value
         // should the device ever be re-added under this address.
@@ -199,6 +212,7 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
         }
     }
     free(col);
+    if (ha::names_secret(d.exposes)) clear_secret_state(d.ieee);
     publish_attrs(d.ieee, d.attrs);   // HA shows the current values right away
 }
 
@@ -251,7 +265,8 @@ void retract_all() {
 void handle_command(const Msg& m) {
     if (!s_plat || !s_plat->set_attr) return;
     if (!s_plat->set_attr(m.ieee, m.key, m.value)) {
-        ESP_LOGW(TAG, "0x%016llx %s <- %s: rejected", (unsigned long long)m.ieee, m.key, m.value);
+        ESP_LOGW(TAG, "0x%016llx %s <- %s: rejected", (unsigned long long)m.ieee, m.key,
+                 zcl_attr_key_is_secret(m.key) ? "<hidden>" : m.value);   // a lock PIN (ZR-06)
     }
 }
 

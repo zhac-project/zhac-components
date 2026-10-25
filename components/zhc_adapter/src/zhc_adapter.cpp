@@ -763,10 +763,13 @@ void log_payload(std::uint64_t ieee,
     if (!result.any_matched) {
         // Show why the frame didn't match: cluster, family, command/attr,
         // first 16 bytes of raw ZCL. Lets ports be debugged without a
-        // sniffer trace. Not for IAS ACE (0x0501): its arm and bypass
-        // commands carry the PIN typed on the keypad (review ZR-06).
+        // sniffer trace. Not for IAS ACE (0x0501), whose arm and bypass
+        // commands carry the PIN typed on the keypad, nor for a door lock's
+        // operation and programming event notifications (0x0101, 0x20/0x21),
+        // which carry the PIN used (review ZR-06).
         char hex[3 * 16 + 1] = {0};
-        const bool hide = cluster_id == 0x0501;
+        const bool hide = cluster_id == 0x0501 ||
+                          (cluster_id == 0x0101 && msg && (msg->command_id == 0x20 || msg->command_id == 0x21));
         const std::size_t n = hide ? 0 : (zcl_len < 16 ? zcl_len : 16);
         for (std::size_t i = 0; i < n; ++i) {
             std::snprintf(hex + i * 3, 4, "%02x ", zcl[i]);
@@ -2012,6 +2015,7 @@ bool dispatch_and_send(uint64_t ieee,
         case zhc::ValueType::Float: std::snprintf(shown, sizeof(shown), "%.2f", static_cast<double>(value.f)); break;
         default: std::snprintf(shown, sizeof(shown), "(type %u)", static_cast<unsigned>(value.type)); break;
     }
+    if (zcl_attr_key_is_secret(key)) std::snprintf(shown, sizeof(shown), "<hidden>");   // a lock PIN (ZR-06)
     ESP_LOGI(TAG, "[zhc-send] 0x%016llx %s=%s -> ep=%u cl=0x%04x len=%u",
              static_cast<unsigned long long>(ieee), key, shown, target_ep, r.cluster_id,
              static_cast<unsigned>(r.frame_size));

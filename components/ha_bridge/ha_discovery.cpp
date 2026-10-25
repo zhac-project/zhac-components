@@ -743,6 +743,16 @@ bool state_retained(const char* key) {
     return key && strcmp(key, "action") != 0 && !zcl_attr_key_is_secret(key);
 }
 
+bool names_secret(const char* exposes_json) {
+    if (!exposes_json) return false;
+    for (const char* k : kZclSecretKeys) {
+        char quoted[ATTR_KEY_MAX + 3];
+        snprintf(quoted, sizeof(quoted), "\"%s\"", k);
+        if (strstr(exposes_json, quoted)) return true;
+    }
+    return false;
+}
+
 bool state_payload(const char* value_json, char* out, size_t cap) {
     if (!value_json || cap < 2) return false;
     JsonDocument doc;

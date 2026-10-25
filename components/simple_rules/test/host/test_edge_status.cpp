@@ -393,6 +393,20 @@ int main() {
     }
     CHECK(fires("feed") == 27, "the bare `ON <device>` wildcard is not held");
 
+    // ── 12. A keypad's code is a secret (review 2026-10-24 ZR-06) ─────────
+    // The fired line named the trigger's value, so a PIN typed on a keypad went
+    // to every log sink. And the code is an event, not state: the shadow keeps
+    // none, and the same PIN typed again must fire again.
+    static constexpr uint64_t kPad = 0xA10000000000000AULL;
+    seed_device(kPad, "pad");
+    add("disarm", "ON pad#action_code=\"4711\" DO script.run disarm ENDON");
+    add("any", "ON pad DO script.run any ENDON");
+    publish_attr(kPad, "action_code", VAL_STR, 0, "4711");
+    publish_attr(kPad, "action_code", VAL_STR, 0, "4711");
+    CHECK(fires("disarm") == 2, "the same code typed twice fires its rule twice");
+    CHECK(stub_log_count('I', "4711") == 0 && stub_log_count('I', "pad#action_code=<hidden>") == 4,
+          "the fired lines hide the code, for the rule on it and for the wildcard");
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

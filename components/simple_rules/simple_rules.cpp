@@ -235,8 +235,8 @@ static bool resolve_action_value(const RuleAction& a, const char* legacy_arg,
     const long long v = strtoll(event_val, &end, 10);
     if (end == event_val || *end != '\0' || errno == ERANGE ||
         v > INT32_MAX || v < INT32_MIN) {
-        ESP_LOGW(TAG, "value expression: non-numeric trigger value '%s' — action skipped",
-                 event_val);
+        // Not the value itself: it may be a keypad's PIN (review ZR-06).
+        ESP_LOGW(TAG, "value expression: the trigger value is not a number — action skipped");
         return false;
     }
     int32_t res = 0;
@@ -363,12 +363,14 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 // home. The memory (RuleEdge) is seeded from the device shadow whenever a rule
 // is (re)loaded, so a reboot, an edit or a rename never fires a rule either.
 
-// Momentary attributes are events, not state: every report counts.
+// Momentary attributes are events, not state: every report counts. So is a
+// secret (a keypad's code, review ZR-06): the same PIN typed again fires
+// again, and no RuleEdge keeps it.
 static bool is_momentary(const char* key) {
     static const char* const kMomentary[] = {"action", "click", "event", "scene"};
     for (const char* k : kMomentary)
         if (strcmp(key, k) == 0) return true;
-    return false;
+    return zcl_attr_key_is_secret(key);
 }
 
 // Triggers that fire on a change and so keep memory. Not the bare
@@ -726,7 +728,8 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
         const char* key = t.attr_key;   // the wildcard names the reported one
         if (!key[0] && ev && ev->type == EventType::ZCL_ATTR)
             key = reinterpret_cast<const ZclAttrEvent*>(ev->data)->key;
-        snprintf(what, sizeof(what), "%s#%.*s=%s", dev, (int)ATTR_KEY_MAX, key, val);
+        snprintf(what, sizeof(what), "%s#%.*s=%s", dev, (int)ATTR_KEY_MAX, key,
+                 zcl_attr_key_is_secret(key) ? "<hidden>" : val);   // a keypad PIN (ZR-06)
         break;
     }
     case TriggerType::TIME_CRON:  snprintf(what, sizeof(what), "Time#Cron"); break;

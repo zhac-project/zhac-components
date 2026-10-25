@@ -453,6 +453,11 @@ static void test_retain() {
     CHECK(ha::state_retained("temperature"));
     CHECK(!ha::state_retained("action"));
     CHECK(!ha::state_retained("action_code"));
+    // Older firmware did retain the code, and a later publish without retain
+    // does not remove it: ha_bridge clears the topic of a device that has one.
+    CHECK(ha::names_secret(R"([{"type":"text","name":"action_code","property":"action_code","access":1}])"));
+    CHECK(!ha::names_secret(R"([{"type":"numeric","name":"temperature","property":"temperature","access":1}])"));
+    CHECK(!ha::names_secret(nullptr));
 }
 
 int main() {

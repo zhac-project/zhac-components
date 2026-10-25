@@ -108,6 +108,11 @@ bool state_payload(const char* value_json, char* out, size_t cap);
 // which would otherwise wait on the broker for every new subscriber.
 bool state_retained(const char* key);
 
+// Whether a device's exposes (JSON array text) name a secret key. Older
+// firmware published those retained, and a publish without retain does not
+// remove a retained message, so ha_bridge clears such a device's topic.
+bool names_secret(const char* exposes_json);
+
 // A float stored x100 (the shadow's VAL_FLOAT) as JSON number text with at
 // most two decimals: 2137 -> "21.37", 4820 -> "48.2", 2100 -> "21",
 // -5 -> "-0.05". Returns length, or -1 if it does not fit.
