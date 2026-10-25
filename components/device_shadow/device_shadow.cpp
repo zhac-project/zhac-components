@@ -1050,13 +1050,18 @@ void device_shadow_flush_now() {
 void device_shadow_process(const ZapDevice* dev,
                            const ZclAttribute* attrs, uint8_t count)
 {
+    device_shadow_process_ieee(dev->ieee_addr, attrs, count);
+}
+
+void device_shadow_process_ieee(uint64_t ieee, const ZclAttribute* attrs, uint8_t count)
+{
     _METRIC_TIMER_SCOPE(METRIC_SHADOW_PROCESS);
     // Radio RX path. Pre-fix (:412) this committed attr blobs to NVS while
     // holding s_mutex; persistence is now a dirty-mark handled by the
     // task_shadow sweep, and the bus publish happens after the lock drops.
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    DeviceShadowEntry* e = find_or_create_entry(dev->ieee_addr);
+    DeviceShadowEntry* e = find_or_create_entry(ieee);
     if (!e) {
         xSemaphoreGive(s_mutex);
         xSemaphoreGive(s_emit_mutex);

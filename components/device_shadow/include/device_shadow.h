@@ -131,6 +131,9 @@ void device_shadow_flush_now();
 // attribute against a device.
 void device_shadow_process(const ZapDevice* dev,
                            const ZclAttribute* attrs, uint8_t count);
+// The same by IEEE, the only thing of the device it reads: the decode path
+// runs on the radio task's stack and passes no ZapDevice copy (review ZR-04).
+void device_shadow_process_ieee(uint64_t ieee, const ZclAttribute* attrs, uint8_t count);
 
 // Called after a successful command send when config.optimistic==true.
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,

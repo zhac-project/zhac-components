@@ -48,6 +48,11 @@ inline constexpr uint32_t kTaskLua      = 32768;
 #endif
 inline constexpr uint32_t kMqttPubP4    = 4096;
 inline constexpr uint32_t kInterviewP4  = 8192;   // alias of kZbInterview when used from main
+// zhac-wired-core's TaskZigbee (esp-zigbee-lib mainloop): every frame is decoded
+// inside the stack's APS callback, and decode -> shadow -> event bus -> log came
+// within a few hundred bytes of the 8 KB it had (review 2026-10-24 ZR-04). In
+// PSRAM where zhac_task_create can put stacks (S31), internal RAM on the P4.
+inline constexpr uint32_t kEspZigbee    = 16384;
 
 // ── S3 main tasks ──────────────────────────────────────────────────
 // TaskWiFi is created internally by ESP-IDF's wifi stack, not by us.
