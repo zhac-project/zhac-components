@@ -362,6 +362,26 @@ int main() {
     CHECK(simple_rules_run_now(tm) && stub_log_count('I', "rule 'tm' run now (Rules#Timer=2)") == 1,
           "log: Run now of a timer rule logs at INFO");
 
+    // ── 11. A rule that keeps re-triggering itself is held (LU-03) ────────
+    // `ON lamp#state DO zigbee.toggle lamp state`: each toggle makes the lamp
+    // report a new state, a changed value, which fires the rule again. A rule
+    // on a device's state that drives a device or runs a script runs at most
+    // 20 times a minute; then it is held, and one held report ends the loop.
+    static constexpr uint64_t kLoop = 0xA100000000000008ULL;
+    seed_device(kLoop, "looper");
+    const uint16_t loop = add("loop", "ON looper#state DO script.run loop ENDON");
+    for (int i = 0; i < 25; i++) report(kLoop, "state", VAL_BOOL, i & 1);
+    CHECK(fires("loop") == 20, "a rule fed by its own action runs 20 times in a minute, then is held");
+    s = status_of(loop);
+    CHECK(s && s->runs == 20 && strcmp(s->last_skip, "rate_limited") == 0,
+          "status: a held run is recorded as 'rate_limited'");
+    CHECK(stub_log_count('W', "rule 'loop' ran 20 times in a minute") == 1,
+          "the hold is logged once");
+    CHECK(simple_rules_run_now(loop) && fires("loop") == 21, "Run now is not held");
+    add("tap", "ON cube#action=\"tap\" DO script.run tap ENDON");
+    for (int i = 0; i < 25; i++) report_str(kCube, "action", "tap");
+    CHECK(fires("tap") == 25, "a button rule is not held: a press does not feed back");
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

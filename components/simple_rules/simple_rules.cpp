@@ -747,16 +747,61 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
         ESP_LOGI(TAG, "rule %s %s (%s)", who, how, what);
 }
 
+// ── Run cap (review 2026-10-24 LU-03) ────────────────────────────────────
+// `ON lamp#state DO zigbee.toggle lamp state`: the toggle makes the lamp report
+// a new state, which is a change, which fires the rule again -- at radio speed,
+// forever. A rule on a device's state whose actions drive a device or run a
+// script runs at most kRunsPerMinute times a minute; past that it is held until
+// the minute is up. Holding one report ends such a loop for good, since nothing
+// is left to report. Buttons (momentary keys) and every other trigger cannot
+// feed back and are never held, nor is Run now.
+static constexpr uint16_t kRunsPerMinute = 20;
+
+static bool can_feed_back(const ParsedRule& r) {
+    if (r.trigger.type != TriggerType::DEVICE_ATTR || is_momentary(r.trigger.attr_key)) return false;
+    for (uint8_t i = 0; i < r.action_count; i++) {
+        const ActionType t = r.actions[i].type;
+        if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT)
+            return true;
+    }
+    return false;
+}
+
+// Caller holds s_mutex. True = hold this run (booked as RATE_LIMITED).
+static bool over_run_cap(ParsedRule& r) {
+    if (!can_feed_back(r)) return false;
+    RuleStat& st = r.stat;
+    const uint32_t now = mono_s();
+    if (st.minute_runs == 0 || now - st.minute_mono >= 60) {
+        st.minute_mono = now;
+        st.minute_runs = 0;
+    }
+    if (st.minute_runs < kRunsPerMinute) {
+        st.minute_runs++;
+        return false;
+    }
+    if (st.minute_runs == kRunsPerMinute) {   // first hold this minute: say so once
+        st.minute_runs++;
+        ESP_LOGW(TAG, "rule '%s' ran %u times in a minute -- held until the minute is up "
+                      "(does its action change its own trigger?)",
+                 r.name[0] ? r.name : "?", (unsigned)kRunsPerMinute);
+    }
+    st.skip = RuleSkip::RATE_LIMITED;
+    return true;
+}
+
 // Runs rule `id` (at `idx` when matched) from a copy taken under the lock, as
 // the actions can block on MQTT / the radio / Lua, then books the run on the
 // live rule. `snap` is the caller's scratch (the event and cron tasks have the
-// stack for it). False when the rule is gone, or disabled and not `manual`.
+// stack for it). False when the rule is gone, or disabled and not `manual`, or
+// held by the run cap.
 static bool fire_rule(ParsedRule& snap, uint16_t idx, uint16_t id,
                       const char* val, const Event* ev, bool manual) {
     if (xSemaphoreTakeRecursive(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     // Re-validate the slot in case it was edited or deleted since the match.
-    const bool live = idx < s_rule_count && s_rules[idx].rule_id == id &&
-                      (manual || s_rules[idx].enabled);
+    bool live = idx < s_rule_count && s_rules[idx].rule_id == id &&
+                (manual || s_rules[idx].enabled);
+    if (live && !manual && over_run_cap(s_rules[idx])) live = false;
     if (live) snap = s_rules[idx];
     xSemaphoreGiveRecursive(s_mutex);
     if (!live) return false;
@@ -1198,6 +1243,7 @@ uint16_t simple_rules_status(SimpleRuleStatus* out, uint16_t max_count) {
         switch (r.stat.skip) {
         case RuleSkip::UNCHANGED:       snprintf(o.last_skip, sizeof(o.last_skip), "unchanged");       break;
         case RuleSkip::CONDITION_FALSE: snprintf(o.last_skip, sizeof(o.last_skip), "condition_false"); break;
+        case RuleSkip::RATE_LIMITED:    snprintf(o.last_skip, sizeof(o.last_skip), "rate_limited");    break;
         case RuleSkip::ACTION_ERROR: {
             const uint8_t k = r.stat.skip_action;
             snprintf(o.last_skip, sizeof(o.last_skip), "action_error:%s",

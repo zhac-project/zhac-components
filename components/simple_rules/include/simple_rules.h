@@ -108,8 +108,9 @@ struct RuleEdge {
     char    str_val[ATTR_STR_MAX];
 };
 
-// Why a rule last did not run, or ran with a failing action.
-enum class RuleSkip : uint8_t { NONE, UNCHANGED, CONDITION_FALSE, ACTION_ERROR };
+// Why a rule last did not run, or ran with a failing action. RATE_LIMITED: held
+// for the rest of the minute after its run cap (simple_rules.cpp, review LU-03).
+enum class RuleSkip : uint8_t { NONE, UNCHANGED, CONDITION_FALSE, ACTION_ERROR, RATE_LIMITED };
 
 // Run counters, RAM only: reset on reboot, kept across edits and reloads.
 struct RuleStat {
@@ -117,6 +118,8 @@ struct RuleStat {
     uint32_t fired_mono;   // monotonic seconds of the last run
     RuleSkip skip;
     uint8_t  skip_action;  // ACTION_ERROR: index of the failing action
+    uint16_t minute_runs;  // automatic runs since minute_mono (the run cap)
+    uint32_t minute_mono;  // monotonic seconds the current minute began
 };
 
 struct ParsedRule {
@@ -203,7 +206,7 @@ struct SimpleRuleStatus {
     uint32_t runs;          // since boot, 0 = never ran
     uint32_t last_fired;    // epoch s when the clock is set, else s since boot
     uint32_t ago_s;         // s since the last run (valid when runs > 0)
-    char     last_skip[32]; // "", "unchanged", "condition_false", "action_error:<verb>"
+    char     last_skip[32]; // "", "unchanged", "condition_false", "action_error:<verb>", "rate_limited"
 };
 // Fills one entry per active (cached) rule. Returns the number written.
 uint16_t simple_rules_status(SimpleRuleStatus* out, uint16_t max_count);
