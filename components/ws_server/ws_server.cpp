@@ -276,8 +276,11 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     // broadcasts until its {"cmd":"auth"} message calls
     // ws_server_fd_set_authed(). That is the safe direction to be wrong in, and
     // it also repairs auth itself: previously that setter silently did nothing
-    // because the fd was not in the table to begin with.
-    ensure_fd(fd, s_api_token[0] == '\0');
+    // because the fd was not in the table to begin with. With an upgrade filter
+    // installed it starts unauthenticated even without a token: it skipped the
+    // handshake, and with it the filter (a refused socket whose close is still
+    // queued must not come in this way).
+    ensure_fd(fd, s_api_token[0] == '\0' && !s_upgrade_filter);
     // DS10 (DS_FINDINGS): the old fixed 256-byte stack buffer truncated/rejected
     // any WS frame larger than 255 bytes (rule DSL, script.check Lua source) and
     // a 2 KB+ stack buffer would risk the httpd task's canary on its deep call
@@ -473,7 +476,9 @@ static bool fd_may_receive(int fd) {
     bool ok = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_fd_count; i++) {
-        if (s_fds[i] == fd) { ok = s_api_token[0] == '\0' || s_fd_authed[i]; break; }
+        // The socket's own flag: one opened while no token is set starts signed
+        // in, and one that never signed in gets nothing, token or not (HS-01).
+        if (s_fds[i] == fd) { ok = s_fd_authed[i]; break; }
     }
     xSemaphoreGive(s_mutex);
     return ok;

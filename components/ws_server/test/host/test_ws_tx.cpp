@@ -404,6 +404,12 @@ int main() {
           "a reply still reaches a client that has not signed in (only broadcasts are re-checked)");
     do_broadcast(0);
     CHECK(read_frames(u[1], f) && f.empty(), "auth gate: a client that has not signed in gets no broadcast");
+    // Sign-in switched off with it still connected (its close only queued): it still gets nothing (HS-01).
+    ws_server_set_api_token(nullptr);
+    do_broadcast(0);
+    CHECK(read_frames(u[1], f) && f.empty(),
+          "auth gate: with sign-in off, a client that never signed in still gets no broadcast");
+    ws_server_set_api_token("0123456789abcdef0123456789abcdef");
     g_close_fn(nullptr, u[0]);
     read_frames(sv[1], f);                  // forget what was sent above
     g_closes.clear();
