@@ -12,6 +12,7 @@
 #include <new>
 
 #include "ArduinoJson.h"
+#include "zcl_attribute.h"   // zcl_attr_key_is_secret
 
 namespace ha {
 namespace {
@@ -736,6 +737,10 @@ bool command_value_json(const char* payload, size_t len, char* out, size_t cap) 
     out[o++] = '"';
     out[o] = '\0';
     return true;
+}
+
+bool state_retained(const char* key) {
+    return key && strcmp(key, "action") != 0 && !zcl_attr_key_is_secret(key);
 }
 
 bool state_payload(const char* value_json, char* out, size_t cap) {

@@ -102,6 +102,12 @@ bool command_value_json(const char* payload, size_t len, char* out, size_t cap);
 // matches against: true/false -> 1/0, numbers as written, strings unquoted.
 bool state_payload(const char* value_json, char* out, size_t cap);
 
+// Whether a state value is published retained. A button press ("action") is
+// not: retained, it would fire again on every Home Assistant restart. Nor is
+// a secret, such as a keypad code (zcl_attr_key_is_secret, review ZR-06),
+// which would otherwise wait on the broker for every new subscriber.
+bool state_retained(const char* key);
+
 // A float stored x100 (the shadow's VAL_FLOAT) as JSON number text with at
 // most two decimals: 2137 -> "21.37", 4820 -> "48.2", 2100 -> "21",
 // -5 -> "-0.05". Returns length, or -1 if it does not fit.

@@ -602,6 +602,7 @@ static void occupancy_apply_locked(DeviceShadowEntry* e) {
 static void upsert_cache(DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_t count) {
     uint32_t now_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
     for (uint8_t i = 0; i < count; i++) {
+        if (zcl_attr_key_is_secret(attrs[i].key)) continue;   // staged and published, never kept (ZR-06)
         bool found = false;
         for (uint8_t j = 0; j < e->attr_count; j++) {
             if (strncmp(e->attrs[j].key, attrs[i].key, ATTR_KEY_MAX) == 0) {
@@ -980,13 +981,18 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
             e->cfg_crc_valid = true;
         }
         if (has_attrs && ac > 0) {
-            memcpy(e->attrs, sc.attrs, (size_t)ac * sizeof(ShadowAttr));
-            e->attr_count = ac;
+            uint8_t kept = 0;
+            for (uint8_t j = 0; j < ac; j++)
+                if (!zcl_attr_key_is_secret(sc.attrs[j].key)) e->attrs[kept++] = sc.attrs[j];
+            e->attr_count = kept;
             // Book what flash holds, so a device that reports the values it
             // had writes nothing (PB-02). s_attr_blob is free again: the load
             // above copied out of it.
-            attr_blob_serialize(s_attr_blob, e->attrs, ac);
+            attr_blob_serialize(s_attr_blob, e->attrs, kept);
             (void)persist_changed_locked(e, s_attr_blob);
+            // A secret older firmware saved (ZR-06) is not restored, and the
+            // next sweep writes the blob again without it.
+            if (kept < ac) { e->nvs_crc_valid = false; mark_attrs_dirty(e); }
         }
         // The time of the device's last report, saved with its attrs.
         for (uint8_t j = 0; j < e->attr_count; j++) {

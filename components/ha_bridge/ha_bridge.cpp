@@ -289,15 +289,14 @@ bool post(Op op, uint64_t ieee = 0, const char* key = nullptr, const char* value
     return xQueueSend(s_q, &m, 0) == pdTRUE;
 }
 
-// Values arrive as JSON text; publish them as HA matches them. "action" (a
-// button press, an HA event entity) goes without retain: a retained press
-// would fire again on every Home Assistant restart.
+// Values arrive as JSON text; publish them as HA matches them. A press and a
+// keypad code go without retain (ha::state_retained).
 void publish_value(uint64_t ieee, const char* key, const char* value_json) {
     char topic[128];
     char payload[64];
     if (ha::state_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee, key) < 0) return;
     if (!ha::state_payload(value_json, payload, sizeof(payload))) return;
-    mqtt_gw_publish(topic, payload, strlen(payload), 0, strcmp(key, "action") != 0);
+    mqtt_gw_publish(topic, payload, strlen(payload), 0, ha::state_retained(key));
 }
 
 void publish_attrs(uint64_t ieee, const char* attrs_json) {

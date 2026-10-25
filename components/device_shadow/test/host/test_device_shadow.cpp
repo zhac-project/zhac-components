@@ -1014,6 +1014,54 @@ int main() {
         g_fake_now = 0;
     }
 
+    // ── G22 a keypad's code goes out with its press and is never kept ──────
+    // Review 2026-10-24 ZR-06: fz_ias_ace_arm decodes the PIN a household
+    // member typed as action_code, and it sat in the shadow (device.get) and in
+    // the saved blob like any state.
+    {
+        printf("\nG22 secret values: published, not kept, not saved, not restored\n");
+        nvs_stub_reset();
+        const uint64_t K = 0x0FB0ULL;
+        ZapDevice kd{};
+        kd.ieee_addr = K;
+        ZclAttrEvent got{};
+        int seen = 0;
+        auto noop = [](const Event&){};
+        EventSubHandle zcl = event_bus_subscribe(EventType::ZCL_ATTR, noop, [&](const Event& e){
+            const auto* p = reinterpret_cast<const ZclAttrEvent*>(e.data);
+            if (strcmp(p->key, "action_code") == 0) { seen++; got = *p; }
+            return false;
+        });
+        ZclAttribute ka[2]{};
+        zcl_attr_set_str(&ka[0], "action", "arm_all_zones");
+        zcl_attr_set_str(&ka[1], "action_code", "4711");
+        device_shadow_process(&kd, ka, 2);
+        device_shadow_flush_now();
+        ShadowAttr o{};
+        CHECK(seen == 1 && strcmp(got.str_val, "4711") == 0, "the code is published with its press");
+        CHECK(device_shadow_get_attr(K, "action", &o), "the action is kept");
+        CHECK(!device_shadow_get_attr(K, "action_code", &o), "the code is not kept (device.get)");
+        CHECK(!read_attr_blob(K, "action_code", &o), "nor saved");
+        device_shadow_process(&kd, ka, 2);
+        CHECK(seen == 2, "the same code again goes out again");
+        event_bus_unsubscribe(zcl);
+
+        // A blob older firmware saved: its code is not restored.
+        const uint64_t L = 0x0FB1ULL;
+        ShadowAttr la[2] = { make_attr("action", VAL_STR, 0, 0), make_attr("action_code", VAL_STR, 0, 0) };
+        strcpy(la[0].str_val, "disarm");
+        strcpy(la[1].str_val, "4711");
+        seed_attr_blob(L, la, 2, false);
+        ZapDevice ld{};
+        ld.ieee_addr = L;
+        device_shadow_restore_from_pool(&ld, 1);
+        CHECK(device_shadow_get_attr(L, "action", &o) && !device_shadow_get_attr(L, "action_code", &o),
+              "an older blob's code is not restored");
+        device_shadow_flush_now();
+        CHECK(read_attr_blob(L, "action", &o) && !read_attr_blob(L, "action_code", &o),
+              "and its blob is written again without it");
+    }
+
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);
     return s_failures ? 1 : 0;
 }

@@ -843,15 +843,19 @@ int main() {
               "restore stores the cleaned identity");
         zap_store_delete_device(0x5333000000000033ULL);
 
-        // String values a definition decodes from radio bytes (a keypad's action_code).
+        // String values a definition decodes from radio bytes.
         zhc_shadow_bridge_register();
         const uint64_t kPad = 0x2222000000000016ULL;
         ZapDevice* pad = pool_add();
         pad->ieee_addr = kPad;
-        g_stub_shadow_fn(kPad, "action_code", 5 /*String*/, 0, 0, 0.0f, false, "12\x01" "4");
+        g_stub_shadow_fn(kPad, "mode", 5 /*String*/, 0, 0, 0.0f, false, "12\x01" "4");
         ShadowAttr sa{};
-        CHECK(device_shadow_get_attr(kPad, "action_code", &sa) && strcmp(sa.str_val, "12?4") == 0,
+        CHECK(device_shadow_get_attr(kPad, "mode", &sa) && strcmp(sa.str_val, "12?4") == 0,
               "a decoded string value is stored with '?' for the control byte");
+        // The one such value seen so far, a keypad's action_code, is the PIN
+        // typed on it: published with its press, never kept (review ZR-06).
+        g_stub_shadow_fn(kPad, "action_code", 5 /*String*/, 0, 0, 0.0f, false, "1234");
+        CHECK(!device_shadow_get_attr(kPad, "action_code", &sa), "a keypad code is not kept in the shadow");
         pool_clear();
     }
 

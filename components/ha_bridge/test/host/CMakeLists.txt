@@ -18,6 +18,7 @@ add_executable(ha_discovery_host_test
 target_include_directories(ha_discovery_host_test PRIVATE
     ${COMPONENTS_DIR}/ha_bridge/include
     ${COMPONENTS_DIR}/arduinojson/src
+    ${COMPONENTS_DIR}/zap_common/include
 )
 target_compile_options(ha_discovery_host_test PRIVATE -Wall -Wextra -Werror)
 

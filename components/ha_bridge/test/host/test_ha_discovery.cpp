@@ -446,6 +446,15 @@ static void test_cover_lock_fan() {
           std::string(t) == "zhac/devices/A4C138F3E2D10B77/availability");
 }
 
+// State is published retained, a press is not (review 2026-10-24 ZR-06): a
+// retained action would fire again on every Home Assistant restart, and a
+// retained keypad code would wait on the broker for every new subscriber.
+static void test_retain() {
+    CHECK(ha::state_retained("temperature"));
+    CHECK(!ha::state_retained("action"));
+    CHECK(!ha::state_retained("action_code"));
+}
+
 int main() {
     test_sensors_and_binary();
     test_climate();
@@ -455,6 +464,7 @@ int main() {
     test_bad_input_and_bridge();
     test_bridge_metrics();
     test_topics_and_payloads();
+    test_retain();
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("ha_discovery: all checks passed\n");
     return 0;

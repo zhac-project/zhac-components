@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "zap_common.h"   // ZAP_MAX_DEVICES — single source of device-count truth
+#include "zcl_attribute.h" // zcl_attr_key_is_secret: values that are never logged
 #include "zhac_task.h"    // zhac_task_create: PSRAM stacks where the target allows
 #include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
 #include "meter_poll.hpp" // periodic meter reads for plugs that never report
@@ -762,12 +763,15 @@ void log_payload(std::uint64_t ieee,
     if (!result.any_matched) {
         // Show why the frame didn't match: cluster, family, command/attr,
         // first 16 bytes of raw ZCL. Lets ports be debugged without a
-        // sniffer trace.
+        // sniffer trace. Not for IAS ACE (0x0501): its arm and bypass
+        // commands carry the PIN typed on the keypad (review ZR-06).
         char hex[3 * 16 + 1] = {0};
-        const std::size_t n = zcl_len < 16 ? zcl_len : 16;
+        const bool hide = cluster_id == 0x0501;
+        const std::size_t n = hide ? 0 : (zcl_len < 16 ? zcl_len : 16);
         for (std::size_t i = 0; i < n; ++i) {
             std::snprintf(hex + i * 3, 4, "%02x ", zcl[i]);
         }
+        if (hide) std::snprintf(hex, sizeof(hex), "<hidden>");
         const char* family_name = "?";
         if (msg) {
             switch (msg->family) {
@@ -811,7 +815,7 @@ void log_payload(std::uint64_t ieee,
                      family_name,
                      msg ? static_cast<unsigned>(msg->type) : 0,
                      msg ? msg->command_id : 0,
-                     zcl_len, hex, zcl_len > 16 ? "…" : "");
+                     zcl_len, hex, !hide && zcl_len > 16 ? "…" : "");
         }
         return;
     }
@@ -826,7 +830,8 @@ void log_payload(std::uint64_t ieee,
     for (std::uint8_t i = 0; i < result.merged.count; ++i) {
         const auto& kv = result.merged.items[i];
         char buf[48];
-        format_value(buf, sizeof(buf), kv.value);
+        if (zcl_attr_key_is_secret(kv.key)) std::snprintf(buf, sizeof(buf), "<hidden>");   // a keypad PIN (ZR-06)
+        else format_value(buf, sizeof(buf), kv.value);
         ESP_LOGI(TAG, "  %s = %s", kv.key ? kv.key : "?", buf);
     }
 }
