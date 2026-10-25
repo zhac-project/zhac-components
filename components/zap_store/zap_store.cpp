@@ -36,7 +36,9 @@ static bool        s_ready = false;
 //     (cleared first, so a copy cut short is never taken for a whole one), and
 //     the store runs on `zhac_data`;
 //   - on an update's trial boot the originals stay: the build before finds
-//     them if the update rolls back, and the next trial copies afresh;
+//     them if the update rolls back. Until the move is final, every boot
+//     copies afresh from them (a copy left by a trial that rolled back is
+//     stale, and the build can come back by USB, without a trial);
 //   - zap_store_confirm_move() (the image was marked valid) or a boot that is
 //     not a trial makes the move final: "live" on `zhac_data`, beside the data,
 //     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
@@ -318,28 +320,29 @@ static bool data_part_select() {
             return false;
         }
         zap_store_confirm_move();   // either mark may be missing: nvs was erased, or a write failed
-        erase_old_copy();           // confirmed at run time, or left by an older build since
+        // Confirmed at run time, or left by an older build since. Not on a
+        // trial boot: if this update rolls back, that older build wants them.
+        if (!image_on_trial()) erase_old_copy();
         return true;
     }
     // Not moved: nvs holds the store of record. If nvs itself cannot be read,
     // leave zhac_data alone (the store then fails to open and stays shut).
     if (!ns_readable(NVS_DEFAULT_PART_NAME, NVS_NS)) return true;
-    // On an update's first boot nvs may have run under the build before (a
-    // rollback since the last copy): copy afresh.
-    const bool trial = image_on_trial();
-    if (trial || !mark_get(DATA_PART, "done")) {
-        const bool ok = mark_clear(DATA_PART, "done") &&
-                        erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
-                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS) &&
-                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW) &&
-                        mark_set(DATA_PART, "done");
-        if (!ok) {
-            ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
-            return true;
-        }
+    // Copied afresh at every boot until the move is final: a copy an earlier
+    // trial left may predate a rollback and days on the build before, and this
+    // build can come back without a trial (a USB flash), so "done" alone does
+    // not tell a current copy from a stale one.
+    const bool ok = mark_clear(DATA_PART, "done") &&
+                    erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
+                    copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS) &&
+                    copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW) &&
+                    mark_set(DATA_PART, "done");
+    if (!ok) {
+        ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
+        return true;
     }
     s_part = DATA_PART;
-    if (trial) {
+    if (image_on_trial()) {
         ESP_LOGI(TAG, "device store on '%s'; the copy on nvs stays until this update is confirmed", DATA_PART);
         return true;
     }

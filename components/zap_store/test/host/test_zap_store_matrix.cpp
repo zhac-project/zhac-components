@@ -598,7 +598,11 @@ int main() {
         zap_store_init();                           // update 2, trial boot again, no reboot between
         CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x04ULL),
               "a second update keeps what changed since the first (no copy from nvs)");
-        CHECK(nvs_stub_count("nvs", "zap_v0") == 0, "... and drops the old copy on nvs");
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();                           // the next plain boot
+        CHECK(nvs_stub_count("nvs", "zap_v0") == 0 && zap_store_load_devices(pool, 8) == 3,
+              "... and the next plain boot drops the old copy on nvs");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
 
         // After the move, nvs unreadable on an update's trial boot: the store stays.
         nvs_stub_part_fails("nvs", true);
@@ -607,13 +611,18 @@ int main() {
               "unreadable nvs on a later trial boot: the store on zhac_data is untouched");
         nvs_stub_part_fails("nvs", false);
 
-        // An older build run after the move left records on nvs: erased, not used.
+        // An older build run after the move left records on nvs: erased, not used,
+        // but not on a trial boot, whose rollback goes back to that older build.
         {
             nvs_handle_t h;
             (void)nvs_open("zap_v0", NVS_READWRITE, &h);
             (void)nvs_set_u16(h, "cnt", 1);
             nvs_close(h);
         }
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();
+        CHECK(nvs_stub_count("nvs", "zap_v0") > 0 && zap_store_load_devices(pool, 8) == 3,
+              "a trial boot keeps an older build's records on nvs, for a rollback");
         nvs_stub_ota_state(ESP_OTA_IMG_VALID);
         zap_store_init();
         CHECK(nvs_stub_count("nvs", "zap_v0") == 0 && zap_store_load_devices(pool, 8) == 3,
@@ -639,6 +648,22 @@ int main() {
         zap_store_init();
         CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x05ULL),
               "a re-copy cut short is redone, not trusted");
+
+        // A trial that rolled back, days on the build before, then this build
+        // back without a trial (a USB flash): the trial's copy is stale.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial: copied, done set
+        nvs_stub_drop_partition("zhac_data");       // rolled back
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();
+        ZapDevice f = make_dev(0x06ULL, 6, "paired after the rollback");
+        (void)zap_store_save_device(&f);
+        nvs_stub_add_partition("zhac_data");        // this build again, flashed by USB: no trial
+        zap_store_init();
+        CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x06ULL),
+              "after a rollback, a non-trial boot copies afresh instead of using the trial's copy");
 
         // One-time marks travel with the records.
         seed();
