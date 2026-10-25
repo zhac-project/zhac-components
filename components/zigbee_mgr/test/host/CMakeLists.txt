@@ -72,6 +72,7 @@ add_executable(zigbee_mgr_host_test
     stubs/zhc_adapter_stub.cpp
     stubs/nvs_stub.cpp
     stubs/nvs_u8_stub.cpp
+    stubs/zap_store_platform_stub.cpp
     ${ZIGBEE_MGR_SRCS}
     ${SUPPORT_SRCS}
 )

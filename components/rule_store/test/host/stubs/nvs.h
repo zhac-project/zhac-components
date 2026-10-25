@@ -15,6 +15,7 @@ esp_err_t nvs_get_u16(nvs_handle_t, const char*, uint16_t*);
 esp_err_t nvs_erase_key(nvs_handle_t, const char*);
 esp_err_t nvs_erase_all(nvs_handle_t);
 esp_err_t nvs_commit(nvs_handle_t);
+void      nvs_close(nvs_handle_t);
 esp_err_t nvs_entry_find(const char*, const char*, nvs_type_t, nvs_iterator_t*);
 esp_err_t nvs_entry_next(nvs_iterator_t*);
 esp_err_t nvs_entry_info(nvs_iterator_t, nvs_entry_info_t*);

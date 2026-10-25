@@ -3,5 +3,5 @@
 idf_component_register(
     SRCS "zap_store.cpp" "zap_store_flush.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES spi_flash nvs_flash zap_common freertos esp_timer
+    REQUIRES spi_flash nvs_flash esp_partition app_update zap_common freertos esp_timer
 )

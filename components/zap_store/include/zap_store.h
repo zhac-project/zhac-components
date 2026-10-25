@@ -17,9 +17,11 @@
 //
 //   2. `ZAP_STORE_SCHEMA_VERSION` — an integer stored under key
 //      "schema_ver" inside the namespace. Bumped whenever the on-flash
-//      `ZapDevice` layout changes. A mismatch at boot calls
+//      `ZapDevice` layout changes. An OLDER stored version at boot calls
 //      `nvs_erase_all()` on the namespace and writes the new version
-//      (devices re-pair) — this is the salvage-free migration path.
+//      (devices re-pair) — this is the salvage-free migration path. A
+//      NEWER stored version (this firmware is a downgrade) is left alone
+//      and the store stays shut: zap_store_is_ready() is false.
 //
 // When to do what:
 //   - Layout-only change (new field, reordered field, widened field):
@@ -37,11 +39,20 @@
 //     "zap_v0". Keeping unrelated keys in separate namespaces makes
 //     selective wipe and schema evolution independent per dataset.
 
-// Initialise NVS — call once from app_main before any other zap_store calls.
+// Open the device store — call once from app_main, after nvs_flash_init()
+// and before any other zap_store call. Never erases NVS: a store that cannot
+// be opened stays shut (zap_store_is_ready() false, nothing saved or loaded).
+// On a firmware that has a `zhac_data` NVS partition the store (and the
+// device_shadow cache) moves there from `nvs`, once; see zap_store.cpp.
 void zap_store_init();
 
 // Returns true if zap_store_init() has been called successfully.
 bool zap_store_is_ready();
+
+// The NVS partition the device store lives on: "zhac_data" after the move,
+// else "nvs". device_shadow keeps its cache on the same one. Valid after
+// zap_store_init().
+const char* zap_store_data_part();
 
 // Save a single device to NVS. Returns true on success.
 bool zap_store_save_device(const ZapDevice* dev);

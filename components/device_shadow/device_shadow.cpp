@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nvs_checked.h"
+#include "zap_store.h"     // zap_store_data_part: the cache lives beside the device store
 #include "esp_rom_crc.h"   // F26: esp_rom_crc32_le for blob integrity
 #include <cstring>
 #include <cstdio>
@@ -847,9 +848,19 @@ void device_shadow_init() {
     // and a same-value re-report won't refresh the tag — so wipe on upgrade and
     // let devices re-report as VAL_FLOAT.
     static constexpr uint8_t NVS_SHADOW_VERSION = 9;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
+    // Same partition as the device store (zhac_data on wired-core, WC-04).
+    if (nvs_open_from_partition(zap_store_data_part(), NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
-        if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
+        const bool have_ver = nvs_get_u8(s_nvs, "ver", &ver) == ESP_OK;
+        if (have_ver && ver > NVS_SHADOW_VERSION) {
+            // Written by a newer firmware (this one is a downgrade): keep it
+            // for that firmware and run from RAM (review 2026-10-24 PB-01).
+            ESP_LOGE(TAG, "shadow NVS format v%u is newer than this firmware's v%u -- "
+                          "not erased; the cache runs without persistence",
+                     (unsigned)ver, (unsigned)NVS_SHADOW_VERSION);
+            nvs_close(s_nvs);
+            s_nvs = 0;
+        } else if (!have_ver || ver != NVS_SHADOW_VERSION) {
             esp_err_t acc = ESP_OK;
             nvs_seq(&acc, nvs_erase_all(s_nvs), TAG, "erase_all shadow");
             if (acc == ESP_OK) {
