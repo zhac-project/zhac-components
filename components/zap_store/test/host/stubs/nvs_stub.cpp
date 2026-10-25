@@ -41,6 +41,7 @@ static std::map<std::string, esp_err_t>  g_init_result;      // nvs_flash_init_p
 static esp_ota_img_states_t              g_ota = ESP_OTA_IMG_VALID;
 static int                               g_writes_left = -1; // -1 = no cut
 static bool                              g_open_fails = false;
+static std::set<std::string>             g_part_fails;       // partitions that cannot be read at all
 
 static std::string full(const char* part, const char* ns) { return std::string(part) + "/" + ns; }
 static Ns* ns_of(nvs_handle_t h) {
@@ -55,7 +56,7 @@ static bool write_ok() {
 }
 
 esp_err_t nvs_open_from_partition(const char* part, const char* ns, nvs_open_mode_t mode, nvs_handle_t* out) {
-    if (g_open_fails) return ESP_FAIL;
+    if (g_open_fails || g_part_fails.count(part)) return ESP_FAIL;
     const std::string k = full(part, ns);
     if (mode == NVS_READONLY && !g_ns.count(k)) return ESP_ERR_NVS_NOT_FOUND;
     g_ns[k];
@@ -171,6 +172,7 @@ esp_err_t esp_ota_get_state_partition(const esp_partition_t*, esp_ota_img_states
 struct StubIter { std::string ns; std::vector<std::pair<std::string, nvs_type_t>> keys; size_t pos; };
 esp_err_t nvs_entry_find(const char* part, const char* ns, nvs_type_t type, nvs_iterator_t* out) {
     *out = nullptr;
+    if (g_part_fails.count(part)) return ESP_FAIL;
     auto n = g_ns.find(full(part, ns));
     if (n == g_ns.end()) return ESP_ERR_NVS_NOT_FOUND;
     auto* it = new StubIter{ns, {}, 0};
@@ -211,8 +213,11 @@ void vTaskDelay(TickType_t) {}
 
 // ── Test helpers ───────────────────────────────────────────────────────────
 extern "C" void nvs_stub_reset(void) {
-    g_ns.clear(); g_handles.clear(); g_parts.clear(); g_init_result.clear();
+    g_ns.clear(); g_handles.clear(); g_parts.clear(); g_init_result.clear(); g_part_fails.clear();
     g_ota = ESP_OTA_IMG_VALID; g_writes_left = -1; g_open_fails = false;
+}
+extern "C" void nvs_stub_part_fails(const char* part, bool f) {
+    if (f) g_part_fails.insert(part); else g_part_fails.erase(part);
 }
 extern "C" void nvs_stub_set_schema(uint16_t v) {
     nvs_handle_t h;

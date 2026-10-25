@@ -54,6 +54,18 @@ bool zap_store_is_ready();
 // zap_store_init().
 const char* zap_store_data_part();
 
+// Makes a move to zhac_data final. Call once the running image is marked
+// valid (it can no longer roll back to a build that reads the store from
+// nvs); a boot that is not an update's trial does it by itself. Two small
+// NVS writes; a no-op when the store is not on zhac_data.
+void zap_store_confirm_move();
+
+// One-time marks kept in the device store's namespace, so they travel with
+// the device records: copied with them to zhac_data, rolled back and reset
+// with them. `key`: up to 15 characters. set fails while the store is shut.
+bool zap_store_flag_get(const char* key);
+bool zap_store_flag_set(const char* key);
+
 // Save a single device to NVS. Returns true on success.
 bool zap_store_save_device(const ZapDevice* dev);
 

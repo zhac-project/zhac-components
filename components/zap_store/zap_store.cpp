@@ -31,14 +31,18 @@ static bool        s_ready = false;
 // pin, and the pool and shadow filled it at a few dozen devices. Firmwares
 // without it (main-core, mono) keep everything on `nvs`.
 //
-// The move is a copy. Both namespaces are copied from `nvs`, then "done" is
-// written on `zhac_data`; a cut before that mark copies again from scratch on
-// the next boot. The originals stay until zap_store_release_old_copy(), which
-// the firmware calls once its image can no longer roll back to a build that
-// reads them, and which leaves "moved" on `nvs`. From then on `zhac_data` holds
-// the only copy and is never erased on an init error.
+// The move is a copy, final only once the image that made it is confirmed:
+//   - both namespaces are copied from `nvs`, then "done" is set on `zhac_data`
+//     (cleared first, so a copy cut short is never taken for a whole one), and
+//     the store runs on `zhac_data`;
+//   - on an update's trial boot the originals stay: the build before finds
+//     them if the update rolls back, and the next trial copies afresh;
+//   - zap_store_confirm_move() (the image was marked valid) or a boot that is
+//     not a trial makes the move final: "live" on `zhac_data`, beside the data,
+//     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
+//     never copied over, never formatted, and leftovers on `nvs` are erased.
 static const char* DATA_PART = "zhac_data";
-static const char* MIG_NS    = "zap_mig";   // "done" on zhac_data, "moved" on nvs
+static const char* MIG_NS    = "zap_mig";   // "done"/"live" on zhac_data, "moved" on nvs
 static const char* s_part    = NVS_DEFAULT_PART_NAME;   // where the pool lives
 
 // F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
@@ -237,6 +241,32 @@ static bool mark_set(const char* part, const char* key) {
     return acc == ESP_OK;
 }
 
+static bool mark_clear(const char* part, const char* key) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, key);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+// The namespace holds at least one entry.
+static bool ns_present(const char* part, const char* ns) {
+    nvs_iterator_t it = nullptr;
+    const bool any = nvs_entry_find(part, ns, NVS_TYPE_ANY, &it) == ESP_OK;
+    nvs_release_iterator(it);
+    return any;
+}
+
+// The namespace can be read (or was never written) -- false when its
+// partition itself is unusable.
+static bool ns_readable(const char* part, const char* ns) {
+    nvs_handle_t h = 0;
+    const esp_err_t e = nvs_open_from_partition(part, ns, NVS_READONLY, &h);
+    if (e == ESP_OK) nvs_close(h);
+    return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;
+}
+
 // The first boot of an update, while it can still roll back to the build
 // before it (which reads the store from nvs).
 static bool image_on_trial() {
@@ -245,9 +275,17 @@ static bool image_on_trial() {
     return run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
 }
 
+static void erase_old_copy() {
+    if (!ns_present(NVS_DEFAULT_PART_NAME, NVS_NS) && !ns_present(NVS_DEFAULT_PART_NAME, zap_nvs::SHADOW)) return;
+    if (erase_ns(NVS_DEFAULT_PART_NAME, NVS_NS) && erase_ns(NVS_DEFAULT_PART_NAME, zap_nvs::SHADOW))
+        ESP_LOGI(TAG, "old device store on nvs erased (it lives on '%s')", DATA_PART);
+    else
+        ESP_LOGW(TAG, "the old device store on nvs could not be erased -- retry next boot");
+}
+
 // Picks the partition the store lives on, moving it there once (see the top
-// of this file). False when the only copy sits on a partition that cannot be
-// used: the store then stays shut.
+// of this file). False when the store of record sits on a partition that
+// cannot be used: the store then stays shut.
 static bool data_part_select() {
     s_part = NVS_DEFAULT_PART_NAME;
     const bool moved = mark_get(NVS_DEFAULT_PART_NAME, "moved");
@@ -255,9 +293,12 @@ static bool data_part_select() {
         if (moved) ESP_LOGE(TAG, "the device store lives on '%s', which this build does not have", DATA_PART);
         return !moved;
     }
+    // Before the move the store of record is on nvs, so nothing depends on
+    // zhac_data yet; after it (or with nothing on nvs, so zhac_data may hold
+    // the only copy) zhac_data is never formatted.
+    const bool before_move = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
     esp_err_t e = nvs_flash_init_partition(DATA_PART);
-    if (!moved && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
-        // Nothing depends on it yet (the store is still on nvs): start it clean.
+    if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
         ESP_LOGW(TAG, "'%s' not usable (%s) -- formatting it, the store is still on nvs",
                  DATA_PART, esp_err_to_name(e));
         e = nvs_flash_erase_partition(DATA_PART);
@@ -265,23 +306,30 @@ static bool data_part_select() {
     }
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "'%s' not usable: %s%s", DATA_PART, esp_err_to_name(e),
-                 moved ? " -- it holds the device store, which stays shut (not erased)"
-                       : " -- the store stays on nvs");
-        return !moved;
+                 before_move ? " -- the store stays on nvs"
+                             : " -- it may hold the device store, which stays shut (not erased)");
+        if (!before_move) s_part = DATA_PART;   // so the shadow cannot fill nvs meanwhile
+        return before_move;
     }
-    if (moved) {
+    if (moved || mark_get(DATA_PART, "live")) {
+        s_part = DATA_PART;
         if (!mark_get(DATA_PART, "done")) {
             ESP_LOGE(TAG, "'%s' lost the device store (no move mark) -- store shut; reset storage", DATA_PART);
             return false;
         }
-        s_part = DATA_PART;
+        zap_store_confirm_move();   // either mark may be missing: nvs was erased, or a write failed
+        erase_old_copy();           // confirmed at run time, or left by an older build since
         return true;
     }
-    // Until "moved", nvs holds the store of record: on an update's first boot
-    // it may have run on the build before (a rollback since the last copy).
+    // Not moved: nvs holds the store of record. If nvs itself cannot be read,
+    // leave zhac_data alone (the store then fails to open and stays shut).
+    if (!ns_readable(NVS_DEFAULT_PART_NAME, NVS_NS)) return true;
+    // On an update's first boot nvs may have run under the build before (a
+    // rollback since the last copy): copy afresh.
     const bool trial = image_on_trial();
     if (trial || !mark_get(DATA_PART, "done")) {
-        const bool ok = erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
+        const bool ok = mark_clear(DATA_PART, "done") &&
+                        erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW) &&
                         mark_set(DATA_PART, "done");
@@ -295,14 +343,40 @@ static bool data_part_select() {
         ESP_LOGI(TAG, "device store on '%s'; the copy on nvs stays until this update is confirmed", DATA_PART);
         return true;
     }
-    // This image cannot roll back any more: drop the originals.
-    if (erase_ns(NVS_DEFAULT_PART_NAME, NVS_NS) && erase_ns(NVS_DEFAULT_PART_NAME, zap_nvs::SHADOW) &&
-        mark_set(NVS_DEFAULT_PART_NAME, "moved")) {
-        ESP_LOGI(TAG, "device store moved to '%s'", DATA_PART);
-    } else {
-        ESP_LOGW(TAG, "the old device store on nvs could not be erased -- retry next boot");
-    }
+    zap_store_confirm_move();   // this image cannot roll back
+    erase_old_copy();
+    ESP_LOGI(TAG, "device store moved to '%s'", DATA_PART);
     return true;
+}
+
+void zap_store_confirm_move() {
+    if (s_part != DATA_PART) return;
+    // With the data first: an nvs that cannot be read later must not make a
+    // trial boot copy over the store of record.
+    if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
+        ESP_LOGW(TAG, "could not mark the move to '%s' final", DATA_PART);
+    if (!mark_get(NVS_DEFAULT_PART_NAME, "moved")) mark_set(NVS_DEFAULT_PART_NAME, "moved");
+}
+
+bool zap_store_flag_get(const char* key) {
+    uint8_t v = 0;
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(s_part, NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, key, &v);
+        nvs_close(h);
+    }
+    return v == 1;
+}
+
+bool zap_store_flag_set(const char* key) {
+    if (!s_ready) return false;
+    nvs_handle_t h = open_ns(NVS_READWRITE);
+    if (!h) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u8(h, key, 1), TAG, "set_u8 flag");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit flag");
+    nvs_close(h);
+    return acc == ESP_OK;
 }
 
 // A delete cut after its first write leaves the last record twice, in the
