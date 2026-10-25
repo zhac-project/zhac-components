@@ -10,7 +10,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"   // xTaskCreateWithCaps (non-S3 targets)
+#include "zhac_task.h"   // zhac_task_create: PSRAM stacks only where flash access is safe
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <cstdio>
@@ -427,21 +427,12 @@ void mqtt_gw_init() {
     if (!s_pubq) {
         s_pubq = xQueueCreate(MQTT_PUBQ_DEPTH, sizeof(PubItem*));
         if (s_pubq) {
-#if CONFIG_IDF_TARGET_ESP32S3
-            xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                         tskIDLE_PRIORITY + 3, nullptr);
-#else
-            // Single-chip builds on other targets (wired P4/S31) link this
-            // client too; their internal RAM is tighter, so the stack goes to
-            // PSRAM (the worker only publishes -- no flash writes). The S3
-            // keeps its measured, hardware-proven internal stack.
-            if (xTaskCreateWithCaps(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                                    tskIDLE_PRIORITY + 3, nullptr,
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-                xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                            tskIDLE_PRIORITY + 3, nullptr);
-            }
-#endif
+            // PSRAM only where the firmware runs from PSRAM (zhac_task.h): the
+            // S31. The wired P4 does not, and a flash access from a PSRAM stack
+            // panics there (review 2026-10-24 PB-09). The S3 keeps its measured,
+            // hardware-proven internal stack.
+            zhac_task_create(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
+                             tskIDLE_PRIORITY + 3, nullptr);
         }
     }
     // Do NOT start the MQTT client here. mqtt_gw_init runs unconditionally
