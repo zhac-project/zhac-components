@@ -381,6 +381,17 @@ int main() {
     add("tap", "ON cube#action=\"tap\" DO script.run tap ENDON");
     for (int i = 0; i < 25; i++) report_str(kCube, "action", "tap");
     CHECK(fires("tap") == 25, "a button rule is not held: a press does not feed back");
+    // A meter reports power, voltage and current in each frame: the wildcard
+    // fires once per attribute and is not held.
+    static constexpr uint64_t kMeter = 0xA100000000000009ULL;
+    seed_device(kMeter, "meter");
+    add("feed", "ON meter DO script.run feed ENDON");
+    for (int i = 0; i < 9; i++) {
+        report(kMeter, "power", VAL_INT, 100 + i);
+        report(kMeter, "voltage", VAL_INT, 230 + i);
+        report(kMeter, "current", VAL_INT, 400 + i);
+    }
+    CHECK(fires("feed") == 27, "the bare `ON <device>` wildcard is not held");
 
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");

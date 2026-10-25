@@ -750,15 +750,17 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
 // ── Run cap (review 2026-10-24 LU-03) ────────────────────────────────────
 // `ON lamp#state DO zigbee.toggle lamp state`: the toggle makes the lamp report
 // a new state, which is a change, which fires the rule again -- at radio speed,
-// forever. A rule on a device's state whose actions drive a device or run a
-// script runs at most kRunsPerMinute times a minute; past that it is held until
-// the minute is up. Holding one report ends such a loop for good, since nothing
-// is left to report. Buttons (momentary keys) and every other trigger cannot
-// feed back and are never held, nor is Run now.
+// forever. An edge-triggered rule (a device attribute, see has_edge) whose
+// actions drive a device or run a script runs at most kRunsPerMinute times a
+// minute; past that it is held until the minute is up. Holding one report ends
+// such a loop for good, since nothing is left to report. Never held: buttons
+// (momentary keys) and other triggers, which cannot feed back; the bare
+// `ON <device>` wildcard, which fires once per attribute of every report and
+// hands them to a script; and Run now.
 static constexpr uint16_t kRunsPerMinute = 20;
 
 static bool can_feed_back(const ParsedRule& r) {
-    if (r.trigger.type != TriggerType::DEVICE_ATTR || is_momentary(r.trigger.attr_key)) return false;
+    if (!has_edge(r.trigger)) return false;
     for (uint8_t i = 0; i < r.action_count; i++) {
         const ActionType t = r.actions[i].type;
         if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT)
