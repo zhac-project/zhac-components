@@ -108,6 +108,13 @@ static_assert(sizeof(ZapDevice) == 522);
 
 // ZapDevice.flags bits.
 static constexpr uint8_t ZAP_DEV_REMOVED = 1 << 0;  // soft-removed / hidden
+// One-time repair on the wired esp-zigbee backend (review 2026-10-24 ZR-01):
+// a hub whose network address is pinned bound devices and enrolled IAS
+// sensors to the radio's factory address. Set once for every matched device;
+// the next configure removes those binds (FIX_BINDS), the next frame from an
+// IAS device rewrites its CIE address (FIX_CIE). Each clears when done.
+static constexpr uint8_t ZAP_DEV_FIX_BINDS = 1 << 1;
+static constexpr uint8_t ZAP_DEV_FIX_CIE   = 1 << 2;
 
 static inline bool zap_dev_is_removed(const ZapDevice* d) {
     return d && (d->flags & ZAP_DEV_REMOVED);
