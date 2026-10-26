@@ -51,8 +51,9 @@ int verify(void* ctx, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
 uint8_t           s_pin[32];
 std::atomic<bool> s_pin_set{false};
 
-// Pinned: the server's own certificate must be the pinned one; what signed it and the name in it do not
-// matter, so the rest of the chain is not judged.
+// Pinned: the server's own certificate must be the pinned one; what signed it, the name in it and its
+// dates do not matter (no build-day floor either: the owner chose this certificate), so the rest of the
+// chain is not judged.
 int verify_broker(void* ctx, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
     if (!s_pin_set.load()) return verify(ctx, crt, depth, flags);
     if (depth > 0) { *flags = 0; return 0; }

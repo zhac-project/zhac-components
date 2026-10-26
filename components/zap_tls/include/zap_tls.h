@@ -5,10 +5,12 @@
 // esp_http_client, esp-tls, esp-mqtt and the websocket client. The pure rules are in zap_tls_policy.h.
 //
 //   zap_tls_attach         IDF's CA bundle (esp_crt_bundle_attach), and the certificate dates once the
-//                          clock is set (review 2026-10-24 HS-11; the build sets MBEDTLS_HAVE_TIME_DATE).
+//                          clock is set (review 2026-10-24 HS-11; the build sets MBEDTLS_HAVE_TIME_DATE);
+//                          whatever the clock says, no certificate that ended before the firmware's build
+//                          day (LOW round review M2).
 //   zap_tls_attach_broker  the MQTT broker: as zap_tls_attach, or, with a pin set, only the certificate
-//                          whose SHA-256 is the pin, whoever signed it and whatever name it carries (HS-13:
-//                          a home broker with its own CA or a self-signed certificate).
+//                          whose SHA-256 is the pin, whoever signed it and whatever name and dates it
+//                          carries (HS-13: a home broker with its own CA or a self-signed certificate).
 #pragma once
 
 #include <cstdint>
