@@ -36,7 +36,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_websocket_client.h"
-#include "esp_crt_bundle.h"
+#include "zap_tls.h"
 #include "ArduinoJson.h"
 
 #include "ws_server.h"  // ws_server_register_reply_hook
@@ -409,7 +409,7 @@ static void start_ws_client() {
     cfg.ping_interval_sec  = CONFIG_ZHAC_REMOTE_PING_INTERVAL_S;
     cfg.network_timeout_ms = 10 * 1000;
     cfg.disable_auto_reconnect = true;  // we run our own backoff
-    cfg.crt_bundle_attach  = esp_crt_bundle_attach;
+    cfg.crt_bundle_attach  = zap_tls_attach;   // the CA bundle; dates once the clock is set (HS-11)
     // The TLS handshake — including X.509 chain verification (RSA bignum, up to the RSA-4096
     // ISRG root for a Let's Encrypt cert) — runs in the esp_websocket_client task. The default
     // WEBSOCKET_TASK_STACK_SIZE (~4 KiB) overflows there: a plaintext endpoint bails before any
