@@ -96,6 +96,7 @@ bool mqtt_gw_is_secure()                       { return false; }  // F45: no loc
 void mqtt_gw_set_rx_callback(mqtt_rx_cb_t)     {}  // N/A on P4
 void mqtt_gw_subscribe(const char*, int)        {}  // N/A on P4
 void mqtt_gw_set_broker_url(const char*)        {}  // N/A on P4
+void mqtt_gw_set_tls_pin(const char*)           {}  // N/A on P4
 void mqtt_gw_set_client_id(const char*)         {}  // N/A on P4
 void mqtt_gw_set_root_topic(const char*)        {}  // N/A on P4
 const char* mqtt_gw_get_root_topic(void)        { return "zhac"; }

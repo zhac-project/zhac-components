@@ -23,6 +23,13 @@ bool mqtt_gw_publish(const char* topic, const char* payload, size_t payload_len,
 /* Reconfigure broker URL and restart client; no-op on P4 */
 void mqtt_gw_set_broker_url(const char* url);
 
+/* The SHA-256 the broker's certificate must have (64 hex digits, colons
+ * allowed), for an mqtts:// or wss:// broker with its own CA or a
+ * self-signed certificate (review 2026-10-24 HS-13): that certificate is
+ * then trusted whoever signed it and whatever name it carries. "" or null:
+ * the CA bundle, as before. Restarts a running client. No-op on P4. */
+void mqtt_gw_set_tls_pin(const char* hex);
+
 /* Start the MQTT client using the currently-configured broker URL and
  * client id. No-op when the client is already running. Clears the
  * auto-disable fail counter. Use after flipping the `mqtt_enabled`

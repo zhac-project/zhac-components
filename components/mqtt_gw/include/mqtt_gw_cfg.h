@@ -18,11 +18,13 @@
 // an address.
 void mqtt_gw_cfg_boot(void);
 
-// Settings write: broker_url, mqtt_root_topic, mqtt_client_id, mqtt_enabled.
+// Settings write: broker_url, mqtt_root_topic, mqtt_client_id, mqtt_enabled,
+// mqtt_tls_pin (the broker certificate's SHA-256; "" removes it).
 // Persists what is present and applies it live (a disabled client gets the
 // new URL from NVS when enabled).
 void mqtt_gw_cfg_apply(JsonDocument& doc);
 
 // Status / settings read: mqtt_enabled, mqtt_broker (user:pass stripped),
-// mqtt_client_id.
+// mqtt_client_id, mqtt_tls_pin, mqtt_cleartext_credentials (the stored URL
+// sends its user name and password without TLS).
 void mqtt_gw_cfg_fill_status(JsonObject d);

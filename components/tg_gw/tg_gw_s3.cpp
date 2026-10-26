@@ -7,7 +7,7 @@
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "zap_tls.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -275,7 +275,7 @@ static void tg_perform_send(const HapTgSend& m) {
     esp_http_client_config_t cfg = {};
     cfg.url            = url;
     cfg.method         = HTTP_METHOD_POST;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.crt_bundle_attach = zap_tls_attach;   // the CA bundle; dates once the clock is set
     cfg.timeout_ms     = 10000;
     cfg.disable_auto_redirect = true;
     cfg.buffer_size    = 1024;
