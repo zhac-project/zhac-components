@@ -376,7 +376,10 @@ static void handle_rx_frame(const char* data, size_t len) {
     bool local_only_key = false;   // remote_scripts, log_to_cloud: remote_allow.cpp kRemoteLocalOnlyKeys
     for (JsonPairConst kv : doc["args"].as<JsonObjectConst>())
         if (!kv.value().isNull() && remote_is_local_only_key(kv.key().c_str())) local_only_key = true;
-    if (const char* refusal = remote_cmd_refusal(cmd, local_only_key, remote_scripts_allowed())) {
+    const bool scripts_on = remote_scripts_allowed();
+    const char* refusal = remote_cmd_refusal(cmd, local_only_key, scripts_on);
+    if (!refusal) refusal = remote_rule_refusal(cmd, doc["args"]["dsl"] | (const char*)nullptr, scripts_on);   // LU-04
+    if (refusal) {
         char err_buf[96];
         int en = snprintf(err_buf, sizeof(err_buf),
             "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}", doc["id"] | 0, refusal);
