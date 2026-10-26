@@ -1194,11 +1194,13 @@ bool simple_rules_delete(uint16_t rule_id) {
 }
 
 bool simple_rules_enable(uint16_t rule_id, bool enabled) {
+    // Read, flip and write back under the lock update holds: an edit saved between this read and the
+    // write would otherwise be overwritten with the old text (review LU-06).
+    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     RuleSlot slot{};
-    if (!rule_store_load(rule_id, &slot)) return false;
+    if (!rule_store_load(rule_id, &slot)) { xSemaphoreGiveRecursive(s_mutex); return false; }
     slot.enabled = enabled ? 1 : 0;
     rule_store_mark_dirty(&slot);  // deferred NVS commit
-    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     for (uint16_t i = 0; i < s_rule_count; i++) {
         if (s_rules[i].rule_id == rule_id) {
             s_rules[i].enabled = enabled;
