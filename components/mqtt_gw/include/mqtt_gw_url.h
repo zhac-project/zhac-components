@@ -17,7 +17,8 @@ inline void mqtt_url_strip_userinfo(const char* in, char* out, size_t cap) {
     const char* host = sep ? sep + 3 : in;
     const char* at   = nullptr;
     for (const char* p = host; *p && *p != '/'; ++p) if (*p == '@') at = p;
-    std::snprintf(out, cap, "%.*s%s", (int)(host - in), in, at ? at + 1 : host);
+    // A URL longer than `cap` is cut; the result is checked so -Wformat-truncation sees it handled.
+    if (std::snprintf(out, cap, "%.*s%s", (int)(host - in), in, at ? at + 1 : host) < 0) out[0] = '\0';
 }
 
 // True when `sent` is the address the status shows for `stored`, its user name and password stripped:
