@@ -76,6 +76,9 @@ void device_cmd_permit_join_status(bool* open, int* remaining_s) {
 
 // ── Remove ──────────────────────────────────────────────────────────────
 
+static DevCmdRemovedFn s_removed = nullptr;
+void device_cmd_set_removed_hook(DevCmdRemovedFn fn) { s_removed = fn; }
+
 DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     if (!ieee) return DEVCMD_BAD_ARGS;
     ZapDevice snap{};
@@ -108,6 +111,7 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
         zhac_adapter_invalidate_def_cache(ieee);
         zhac_adapter_fallback_clear(ieee);
         zigbee_pool_remove(ieee);
+        if (s_removed) s_removed(ieee);   // the core's own records: options, group mirror (PB-08)
         ESP_LOGI(TAG, "removed 0x%016llX (hard)", static_cast<unsigned long long>(ieee));
     }
     // Gone from this hub, soft or hard: the web UI drops the row, Home

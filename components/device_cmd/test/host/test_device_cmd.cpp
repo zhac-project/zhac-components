@@ -16,6 +16,9 @@ static const uint64_t IEEE = 0x00158D0007A1B2C3ULL;
 
 static void arm() { stub_reset(); stub_pool_set(IEEE, 0x3F1A, 2, "TS0601", "_TZE200_abc"); }
 
+static int      g_removed_calls = 0;
+static uint64_t g_removed_ieee  = 0;
+
 int main() {
     // bool: adapter bool, shadow VAL_BOOL, device default endpoint, lock released before the send
     arm();
@@ -293,6 +296,17 @@ int main() {
     // soft remove of a device whose nwk is unknown (0) sends no leave to the coordinator
     arm(); stub_pool_set(IEEE, 0, 1, "m", "n");
     CHECK(device_cmd_remove(IEEE, false) == DEVCMD_OK && g_store.leave_reqs == 0, "no leave request to nwk 0 (that is the coordinator)");
+
+    // ── remove: the core's own per-device records (options, group mirror) go with a hard remove only (PB-08) ──
+    device_cmd_set_removed_hook([](uint64_t ieee) { g_removed_calls++; g_removed_ieee = ieee; });
+    arm(); g_removed_calls = 0;
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_OK && g_removed_calls == 0, "soft remove keeps the core's records (a rejoin keeps them)");
+    arm(); g_removed_calls = 0;
+    CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_removed_calls == 1 && g_removed_ieee == IEEE,
+          "hard remove calls the removed hook once, with the IEEE");
+    stub_reset(); stub_pool_clear(); g_removed_calls = 0;
+    CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_removed_calls == 1, "hard remove of an unknown device still clears the core's leftovers");
+    device_cmd_set_removed_hook(nullptr);
 
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("device_cmd contract: all checks passed\n");
