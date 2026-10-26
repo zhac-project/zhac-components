@@ -42,6 +42,31 @@ int main() {
           "empty, null and malformed: refused");
     CHECK(!zap_tls_pin_parse("a:bcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", again),
           "a colon inside a byte: refused");
+    char line[160];
+    std::snprintf(line, sizeof(line), "sha256 Fingerprint=%s\n", colons);
+    CHECK(zap_tls_pin_parse(line, again) && std::memcmp(pin, again, 32) == 0,
+          "openssl's whole line, \"sha256 Fingerprint=\" and all");
+
+    // Certificate times as UTC seconds, and the firmware's build day as a floor (LOW review M2).
+    CHECK(zap_utc_seconds(1970, 1, 1, 0, 0, 0) == 0 && zap_utc_seconds(2026, 10, 26, 0, 0, 0) == 1792972800 &&
+          zap_utc_seconds(2000, 3, 1, 12, 30, 15) == 951913815 && zap_utc_seconds(2024, 2, 29, 23, 59, 59) == 1709251199,
+          "civil date-times to UTC seconds, leap day included");
+    CHECK(zap_build_day("Oct 26 2026") == 1792972800 && zap_build_day("Oct  6 2026") == 1791244800,
+          "the build day as __DATE__ writes it, a padded day too");
+    CHECK(zap_build_day("") == 0 && zap_build_day(nullptr) == 0 && zap_build_day("Foo 26 2026") == 0 &&
+          zap_build_day("Oct 26 20") == 0, "a date that does not parse gives no floor");
+    constexpr uint32_t kExpired = 0x01;
+    const int64_t built = 1792972800;   // 2026-10-26
+    CHECK(zap_tls_cert_flags(0, kDates, kExpired, 0, built - 86400, built) == kExpired,
+          "clock not set: a certificate that ended before the build day has still expired");
+    CHECK(zap_tls_cert_flags(0, kDates, kExpired, kZapClockSetAfter + 1000, built - 86400, built) == kExpired,
+          "a clock set back into its validity does not bring it back");
+    CHECK(zap_tls_cert_flags(kDates, kDates, kExpired, 0, built + 86400, built) == 0,
+          "clock not set, ends after the build: the dates are left out as before");
+    CHECK(zap_tls_cert_flags(kOther, kDates, kExpired, 0, built - 86400, 0) == kOther,
+          "no build day known: no floor");
+    CHECK(zap_tls_cert_flags(0, kDates, kExpired, 0, zap_utc_seconds(0, 1, 1, 0, 0, 0), built) == 0,
+          "a time before 1970 (IDF's synthetic bundle roots carry year 0) is not judged");
 
     // A broker URL that sends its user name and password in clear (HS-13: Settings warns).
     CHECK(zap_url_cleartext_credentials("mqtt://user:pass@192.168.1.10:1883"), "mqtt:// with user:pass@");

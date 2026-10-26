@@ -25,10 +25,52 @@ inline uint32_t zap_tls_date_flags(uint32_t flags, uint32_t date_bits, time_t no
     return zap_clock_is_set(now) ? flags : (flags & ~date_bits);
 }
 
+// UTC seconds of a civil date and time (proleptic Gregorian; days_from_civil), for certificate times.
+inline int64_t zap_utc_seconds(int y, int m, int d, int hh, int mm, int ss) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const int64_t yoe = y - era * 400;
+    const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+// The start (UTC) of the day this firmware was built, from esp_app_desc_t::date as __DATE__ writes it
+// ("Oct 26 2026", "Oct  6 2026"); 0 when it does not parse.
+inline int64_t zap_build_day(const char* date) {
+    static const char kMon[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    if (!date || std::strlen(date) != 11 || date[3] != ' ' || date[6] != ' ') return 0;
+    int m = 0;
+    while (m < 12 && std::strncmp(kMon + 3 * m, date, 3) != 0) m++;
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (m == 12 || !digit(date[5]) || !(date[4] == ' ' || digit(date[4]))) return 0;
+    const int d = (date[4] == ' ' ? 0 : date[4] - '0') * 10 + (date[5] - '0');
+    int y = 0;
+    for (int i = 7; i < 11; i++) {
+        if (!digit(date[i])) return 0;
+        y = y * 10 + (date[i] - '0');
+    }
+    return d >= 1 && d <= 31 ? zap_utc_seconds(y, m + 1, d, 0, 0, 0) : 0;
+}
+
+// What the hub makes of one certificate's date flags (`date_bits` = BADCERT_EXPIRED | BADCERT_FUTURE):
+// left out while the clock is not set, as zap_tls_date_flags; and, whatever the clock says, a certificate
+// that ended (`not_after`, UTC seconds) before the day this firmware was built has expired, so a clock set
+// back by whoever answers NTP cannot bring it back (LOW review M2). No floor when the build day is unknown;
+// a time before 1970 (IDF's synthetic bundle roots carry year 0) is not judged.
+inline uint32_t zap_tls_cert_flags(uint32_t flags, uint32_t date_bits, uint32_t expired_bit, time_t now,
+                                   int64_t not_after, int64_t built_day) {
+    flags = zap_tls_date_flags(flags, date_bits, now);
+    if (built_day > 0 && not_after > 0 && not_after < built_day) flags |= expired_bit;
+    return flags;
+}
+
 // 32 bytes from 64 hex digits, either case, optionally with a colon between bytes; spaces around the
-// whole are ignored. False for anything else.
+// whole are ignored, and so is a label up to an '=' (openssl prints "sha256 Fingerprint=AB:CD:..").
+// False for anything else.
 inline bool zap_tls_pin_parse(const char* s, uint8_t out[32]) {
     if (!s) return false;
+    if (const char* eq = std::strrchr(s, '=')) s = eq + 1;
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
     auto nib = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';

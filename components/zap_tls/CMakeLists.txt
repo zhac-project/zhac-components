@@ -6,5 +6,5 @@
 idf_component_register(
     SRCS "zap_tls.cpp"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES mbedtls zap_common
+    PRIV_REQUIRES mbedtls zap_common esp_app_format   # esp_app_get_description: the build day
 )

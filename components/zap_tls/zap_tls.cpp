@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ctime>
 
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "mbedtls/ssl.h"
@@ -27,10 +28,23 @@ namespace {
 
 constexpr uint32_t kDateBits = MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE;
 
+// The start of the day this firmware was built: no certificate that ended before it is valid, whatever
+// the clock says (zap_tls_cert_flags). 0 when the build carries no date.
+int64_t built_day() {
+    static const int64_t day = [] {
+        const esp_app_desc_t* app = esp_app_get_description();
+        return app ? zap_build_day(app->date) : int64_t{0};
+    }();
+    return day;
+}
+
 // The dates go first: the bundle's callback looks up the trust anchor only for a link whose sole fault
 // is "not trusted", and before the clock is set every certificate also reads "not yet valid".
 int verify(void* ctx, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
-    *flags = zap_tls_date_flags(*flags, kDateBits, time(nullptr));
+    const mbedtls_x509_time& t = crt->valid_to;
+    const int64_t not_after = zap_utc_seconds(t.year, t.mon, t.day, t.hour, t.min, t.sec);
+    *flags = zap_tls_cert_flags(*flags, kDateBits, MBEDTLS_X509_BADCERT_EXPIRED, time(nullptr), not_after,
+                                built_day());
     return esp_crt_verify_callback(ctx, crt, depth, flags);
 }
 

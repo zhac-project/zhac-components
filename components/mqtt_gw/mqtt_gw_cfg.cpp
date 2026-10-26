@@ -10,6 +10,7 @@
 
 #include "esp_log.h"
 #include "mqtt_gw.h"
+#include "mqtt_gw_url.h"
 #include "nvs.h"
 #include "zap_tls_policy.h"
 
@@ -68,17 +69,6 @@ void write_u8(const char* key, uint8_t v) {
     nvs_close(h);
 }
 
-// mqtt://user:pass@host:1883 -> mqtt://host:1883, for status and logs.
-void strip_userinfo(const char* in, char* out, size_t cap) {
-    out[0] = '\0';
-    if (!in || !in[0]) return;
-    const char* sep  = strstr(in, "://");
-    const char* host = sep ? sep + 3 : in;
-    const char* at   = nullptr;
-    for (const char* p = host; *p && *p != '/'; ++p) if (*p == '@') at = p;
-    snprintf(out, cap, "%.*s%s", (int)(host - in), in, at ? at + 1 : host);
-}
-
 }  // namespace
 
 void mqtt_gw_cfg_boot(void) {
@@ -88,7 +78,7 @@ void mqtt_gw_cfg_boot(void) {
     if (c.enabled && c.url[0]) mqtt_gw_configure(c.url, c.root, c.cid);
     else if (c.cid[0])         mqtt_gw_set_client_id(c.cid);
     char safe[128];
-    strip_userinfo(c.url, safe, sizeof(safe));
+    mqtt_url_strip_userinfo(c.url, safe, sizeof(safe));
     ESP_LOGI(TAG, "MQTT %s broker=%s root=%s", (c.enabled && c.url[0]) ? "enabled" : "disabled",
              safe[0] ? safe : "(none)", mqtt_gw_get_root_topic());
 }
@@ -112,10 +102,16 @@ void mqtt_gw_cfg_apply(JsonDocument& doc) {
     }
     if (cid && cid[0] && strlen(cid) < 32)    { write_str("client_id", cid);   mqtt_gw_set_client_id(cid); }
     if (url && url[0] && strlen(url) < 127) {
-        write_str("broker_url", url);
+        const Cfg stored = read_cfg();
+        // The address the status showed, without its user name and password,
+        // sent back: the broker is unchanged, so the stored URL with them stays
+        // (review LOW M6). Otherwise a Save of any other field lost them.
+        const bool echo = mqtt_url_is_echo(url, stored.url);
+        if (!echo) write_str("broker_url", url);
         // Only a running client picks it up now; a disabled one gets it from
-        // NVS when enabled (mqtt_gw_configure would arm it).
-        if (read_cfg().enabled) mqtt_gw_set_broker_url(url);
+        // NVS when enabled (mqtt_gw_configure would arm it). A save of the
+        // same address reconnects, as it always did.
+        if (stored.enabled) mqtt_gw_set_broker_url(echo ? stored.url : url);
     }
     if (doc["mqtt_enabled"].is<bool>()) {
         const bool en = doc["mqtt_enabled"].as<bool>();
@@ -134,7 +130,7 @@ void mqtt_gw_cfg_fill_status(JsonObject d) {
     // `char*`, and `c` dies before the document is serialised.
     Cfg c = read_cfg();
     char safe[128];
-    strip_userinfo(c.url, safe, sizeof(safe));
+    mqtt_url_strip_userinfo(c.url, safe, sizeof(safe));
     d["mqtt_enabled"]   = c.enabled != 0;
     d["mqtt_broker"]    = safe;
     d["mqtt_client_id"] = c.cid;
