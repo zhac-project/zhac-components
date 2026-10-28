@@ -12,6 +12,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -124,6 +125,50 @@ int main() {
     g_ws_frame_len = 0;
     g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
     g_close_fn(nullptr, 111);
+
+    // ── R-04 (review 2026-10-28): a trickled frame ends its session ────────
+    // Each byte arrives just inside the 3 s receive timeout; only a deadline on
+    // the whole frame stops one frame holding the httpd task (an 8 KB frame:
+    // about 7 h). Two sockets: one trickles past 8 s, one sends two frames of
+    // 5 s each (the deadline is per frame, not per session).
+    {
+        char bytes[200];
+        std::memset(bytes, 'y', sizeof(bytes));
+        g_fd_info_result = HTTPD_WS_CLIENT_WEBSOCKET;
+
+        int slow[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, slow);
+        (void)g_open_fn(nullptr, slow[0]);
+        add_client(slow[0]);
+        httpd_req_t fs{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(slow[0]))};
+        (void)!write(slow[1], bytes, 100);
+        g_ws_trickle_us = 2'900'000;
+        g_ws_frame_len = 100;
+        s_rx_len = 0;
+        CHECK(g_ws_uri->handler(&fs) == ESP_FAIL && s_rx_len == 0,
+              "a frame trickled past 8 s fails its session");
+        g_ws_frame_len = 0;
+        g_close_fn(nullptr, slow[0]);
+        close(slow[1]);
+
+        int ok[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, ok);
+        (void)g_open_fn(nullptr, ok[0]);
+        add_client(ok[0]);
+        httpd_req_t fo{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(ok[0]))};
+        (void)!write(ok[1], bytes, 200);
+        g_ws_trickle_us = 50'000;                // 100 bytes: 5 s
+        g_ws_frame_len = 100;
+        s_rx_len = 0;
+        const bool first = g_ws_uri->handler(&fo) == ESP_OK && s_rx_len == 100;
+        g_ws_frame_len = 100;
+        s_rx_len = 0;
+        CHECK(first && g_ws_uri->handler(&fo) == ESP_OK && s_rx_len == 100,
+              "frames that each arrive within 8 s pass, however long the session");
+        g_ws_trickle_us = 0;
+        g_close_fn(nullptr, ok[0]);
+        close(ok[1]);
+    }
 
     std::printf("%s (%d failure(s))\n", s_fail ? "FAILED" : "ALL PASS", s_fail);
     return s_fail ? 1 : 0;

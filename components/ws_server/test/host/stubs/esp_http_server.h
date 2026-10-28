@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "esp_timer.h"   // g_now_us, for the trickled frame below
+
 typedef int esp_err_t;
 #define ESP_OK          0
 #define ESP_FAIL        (-1)
@@ -63,7 +65,12 @@ inline esp_err_t httpd_query_key_value(const char*, const char*, char*, size_t) 
 // sets g_ws_frame_len back to 0.
 inline size_t g_ws_frame_len = 0;
 inline httpd_ws_type_t g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
-inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t* f, size_t max_len) {
+// Review 2026-10-28 R-04: when set, the payload is read through the session's
+// read function a byte at a time, the clock moving g_ws_trickle_us per byte --
+// a client sending each byte just inside the receive timeout. A failed read
+// fails the frame, as in IDF's httpd_ws_recv_frame.
+inline int64_t g_ws_trickle_us = 0;
+inline esp_err_t httpd_ws_recv_frame(httpd_req_t* req, httpd_ws_frame_t* f, size_t max_len) {
     if (!g_ws_frame_len) return ESP_FAIL;
     if (f->len == 0) {
         f->type = g_ws_frame_type;
@@ -71,6 +78,15 @@ inline esp_err_t httpd_ws_recv_frame(httpd_req_t*, httpd_ws_frame_t* f, size_t m
         if (max_len == 0) return ESP_OK;
     }
     if (f->len > max_len || !f->payload) return ESP_FAIL;
+    if (g_ws_trickle_us) {
+        for (size_t i = 0; i < f->len; i++) {
+            g_now_us += g_ws_trickle_us;
+            if (g_recv_override(nullptr, httpd_req_to_sockfd(req), reinterpret_cast<char*>(f->payload) + i, 1, 0) <= 0)
+                return ESP_FAIL;
+        }
+        g_ws_frame_len = 0;
+        return ESP_OK;
+    }
     for (size_t i = 0; i < f->len; i++) f->payload[i] = 'x';
     g_ws_frame_len = 0;
     return ESP_OK;

@@ -324,6 +324,8 @@ static esp_err_t ws_post_handshake(httpd_req_t* req) {
 }
 #endif
 
+static void ws_frame_clock(int fd, bool start);   // the frame deadline (R-04), with the request clocks below
+
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
     if (req->method == HTTP_GET) {
@@ -331,6 +333,13 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         register_client(req, fd);
         return ESP_OK;
     }
+    // The rest of the frame (header and payload) must arrive within the
+    // request deadline: httpd_ws_recv_frame reads through deadline_recv.
+    struct FrameClock {
+        int fd;
+        explicit FrameClock(int f) : fd(f) { ws_frame_clock(fd, true); }
+        ~FrameClock() { ws_frame_clock(fd, false); }
+    } frame_clock(fd);
 
     // Safety net, and the ONLY registration that works on IDF 6.1 when
     // CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT is off: adopt any socket that
@@ -424,11 +433,13 @@ static const httpd_uri_t s_ws_uri = {
 // HTTP request now has kRequestDeadlineUs from its first byte to its answer;
 // past that its reads fail and httpd closes the session. The clock starts at
 // a request's first read and stops when the hub sends anything back; a session
-// upgraded to WebSocket is exempt (its frames are read as they come). All of
+// upgraded to WebSocket has no request clock, but each of its frames gets the
+// same deadline (ws_frame_clock, R-04). All of
 // this runs on the httpd task (reads, answers, open and close), so the table
 // needs no lock; WS frames sent from other tasks leave it alone.
 static constexpr int64_t kRequestDeadlineUs = 8 * 1000 * 1000;
-struct ReqClock { int fd; int64_t start_us; };   // fd 0 = free slot; start 0 = no request running
+// fd 0 = free slot; start 0 = no request running; frame 0 = no WS frame being read
+struct ReqClock { int fd; int64_t start_us; int64_t frame_us; };
 static ReqClock s_clock[16];                     // >= max_open_sockets
 
 static ReqClock* clock_of(int fd, bool add) {
@@ -437,8 +448,16 @@ static ReqClock* clock_of(int fd, bool add) {
         if (c.fd == fd) return &c;
         if (!c.fd && !free_slot) free_slot = &c;
     }
-    if (add && free_slot) { free_slot->fd = fd; free_slot->start_us = 0; return free_slot; }
+    if (add && free_slot) { *free_slot = ReqClock{fd, 0, 0}; return free_slot; }
     return nullptr;
+}
+
+// Review 2026-10-28 R-04: a WebSocket frame gets the same deadline, from the
+// start of its read in ws_handler to its end. The exemption above let a client
+// trickle a byte per receive timeout through a whole 8 KB frame (about 7 h) with
+// the httpd task held, and the sign-in sweep's close only queued behind it.
+static void ws_frame_clock(int fd, bool start) {
+    if (ReqClock* c = clock_of(fd, start)) c->frame_us = start ? esp_timer_get_time() : 0;
 }
 
 // httpd's own socket errors (IDF httpd_txrx.c httpd_sock_err).
@@ -462,6 +481,9 @@ static int deadline_recv(httpd_handle_t hd, int fd, char* buf, size_t len, int f
             if (!c->start_us) c->start_us = now;
             else if (now - c->start_us > kRequestDeadlineUs) return HTTPD_SOCK_ERR_FAIL;
         }
+    } else if (ReqClock* c = clock_of(fd, false);
+               c && c->frame_us && esp_timer_get_time() - c->frame_us > kRequestDeadlineUs) {
+        return HTTPD_SOCK_ERR_FAIL;   // the frame ran past its deadline (R-04): httpd ends the session
     }
     const int r = recv(fd, buf, len, flags);
     return r < 0 ? sock_err() : r;
