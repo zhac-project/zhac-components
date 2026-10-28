@@ -74,6 +74,7 @@ struct DirtySlot {
     uint8_t  pri;
     uint8_t  state;      // SlotState
     bool     remarked;   // mark_dirty landed while FLUSHING — newer data pending
+    bool     cancelled;  // deleted while FLUSHING — the write is taken back (R-11)
 };
 }  // namespace
 
@@ -136,8 +137,9 @@ static FlushOutcome flush_slot(size_t idx, const uint64_t* expect_ieee = nullptr
         return FlushOutcome::Settled;   // nothing (of ours) pending here
     }
     snap = s_dirty[idx];
-    s_dirty[idx].state    = SLOT_FLUSHING;  // own it for the I/O window
-    s_dirty[idx].remarked = false;
+    s_dirty[idx].state     = SLOT_FLUSHING;  // own it for the I/O window
+    s_dirty[idx].remarked  = false;
+    s_dirty[idx].cancelled = false;
     xSemaphoreGive(s_mtx);
 
     bool persisted = false;
@@ -158,6 +160,14 @@ static FlushOutcome flush_slot(size_t idx, const uint64_t* expect_ieee = nullptr
         }
     }
 
+    // The device was deleted while this write ran: take the write back, or the
+    // deleted device returns at the next boot (review 2026-10-28 R-11). The
+    // delete marks the slot cancelled again; the settle below frees it.
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    const bool cancelled = s_dirty[idx].cancelled;
+    xSemaphoreGive(s_mtx);
+    if (cancelled && persisted) zap_store_delete_device(snap.ieee);
+
     // Settle. Only we (the FLUSHING owner) may free the slot; mark_dirty
     // can't have re-issued it to another IEEE meanwhile (not FREE), so
     // `remarked` unambiguously means "newer data arrived during the write".
@@ -167,13 +177,29 @@ static FlushOutcome flush_slot(size_t idx, const uint64_t* expect_ieee = nullptr
         // (marked_ms is pre-write → due immediately).
         s_dirty[idx].state    = SLOT_DIRTY;
         s_dirty[idx].remarked = false;
-    } else if (persisted || dropped) {
+    } else if (persisted || dropped || cancelled) {
         s_dirty[idx].state = SLOT_FREE;
     } else {
         s_dirty[idx].state = SLOT_DIRTY;    // failed write → retry next tick
     }
+    s_dirty[idx].cancelled = false;
     xSemaphoreGive(s_mtx);
-    return (persisted || dropped) ? FlushOutcome::Settled : FlushOutcome::Retry;
+    return (persisted || dropped || cancelled) ? FlushOutcome::Settled : FlushOutcome::Retry;
+}
+
+void zap_store_flush_cancel(uint64_t ieee) {
+    if (!s_mtx || ieee == 0) return;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    const int slot = find_slot_locked(ieee);
+    if (slot >= 0) {
+        if (s_dirty[slot].state == SLOT_DIRTY) {
+            s_dirty[slot].state = SLOT_FREE;        // queued: never written
+        } else {
+            s_dirty[slot].cancelled = true;         // in flight: flush_slot takes it back
+            s_dirty[slot].remarked  = false;        // data marked before the delete is moot
+        }
+    }
+    xSemaphoreGive(s_mtx);
 }
 
 void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {

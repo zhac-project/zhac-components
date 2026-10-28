@@ -42,6 +42,7 @@ static esp_ota_img_states_t              g_ota = ESP_OTA_IMG_VALID;
 static int                               g_writes_left = -1; // -1 = no cut
 static bool                              g_open_fails = false;
 static std::set<std::string>             g_part_fails;       // partitions that cannot be read at all
+static std::set<std::string>             g_fail_keys;        // keys whose writes fail (a full partition)
 
 static std::string full(const char* part, const char* ns) { return std::string(part) + "/" + ns; }
 static Ns* ns_of(nvs_handle_t h) {
@@ -73,6 +74,7 @@ void      nvs_close(nvs_handle_t) {}
 static esp_err_t put(nvs_handle_t h, const char* key, nvs_type_t type, const void* p, size_t len) {
     Ns* ns = ns_of(h);
     if (!ns) return ESP_ERR_INVALID_ARG;
+    if (g_fail_keys.count(key)) return ESP_ERR_NVS_NO_FREE_PAGES;
     if (!write_ok()) return ESP_FAIL;
     const uint8_t* b = static_cast<const uint8_t*>(p);
     (*ns)[key] = Entry{type, std::vector<uint8_t>(b, b + len)};
@@ -214,7 +216,11 @@ void vTaskDelay(TickType_t) {}
 // ── Test helpers ───────────────────────────────────────────────────────────
 extern "C" void nvs_stub_reset(void) {
     g_ns.clear(); g_handles.clear(); g_parts.clear(); g_init_result.clear(); g_part_fails.clear();
+    g_fail_keys.clear();
     g_ota = ESP_OTA_IMG_VALID; g_writes_left = -1; g_open_fails = false;
+}
+extern "C" void nvs_stub_fail_key(const char* key, bool f) {
+    if (f) g_fail_keys.insert(key); else g_fail_keys.erase(key);
 }
 extern "C" void nvs_stub_part_fails(const char* part, bool f) {
     if (f) g_part_fails.insert(part); else g_part_fails.erase(part);

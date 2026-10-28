@@ -346,19 +346,26 @@ static bool data_part_select() {
         ESP_LOGI(TAG, "device store on '%s'; the copy on nvs stays until this update is confirmed", DATA_PART);
         return true;
     }
-    zap_store_confirm_move();   // this image cannot roll back
+    if (!zap_store_confirm_move()) {   // this image cannot roll back
+        // With neither mark the next boot copies nvs over zhac_data again, so
+        // nvs stays the store of record until a mark sticks (review R-03).
+        s_part = NVS_DEFAULT_PART_NAME;
+        ESP_LOGW(TAG, "could not mark the move to '%s' -- the store stays on nvs, retry next boot", DATA_PART);
+        return true;
+    }
     erase_old_copy();
     ESP_LOGI(TAG, "device store moved to '%s'", DATA_PART);
     return true;
 }
 
-void zap_store_confirm_move() {
-    if (s_part != DATA_PART) return;
+bool zap_store_confirm_move() {
+    if (s_part != DATA_PART) return false;
     // With the data first: an nvs that cannot be read later must not make a
     // trial boot copy over the store of record.
     if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
         ESP_LOGW(TAG, "could not mark the move to '%s' final", DATA_PART);
     if (!mark_get(NVS_DEFAULT_PART_NAME, "moved")) mark_set(NVS_DEFAULT_PART_NAME, "moved");
+    return mark_get(DATA_PART, "live") || mark_get(NVS_DEFAULT_PART_NAME, "moved");
 }
 
 bool zap_store_flag_get(const char* key) {
@@ -582,6 +589,9 @@ bool zap_store_delete_device(uint64_t ieee) {
     bool      ok    = false;
     uint16_t  count = 0;
     ZapDevice* tail = nullptr;
+    // Before the delete: a write of this device still queued or in flight
+    // would land after it and bring the device back (review 2026-10-28 R-11).
+    zap_store_flush_cancel(ieee);
     store_lock();   // F16: serialise with save + protect the IEEE index
     do {
         if (!s_ready || ieee == 0) break;

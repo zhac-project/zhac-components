@@ -58,6 +58,7 @@ extern "C" void nvs_stub_ota_state(int st);
 extern "C" void nvs_stub_cut_after(int writes);           // power cut after n writes; -1 = none
 extern "C" void nvs_stub_open_fails(bool f);
 extern "C" void nvs_stub_part_fails(const char* part, bool f);   // a partition that cannot be read at all
+extern "C" void nvs_stub_fail_key(const char* key, bool f);      // writes of this key fail (partition full)
 extern "C" int  nvs_stub_count(const char* part, const char* ns);
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -89,10 +90,19 @@ static bool pool_has(const ZapDevice* pool, uint16_t n, uint64_t ieee) {
 // The flush layer stores only the dirty IEEE; at flush time it calls back for
 // the current device state. This map is that "live pool".
 static std::map<uint64_t, ZapDevice> g_live;
+// R-11: when set, the snapshot of this IEEE is taken and THEN the device is
+// hard-deleted (pool entry and record) before the flusher writes it -- what a
+// concurrent device_cmd_remove does in that gap on the real chip.
+static uint64_t g_delete_during_snapshot = 0;
 static bool test_snapshot(uint64_t ieee, ZapDevice* out) {
     auto it = g_live.find(ieee);
     if (it == g_live.end()) return false;   // device gone → flush drops it
     *out = it->second;
+    if (ieee == g_delete_during_snapshot) {
+        g_delete_during_snapshot = 0;
+        g_live.erase(ieee);
+        (void)zap_store_delete_device(ieee);
+    }
     return true;
 }
 
@@ -322,6 +332,35 @@ int main() {
         ZapDevice pool[4]{};
         CHECK(zap_store_load_devices(pool, 4) == 0,
               "flush drops the dirty entry when snapshot reports the device gone");
+    }
+
+    // ── G12b: a deleted device stays deleted (review 2026-10-28 R-11) ──────
+    {
+        fresh_store();
+        ZapDevice r = make_dev(0x0505ULL, 0x0E0E, "removed mid-flush");
+        g_live[0x0505ULL] = r;
+        zap_store_mark_dirty(&r, ZAP_PERSIST_HIGH);
+        zap_store_flush_now();                      // on flash once
+        r.nwk_addr = 0x0E0F;                        // a later change, then the remove
+        g_live[0x0505ULL] = r;
+        zap_store_mark_dirty(&r, ZAP_PERSIST_HIGH);
+        g_delete_during_snapshot = 0x0505ULL;
+        // flush_device, not flush_now: flush_now first saves last_seen, whose
+        // snapshot would fire the delete before any write is in flight.
+        (void)zap_store_flush_device(0x0505ULL);    // snapshot, the delete, then the write
+        ZapDevice pool[4]{};
+        CHECK(zap_store_load_devices(pool, 4) == 0,
+              "a device deleted while its flush was writing stays deleted");
+
+        // A write still queued when the device is deleted is dropped, even
+        // while its pool entry lingers.
+        ZapDevice q = make_dev(0x0606ULL, 0x0F0F, "queued");
+        g_live[0x0606ULL] = q;
+        zap_store_mark_dirty(&q, ZAP_PERSIST_LOW);
+        (void)zap_store_delete_device(0x0606ULL);
+        zap_store_flush_now();
+        g_live.erase(0x0606ULL);
+        CHECK(zap_store_load_devices(pool, 4) == 0, "a write queued before the delete is dropped");
     }
 
     // ── G13: uplink selector — absent key, round-trip, OOR fallback ────────
@@ -673,6 +712,25 @@ int main() {
         zap_store_init();                           // a plain boot: moved
         CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_flag_get("repair"),
               "a store flag moves to zhac_data with the device records");
+
+        // Review 2026-10-28 R-03: a plain first boot whose two move marks both
+        // fail (both partitions full: an erase needs no space). The old copy
+        // must stay, or the next boot copies an empty nvs over the moved store.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        zap_store_init();                           // a plain boot: copied, both marks fail
+        CHECK(nvs_stub_count("nvs", "zap_v0") > 0, "unwritable move marks: the copy on nvs stays");
+        ZapDevice g = make_dev(0x07ULL, 7, "paired meanwhile");
+        CHECK(zap_store_save_device(&g), "unwritable move marks: the store still saves");
+        nvs_stub_fail_key("live", false);
+        nvs_stub_fail_key("moved", false);
+        zap_store_init();                           // the next boot, storage writable again
+        CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x07ULL),
+              "unwritable move marks: every device survives the next boot");
+        CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && nvs_stub_count("nvs", "zap_v0") == 0,
+              "... which finishes the move");
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();

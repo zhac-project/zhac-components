@@ -106,11 +106,14 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     if (!hard) {
         zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
     } else {
+        // Out of the pool first: a flush that has not copied the device yet
+        // then drops it, and the store delete takes back one already writing
+        // (review 2026-10-28 R-11).
+        zigbee_pool_remove(ieee);
         zap_store_delete_device(ieee);
         device_shadow_remove(ieee);
         zhac_adapter_invalidate_def_cache(ieee);
         zhac_adapter_fallback_clear(ieee);
-        zigbee_pool_remove(ieee);
         if (s_removed) s_removed(ieee);   // the core's own records: options, group mirror (PB-08)
         ESP_LOGI(TAG, "removed 0x%016llX (hard)", static_cast<unsigned long long>(ieee));
     }
