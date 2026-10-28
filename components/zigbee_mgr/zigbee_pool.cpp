@@ -244,6 +244,10 @@ uint16_t zigbee_pool_restore_persisted() {
         ESP_LOGW("zigbee_pool", "restore skipped — zap_store not ready");
         return 0;
     }
+    // The pool lock, then the store lock inside zap_store_load_devices: the
+    // reverse of zap_store_save_live's order (store, then pool). Safe because
+    // this runs once at boot, before any deferred device-store write is queued;
+    // a restore at run time could deadlock against the flush task (fix review N2).
     lock();
     const uint16_t n = zap_store_load_devices(s_pool, ZAP_MAX_DEVICES);
     s_pool_count  = n;

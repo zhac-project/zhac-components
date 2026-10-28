@@ -1039,9 +1039,10 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
 
 void device_shadow_flush_now() {
     if (!s_mutex) return;
-    // Own scratch: task_shadow may be mid-write from s_sweep_blob. If it is
-    // writing the same device right now, the older of two snapshots taken
-    // milliseconds apart can land last; accepted on the way to a restart.
+    // Own scratch: task_shadow may be mid-write from s_sweep_blob. Each entry's
+    // copy-and-write holds FlashOrder, like the sweep's, so two writes of one
+    // device land in the order they were copied, and never after a remove's
+    // erase (fix review M5, N3).
     auto* blob = static_cast<uint8_t*>(
         heap_caps_malloc(sizeof(s_sweep_blob), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!blob) return;
@@ -1049,6 +1050,7 @@ void device_shadow_flush_now() {
     for (uint16_t i = 0; ; i++) {
         uint64_t ieee = 0;
         size_t   len  = 0;
+        FlashOrder flash_order;   // from the copy below to its flash write
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (i >= s_count) { xSemaphoreGive(s_mutex); break; }
         DeviceShadowEntry* e = &s_shadow[i];

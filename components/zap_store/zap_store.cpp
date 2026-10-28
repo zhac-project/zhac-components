@@ -673,10 +673,12 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
     // FINDINGS §8.3: validate the destination, and take the store lock so the
     // multi-blob scan is consistent vs a concurrent save/delete once the flush
     // task is running (load is normally a cold boot path, but the flush task
-    // can write before the boot relist completes). Lock order: store_lock is
-    // the INNERMOST lock — the flush layer (zap_store_flush.cpp) always
-    // releases its own s_mtx before calling into save/delete, so taking
-    // s_store_mutex here cannot invert against it.
+    // can write before the boot relist completes). Lock order: the flush
+    // layer (zap_store_flush.cpp) releases its own s_mtx before calling into
+    // save/delete; store_lock comes before the pool lock (zap_store_save_live
+    // reads the pool under it). zigbee_pool_restore_persisted calls this while
+    // holding the pool lock -- the other way round -- which is safe only at
+    // boot, before any deferred write is queued (fix review N2).
     if (!pool || max_count == 0) {
         ESP_LOGE(TAG, "load_devices: null pool or zero capacity");
         return 0;
@@ -747,8 +749,8 @@ bool zap_store_save_last_seen(ZapStoreSnapshotCb snap) {
     if (!rows) return false;
 
     // The stored devices, copied under the store lock. Their live values are
-    // read after it is released: `snap` takes the pool lock, and the pool lock
-    // is taken before this one elsewhere.
+    // read after it is released: `snap` takes the pool lock, and the boot-time
+    // restore takes the two the other way round, so this loop holds one at a time.
     uint16_t n = 0;
     store_lock();
     if (!s_idx_built) {
