@@ -154,6 +154,20 @@ static uint16_t           s_count  = 0;
 // the old code had on s_mutex, just on the outer lock now.
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_emit_mutex;
+// Flash order (review 2026-10-28, fix review M5): a sweep or a config setter
+// copies an entry under s_mutex and writes it to flash after releasing it, so
+// a remove (or clear_attrs) that erased the keys in between saw them written
+// back -- a deleted device's cache and settings returned at the next boot, and
+// a re-paired one inherited them. Every flash write of an entry holds this from
+// before its copy to after its write, and every erase holds it too. Taken
+// before s_emit_mutex and s_mutex, never inside them.
+static SemaphoreHandle_t s_flash_mutex;
+struct FlashOrder {
+    FlashOrder()  { if (s_flash_mutex) xSemaphoreTakeRecursive(s_flash_mutex, portMAX_DELAY); }
+    ~FlashOrder() { if (s_flash_mutex) xSemaphoreGiveRecursive(s_flash_mutex); }
+    FlashOrder(const FlashOrder&) = delete;
+    FlashOrder& operator=(const FlashOrder&) = delete;
+};
 
 // One housekeeping queue for both timer-callback kinds. Timer callbacks run
 // on the SHARED FreeRTOS timer service task and must never block on s_mutex
@@ -814,6 +828,7 @@ static void task_shadow(void* arg) {
         for (uint16_t i = 0; ; i++) {
             size_t   blob_len = 0;
             uint64_t ieee     = 0;
+            FlashOrder flash_order;   // from the copy below to its flash write (M5)
 
             xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -925,6 +940,8 @@ void device_shadow_init() {
     configASSERT(s_mutex);
     s_emit_mutex = xSemaphoreCreateMutex();
     configASSERT(s_emit_mutex);
+    s_flash_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(s_flash_mutex);
     s_task_queue = zhac_queue_create(TASK_QUEUE_DEPTH, sizeof(ShadowTaskMsg));
     configASSERT(s_task_queue);
 
@@ -1197,6 +1214,7 @@ bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
 }
 
 bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1228,6 +1246,7 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
 }
 
 bool device_shadow_set_throttle_ms(uint64_t ieee, uint32_t throttle_ms) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_or_create_entry(ieee);
@@ -1250,6 +1269,7 @@ bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out) {
 }
 
 void device_shadow_clear_attrs(uint64_t ieee) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     bool found = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
@@ -1339,6 +1359,7 @@ bool device_shadow_remove_attr(uint64_t ieee, const char* key) {
 // for a rejoin). Lock model (T10): all table/timer work under the leaf
 // s_mutex; the two NVS erases run AFTER the lock is released.
 void device_shadow_remove(uint64_t ieee) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     bool found = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
@@ -1379,10 +1400,10 @@ void device_shadow_remove(uint64_t ieee) {
 
     if (!found) return;   // unknown ieee — nothing in RAM or (by construction) NVS
 
-    // Leaf-lock rule: NVS erase outside s_mutex (same window/justification as
-    // clear_attrs — a concurrent sweep write for THIS ieee can't happen now
-    // that the slot is gone, and an in-flight one for the moved entry targets
-    // a different key). Erase BOTH the 'a' (attr) and 'c' (config) keys —
+    // Leaf-lock rule: NVS erase outside s_mutex. A sweep or config write that
+    // copied this entry before the slot went has finished: FlashOrder, taken
+    // first, orders it before this erase (M5). An in-flight one for the moved
+    // entry targets a different key. Erase BOTH the 'a' (attr) and 'c' (config) keys —
     // clear_attrs only ever erased 'a', so removed devices leaked their 'c'
     // config blob in NVS forever.
     if (s_nvs) {
@@ -1402,6 +1423,7 @@ void device_shadow_remove(uint64_t ieee) {
 }
 
 bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1434,6 +1456,7 @@ bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
 }
 
 bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
