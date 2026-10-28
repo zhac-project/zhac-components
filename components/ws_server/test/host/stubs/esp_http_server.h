@@ -92,15 +92,12 @@ inline esp_err_t httpd_ws_recv_frame(httpd_req_t* req, httpd_ws_frame_t* f, size
     g_ws_frame_len = 0;
     return ESP_OK;
 }
-// The frames a handler answered with on its own request (a PONG, a CLOSE): type, length, first payload byte.
+// The last frame written (a test's httpd_ws_send_frame_async records it): type, length, first payload
+// byte, and whether a lock was held while it was written.
 struct StubSentFrame { httpd_ws_type_t type; size_t len; uint8_t first; };
 inline StubSentFrame g_sent_frame{};
 inline int g_sent_frames = 0;
-inline esp_err_t httpd_ws_send_frame(httpd_req_t*, httpd_ws_frame_t* f) {
-    g_sent_frame = StubSentFrame{f->type, f->len, f->len && f->payload ? f->payload[0] : uint8_t{0}};
-    g_sent_frames++;
-    return ESP_OK;
-}
+inline bool g_sent_under_lock = false;
 inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return g_fd_info_result; }
 inline bool httpd_uri_match_wildcard(const char*, const char*, size_t) { return true; }
 esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int fd, httpd_ws_frame_t* frame);   // supplied by the test

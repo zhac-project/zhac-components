@@ -325,6 +325,7 @@ static esp_err_t ws_post_handshake(httpd_req_t* req) {
 #endif
 
 static void ws_frame_clock(int fd, bool start);   // the frame deadline (R-04), with the request clocks below
+static esp_err_t send_control(int fd, httpd_ws_frame_t* pkt);   // under s_tx_mutex, with the senders below
 
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
@@ -380,13 +381,13 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         // close_fn cleans the table. A PONG needs nothing.
         if (pkt.type == HTTPD_WS_TYPE_PING) {
             pkt.type = HTTPD_WS_TYPE_PONG;
-            return httpd_ws_send_frame(req, &pkt);
+            return send_control(fd, &pkt);
         }
         if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
             httpd_ws_frame_t close_frame{};
             close_frame.final = true;
             close_frame.type  = HTTPD_WS_TYPE_CLOSE;
-            (void)httpd_ws_send_frame(req, &close_frame);
+            (void)send_control(fd, &close_frame);
         }
         return ESP_OK;
     }
@@ -771,6 +772,20 @@ static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool reche
         }
         ESP_LOGW(TAG, "%s: send failed fd=%d err=%d (removed)", who, fds[i], err[i]);
     }
+}
+
+// A control frame's answer (ws_handler's PONG or CLOSE) takes its turn on
+// s_tx_mutex like every other frame: a broadcast to the same socket would
+// otherwise interleave its two send()s with ours (review 2026-10-28, fix
+// review N1). Not through send_locked: a PONG must echo the PING's bytes, which
+// need not be UTF-8, and a failure here is handled by httpd ending the session.
+static esp_err_t send_control(int fd, httpd_ws_frame_t* pkt) {
+    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+    s_broadcast_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    const esp_err_t err = httpd_ws_send_frame_async(s_server, fd, pkt);
+    s_broadcast_task.store(nullptr, std::memory_order_release);
+    xSemaphoreGive(s_tx_mutex);
+    return err;
 }
 
 void ws_server_broadcast(const char* json, size_t len) {

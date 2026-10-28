@@ -9,6 +9,7 @@
 // A fresh process, so the client table starts empty.
 #include "ws_server.h"
 #include "esp_timer.h"
+#include "freertos/semphr.h"   // t_nheld: the locks this thread holds
 
 #include <cstdarg>
 #include <cstdio>
@@ -22,7 +23,14 @@ static int s_fail = 0;
 
 static std::vector<int> g_closes;   // what ws_server asked httpd to close
 esp_err_t httpd_sess_trigger_close(httpd_handle_t, int fd) { g_closes.push_back(fd); return ESP_OK; }
-esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int, httpd_ws_frame_t*) { return ESP_OK; }
+// Records what was written, and whether a lock (s_tx_mutex: nothing else is
+// held while a frame goes out) was held while writing it (fix review N1).
+esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int, httpd_ws_frame_t* f) {
+    g_sent_frame = StubSentFrame{f->type, f->len, f->len && f->payload ? f->payload[0] : uint8_t{0}};
+    g_sent_frames++;
+    g_sent_under_lock = t_nheld > 0;
+    return ESP_OK;
+}
 void host_log(const char*, const char*, ...) {}
 
 static void add_client(int fd) {            // the handshake registers fd as a client
@@ -190,6 +198,7 @@ int main() {
         CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 1 && g_sent_frame.type == HTTPD_WS_TYPE_PONG &&
               g_sent_frame.len == 5 && g_sent_frame.first == 'x' && s_rx_len == 0,
               "a PING is answered with a PONG carrying its payload, and is not handed on");
+        CHECK(g_sent_under_lock, "the PONG is written under the send lock, so a broadcast cannot interleave with it");
         g_sent_frames = 0;
         g_ws_frame_type = HTTPD_WS_TYPE_PONG;
         g_ws_frame_len = 3;
@@ -202,8 +211,8 @@ int main() {
         g_ws_frame_len = 0;
         g_ws_frame_type = HTTPD_WS_TYPE_CLOSE;
         g_ws_frame_len = 2;
-        CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 1 && g_sent_frame.type == HTTPD_WS_TYPE_CLOSE,
-              "a CLOSE is answered with a CLOSE (httpd then ends the session)");
+        CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 1 && g_sent_frame.type == HTTPD_WS_TYPE_CLOSE &&
+              g_sent_under_lock, "a CLOSE is answered with a CLOSE under the send lock (httpd then ends the session)");
         g_close_fn(nullptr, 120);
 
         int tp[2];
