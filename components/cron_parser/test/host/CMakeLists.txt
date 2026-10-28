@@ -22,7 +22,9 @@ target_include_directories(cron_parser_host_test PRIVATE
     ${COMPONENTS_DIR}/cron_parser/include
 )
 
-target_compile_options(cron_parser_host_test PRIVATE -Wall -Wextra -Werror)
+target_compile_options(cron_parser_host_test PRIVATE -Wall -Wextra -Werror
+    -fsanitize=undefined -fno-sanitize-recover=undefined)
+target_link_options(cron_parser_host_test PRIVATE -fsanitize=undefined)
 
 # Comprehensive grammar / matching / DOM-DOW / cron_next coverage.
 add_executable(cron_parser_matrix_test

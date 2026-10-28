@@ -82,6 +82,18 @@ int main() {
         }
     }
 
+    // ── review 2026-10-28 R-10: a step past the field's span ──────────────
+    // `v += step` overflowed an int and shifted by a negative count; the
+    // minute mask came out 0x7 instead of minute 2 alone. Built with UBSan.
+    {
+        CronExpr big{};
+        CHECK(cron_parse("2-59/2147483647 * * * *", big), "INT_MAX step in a range parses");
+        CHECK(big.minute_bits == (1ULL << 2), "INT_MAX step in a range matches its first value only");
+        CHECK(cron_parse("0 0 */2147483647 * *", big), "INT_MAX step on a field starting at 1 parses");
+        CHECK(big.day_bits == (1u << 1), "INT_MAX */step matches the field's first value only");
+        CHECK(cron_parse("0 */60 * * *", big) && big.hour_bits == 1u, "a step just past the span matches once");
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

@@ -43,6 +43,9 @@ static bool parse_field(const char* s, int min_val, int max_val,
         } else if (s[1] != '\0') {
             return false; // unexpected char after *
         }
+        // A step past the field's span matches its first value only; clamped,
+        // `v += step` cannot overflow (review 2026-10-28 R-10).
+        if (step > max_val - min_val) step = max_val - min_val + 1;
         for (int v = min_val; v <= max_val; v += step)
             *bits |= (1ULL << v);
         if (is_star) *is_star = true;
@@ -77,6 +80,7 @@ static bool parse_field(const char* s, int min_val, int max_val,
                 if (!parse_int(dash + 1, &hi)) return false;
             }
             if (lo < min_val || hi > max_val || lo > hi) return false;
+            if (step > max_val - min_val) step = max_val - min_val + 1;   // R-10, as above
             for (int v = lo; v <= hi; v += step)
                 *bits |= (1ULL << v);
         } else {
