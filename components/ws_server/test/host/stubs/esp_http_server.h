@@ -19,7 +19,8 @@ typedef int esp_err_t;
 typedef void* httpd_handle_t;
 enum httpd_method_t { HTTP_DELETE = 0, HTTP_GET = 1 };   // data frames after the handshake arrive with method 0
 struct httpd_req_t { httpd_method_t method; void* user_ctx; };   // user_ctx carries the fake sockfd
-enum httpd_ws_type_t { HTTPD_WS_TYPE_CONTINUE = 0, HTTPD_WS_TYPE_TEXT = 1, HTTPD_WS_TYPE_BINARY = 2, HTTPD_WS_TYPE_PONG = 0xA };
+enum httpd_ws_type_t { HTTPD_WS_TYPE_CONTINUE = 0, HTTPD_WS_TYPE_TEXT = 1, HTTPD_WS_TYPE_BINARY = 2,
+                       HTTPD_WS_TYPE_CLOSE = 0x8, HTTPD_WS_TYPE_PING = 0x9, HTTPD_WS_TYPE_PONG = 0xA };
 enum httpd_ws_client_info_t { HTTPD_WS_CLIENT_INVALID, HTTPD_WS_CLIENT_HTTP, HTTPD_WS_CLIENT_WEBSOCKET };
 struct httpd_ws_frame_t { bool final; bool fragmented; httpd_ws_type_t type; uint8_t* payload; size_t len; };
 struct httpd_uri_t {
@@ -89,6 +90,15 @@ inline esp_err_t httpd_ws_recv_frame(httpd_req_t* req, httpd_ws_frame_t* f, size
     }
     for (size_t i = 0; i < f->len; i++) f->payload[i] = 'x';
     g_ws_frame_len = 0;
+    return ESP_OK;
+}
+// The frames a handler answered with on its own request (a PONG, a CLOSE): type, length, first payload byte.
+struct StubSentFrame { httpd_ws_type_t type; size_t len; uint8_t first; };
+inline StubSentFrame g_sent_frame{};
+inline int g_sent_frames = 0;
+inline esp_err_t httpd_ws_send_frame(httpd_req_t*, httpd_ws_frame_t* f) {
+    g_sent_frame = StubSentFrame{f->type, f->len, f->len && f->payload ? f->payload[0] : uint8_t{0}};
+    g_sent_frames++;
     return ESP_OK;
 }
 inline httpd_ws_client_info_t httpd_ws_get_fd_info(httpd_handle_t, int) { g_fd_info_calls++; return g_fd_info_result; }

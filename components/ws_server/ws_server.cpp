@@ -367,11 +367,29 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     if (ret != ESP_OK) { remove_fd(fd); return ret; }
     // Every frame that reaches this handler is read to its end: a payload left
     // in the stream is taken for the next frame's header (review 2026-10-24
-    // HS-12). Text, binary and continuation frames come here, and on IDF 6.1
-    // PONGs too; PING and CLOSE do not (handle_ws_control_frames is false:
-    // httpd answers PING with PONG and replies to CLOSE itself, RFC 6455
-    // 5.5.1/5.5.2, then tears the session down — our close_fn does the table
-    // cleanup). Only text is handed on.
+    // HS-12). All frames come here, control frames too (handle_ws_control_frames,
+    // below), so each is read under the frame deadline. Only text is handed on.
+    if (pkt.type == HTTPD_WS_TYPE_PING || pkt.type == HTTPD_WS_TYPE_PONG || pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        uint8_t ctl[125];   // a control frame carries at most 125 bytes (RFC 6455 5.5)
+        if (pkt.len > sizeof(ctl)) { remove_fd(fd); return ESP_FAIL; }
+        pkt.payload = ctl;
+        if (pkt.len && (ret = httpd_ws_recv_frame(req, &pkt, pkt.len)) != ESP_OK) { remove_fd(fd); return ret; }
+        // Answered as httpd itself would (RFC 6455 5.5.1/5.5.2): a PING with a
+        // PONG carrying its payload, a CLOSE with an empty CLOSE, after which
+        // httpd ends the session (it set ws_close on reading the opcode) and our
+        // close_fn cleans the table. A PONG needs nothing.
+        if (pkt.type == HTTPD_WS_TYPE_PING) {
+            pkt.type = HTTPD_WS_TYPE_PONG;
+            return httpd_ws_send_frame(req, &pkt);
+        }
+        if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
+            httpd_ws_frame_t close_frame{};
+            close_frame.final = true;
+            close_frame.type  = HTTPD_WS_TYPE_CLOSE;
+            (void)httpd_ws_send_frame(req, &close_frame);
+        }
+        return ESP_OK;
+    }
     if (pkt.len > WS_RX_MAX) {
         // A failed handler makes httpd close the session; reading the payload
         // away instead would hold the httpd task as long as the client cares
@@ -402,11 +420,12 @@ static const httpd_uri_t s_ws_uri = {
     .handler                  = ws_handler,
     .user_ctx                 = nullptr,
     .is_websocket             = true,
-    // false → httpd auto-replies PONG to PING and CLOSE to CLOSE (the old
-    // `true` setting claimed control-frame handling but swallowed PING
-    // without ever sending a PONG, so keepalive-probing clients timed out).
+    // true → PING, PONG and CLOSE come to ws_handler, which answers them (an
+    // older `true` swallowed PING without a PONG, so keepalive-probing clients
+    // timed out). With false httpd read them itself, outside the frame
+    // deadline: one trickled PING held the httpd task ~6 min (review R-04).
     // Session teardown after CLOSE runs through close_fn below.
-    .handle_ws_control_frames = false,
+    .handle_ws_control_frames = true,
     .supported_subprotocol    = nullptr,
 #ifdef CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
     .ws_pre_handshake_cb      = ws_pre_handshake,

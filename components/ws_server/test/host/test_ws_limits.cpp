@@ -89,7 +89,10 @@ int main() {
     g_fd_info_result = HTTPD_WS_CLIENT_WEBSOCKET;
     (void)!write(sv[1], "x", 1);
     g_now_us += 60'000'000;
-    CHECK(g_recv_override(nullptr, sv[0], buf, 1, 0) == 1, "a WebSocket session has no request deadline");
+    // Between frames httpd reads only the next opcode byte; every frame, control
+    // frames included, is timed in ws_handler (R-04, below).
+    CHECK(g_recv_override(nullptr, sv[0], buf, 1, 0) == 1,
+          "a WebSocket session has no request clock between frames");
     g_close_fn(nullptr, sv[0]);
     close(sv[1]);
 
@@ -168,6 +171,60 @@ int main() {
         g_ws_trickle_us = 0;
         g_close_fn(nullptr, ok[0]);
         close(ok[1]);
+    }
+
+    // ── R-04, control frames (review B1) ─────────────────────────────────
+    // While the URI did not ask for control frames, httpd read a PING or CLOSE
+    // itself, outside ws_handler and so outside the frame deadline: one trickled
+    // PING held the httpd task about 6 minutes. They come to the handler now,
+    // which answers them as httpd did.
+    {
+        CHECK(g_ws_uri->handle_ws_control_frames,
+              "control frames come to the handler, so their reads have the frame deadline");
+        add_client(120);
+        httpd_req_t fc{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(120))};
+        g_sent_frames = 0;
+        g_ws_frame_type = HTTPD_WS_TYPE_PING;
+        g_ws_frame_len = 5;
+        s_rx_len = 0;
+        CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 1 && g_sent_frame.type == HTTPD_WS_TYPE_PONG &&
+              g_sent_frame.len == 5 && g_sent_frame.first == 'x' && s_rx_len == 0,
+              "a PING is answered with a PONG carrying its payload, and is not handed on");
+        g_sent_frames = 0;
+        g_ws_frame_type = HTTPD_WS_TYPE_PONG;
+        g_ws_frame_len = 3;
+        CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 0 && g_ws_frame_len == 0,
+              "a PONG is read away and not answered");
+        g_ws_frame_type = HTTPD_WS_TYPE_PING;
+        g_ws_frame_len = 126;
+        CHECK(g_ws_uri->handler(&fc) == ESP_FAIL && g_sent_frames == 0,
+              "a control frame over 125 bytes fails its session (RFC 6455 5.5)");
+        g_ws_frame_len = 0;
+        g_ws_frame_type = HTTPD_WS_TYPE_CLOSE;
+        g_ws_frame_len = 2;
+        CHECK(g_ws_uri->handler(&fc) == ESP_OK && g_sent_frames == 1 && g_sent_frame.type == HTTPD_WS_TYPE_CLOSE,
+              "a CLOSE is answered with a CLOSE (httpd then ends the session)");
+        g_close_fn(nullptr, 120);
+
+        int tp[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tp);
+        (void)g_open_fn(nullptr, tp[0]);
+        add_client(tp[0]);
+        httpd_req_t ft{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(tp[0]))};
+        char bytes[125];
+        std::memset(bytes, 'p', sizeof(bytes));
+        (void)!write(tp[1], bytes, sizeof(bytes));
+        g_sent_frames = 0;
+        g_ws_trickle_us = 2'900'000;
+        g_ws_frame_type = HTTPD_WS_TYPE_PING;
+        g_ws_frame_len = 125;
+        CHECK(g_ws_uri->handler(&ft) == ESP_FAIL && g_sent_frames == 0,
+              "a PING trickled past 8 s fails its session");
+        g_ws_trickle_us = 0;
+        g_ws_frame_len = 0;
+        g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
+        g_close_fn(nullptr, tp[0]);
+        close(tp[1]);
     }
 
     std::printf("%s (%d failure(s))\n", s_fail ? "FAILED" : "ALL PASS", s_fail);
