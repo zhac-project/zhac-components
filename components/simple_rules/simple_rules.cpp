@@ -1041,7 +1041,7 @@ bool simple_rules_check(const char* dsl, char* err, size_t cap) {
 }
 
 bool simple_rules_add(const char* name, const char* dsl,
-                       uint16_t* out_rule_id) {
+                       uint16_t* out_rule_id, bool enabled) {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     // P2-T18 def 4 (FINDINGS §7): a DSL that doesn't fit slot.src would parse
     // in full for the live rule yet persist truncated, so the rule silently
@@ -1073,7 +1073,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     }
     RuleSlot slot{};
     slot.rule_id      = id;
-    slot.enabled      = 1;
+    slot.enabled      = enabled ? 1 : 0;
     slot._reserved    = 0;
     slot.rule_type    = (uint8_t)RuleType::SIMPLE;
     slot.trigger_type = (uint8_t)r.trigger.type;
@@ -1087,7 +1087,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     // PSRAM writeback task flushes to flash ≤5 s later. Saves ~10–50 ms
     // per REST round-trip and cuts flash wear on rapid edits.
     rule_store_mark_dirty(&slot);
-    r.enabled = true;
+    r.enabled = enabled;
     memcpy(r.name, slot.name, sizeof(r.name));
     ParsedRule& added = s_rules[s_rule_count++];
     added = r;

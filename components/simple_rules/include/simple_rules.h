@@ -181,8 +181,10 @@ void     simple_rules_reload();
 
 // `name` is an optional friendly label ≤ 23 chars; pass nullptr or "" to
 // leave blank. Stored verbatim in the slot; never used by parsing.
+// `enabled` false stores and caches the rule Off in the same step: a create
+// followed by a disable left it live in between (review 2026-10-28 R-08).
 bool     simple_rules_add(const char* name, const char* dsl,
-                           uint16_t* out_rule_id);
+                           uint16_t* out_rule_id, bool enabled = true);
 bool     simple_rules_update(uint16_t rule_id,
                               const char* name, const char* dsl);
 

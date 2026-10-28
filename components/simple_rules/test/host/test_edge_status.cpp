@@ -407,6 +407,26 @@ int main() {
     CHECK(stub_log_count('I', "4711") == 0 && stub_log_count('I', "pad#action_code=<hidden>") == 4,
           "the fired lines hide the code, for the rule on it and for the wildcard");
 
+    // ── 11. Created Off (review 2026-10-28 R-08) ──────────────────────────
+    // The cloud's "create as Off" was create, then disable: live in between.
+    {
+        uint16_t off = 0;
+        CHECK(simple_rules_add("off", "ON door2#contact DO script.run off ENDON", &off, false),
+              "a rule can be created Off");
+        report(kDoor2, "contact", VAL_BOOL, 0);
+        report(kDoor2, "contact", VAL_BOOL, 1);
+        CHECK(fires("off") == 0, "a rule created Off does not fire");
+        RuleSlot slots[64]{};
+        const uint16_t n = simple_rules_list(slots, 64);
+        bool stored_off = false;
+        for (uint16_t i = 0; i < n; i++)
+            if (slots[i].rule_id == off) stored_off = slots[i].enabled == 0;
+        CHECK(stored_off, "it is stored Off, so it stays Off after a reboot");
+        simple_rules_enable(off, true);
+        report(kDoor2, "contact", VAL_BOOL, 0);
+        CHECK(fires("off") == 1, "once enabled it fires on the next change");
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;
