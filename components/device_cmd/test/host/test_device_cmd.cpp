@@ -283,6 +283,8 @@ int main() {
           "hard remove wipes stored row, shadow, def cache and fallback data");
     CHECK(g_store.dirty_marks == 0, "hard remove does not re-persist the row it deletes");
     CHECK(g_store.leave_events == 1, "hard remove publishes DEVICE_LEAVE");
+    CHECK(!g_store.pool_had_device_at_delete,
+          "hard remove takes the device out of the pool before its record (a flush then cannot write it back, R-11)");
     // ── remove, hard: backend owns the leave ──
     arm(); g_have_backend = true;
     CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_store.backend_removes == 1 && g_store.leave_reqs == 0,

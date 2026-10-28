@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -204,10 +205,26 @@ void nvs_release_iterator(nvs_iterator_t iter) { delete static_cast<StubIter*>(i
 static int64_t g_time_us = 0;
 int64_t esp_timer_get_time(void) { return (g_time_us += 1000); }   // +1 ms per call
 
+// Every mutex is one no-op object, but the depth of held locks is counted, so
+// a test can model another task's work that has to wait for a lock: queued
+// with nvs_stub_when_unlocked(), it runs as soon as no lock is held.
 static int s_mutex_obj = 0;
+static int g_lock_depth = 0;
+static std::vector<std::function<void()>> g_when_unlocked;
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &s_mutex_obj; }
-BaseType_t xSemaphoreTake(SemaphoreHandle_t, TickType_t) { return pdTRUE; }
-BaseType_t xSemaphoreGive(SemaphoreHandle_t) { return pdTRUE; }
+BaseType_t xSemaphoreTake(SemaphoreHandle_t, TickType_t) { g_lock_depth++; return pdTRUE; }
+BaseType_t xSemaphoreGive(SemaphoreHandle_t) {
+    if (--g_lock_depth == 0 && !g_when_unlocked.empty()) {
+        auto fns = std::move(g_when_unlocked);
+        g_when_unlocked.clear();
+        for (auto& f : fns) f();
+    }
+    return pdTRUE;
+}
+void nvs_stub_when_unlocked(std::function<void()> f) {
+    if (g_lock_depth == 0) f();
+    else g_when_unlocked.push_back(std::move(f));
+}
 BaseType_t xTaskCreate(void (*)(void*), const char*, uint32_t, void*, UBaseType_t, TaskHandle_t*) {
     return pdPASS;   // the flush task never runs; flush_now()/flush_device() are synchronous
 }

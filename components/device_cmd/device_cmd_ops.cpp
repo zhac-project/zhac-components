@@ -106,9 +106,10 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     if (!hard) {
         zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
     } else {
-        // Out of the pool first: a flush that has not copied the device yet
-        // then drops it, and the store delete takes back one already writing
-        // (review 2026-10-28 R-11).
+        // Out of the pool first: every deferred write reads the pool under the
+        // store lock (zap_store_save_live), so one that runs after this line
+        // writes nothing, and one already writing is removed by the delete
+        // below (review 2026-10-28 R-11).
         zigbee_pool_remove(ieee);
         zap_store_delete_device(ieee);
         device_shadow_remove(ieee);

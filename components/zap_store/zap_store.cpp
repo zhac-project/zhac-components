@@ -359,7 +359,7 @@ static bool data_part_select() {
 }
 
 bool zap_store_confirm_move() {
-    if (s_part != DATA_PART) return false;
+    if (s_part != DATA_PART) return true;   // the store is on nvs: nothing to confirm
     // With the data first: an nvs that cannot be read later must not make a
     // trial boot copy over the store of record.
     if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
@@ -487,12 +487,10 @@ bool zap_store_is_ready() { return s_ready; }
 // never-implemented A/B-snapshot + journal scheme was removed 2026-05-29; NVS
 // is the store.
 
-bool zap_store_save_device(const ZapDevice* dev) {
-    if (!dev || !s_ready) return false;
-
-    store_lock();   // F16: serialise with delete + protect the IEEE index
+// The save itself; the caller holds store_lock.
+static bool save_locked(const ZapDevice* dev) {
     nvs_handle_t h = open_ns(NVS_READWRITE);
-    if (!h) { store_unlock(); return false; }
+    if (!h) return false;
 
     uint16_t count = 0;
     nvs_get_u16(h, "cnt", &count);
@@ -518,7 +516,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
                  count, (unsigned)ZAP_MAX_DEVICES,
                  (unsigned long long)dev->ieee_addr);
         nvs_close(h);
-        store_unlock();
         return false;
     }
 
@@ -545,7 +542,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
         if (cnt_err != ESP_OK) {
             ESP_LOGE(TAG, "nvs_set_u16 cnt: %s", esp_err_to_name(cnt_err));
             nvs_close(h);
-            store_unlock();
             return false;
         }
     }
@@ -553,7 +549,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_set_blob: %s", esp_err_to_name(err));
         nvs_close(h);
-        store_unlock();
         return false;
     }
 
@@ -567,13 +562,40 @@ bool zap_store_save_device(const ZapDevice* dev) {
         s_idx_ieee[idx] = dev->ieee_addr;
         if (idx >= s_idx_count) s_idx_count = static_cast<uint16_t>(idx + 1);
     }
-    store_unlock();
 
     // Success log gated on the commit — a failed save must not read as
     // "Device saved" in the log while the function returns false.
     if (acc == ESP_OK)
         ESP_LOGI(TAG, "Device saved idx=%u ieee=0x%016llx", idx, dev->ieee_addr);
     return acc == ESP_OK;
+}
+
+bool zap_store_save_device(const ZapDevice* dev) {
+    if (!dev || !s_ready) return false;
+    store_lock();   // F16: serialise with delete + protect the IEEE index
+    const bool ok = save_locked(dev);
+    store_unlock();
+    return ok;
+}
+
+// The pool's copy, read and written under the store lock. A hard delete takes
+// the device out of the pool before it deletes the record, so this either
+// writes before that delete (which then removes the record) or finds the
+// device gone and writes nothing: a copy taken before the delete can no
+// longer be written after it (review 2026-10-28 R-11).
+bool zap_store_save_live(uint64_t ieee, ZapStoreSnapshotCb snapshot, bool* gone) {
+    if (gone) *gone = false;
+    if (!snapshot || !s_ready) return false;
+    ZapDevice dev{};
+    bool ok = false;
+    store_lock();
+    if (!snapshot(ieee, &dev)) {
+        if (gone) *gone = true;
+    } else {
+        ok = save_locked(&dev);
+    }
+    store_unlock();
+    return ok;
 }
 
 // ── Delete device — three writes, safe at every cut ──────────────────────
@@ -589,9 +611,6 @@ bool zap_store_delete_device(uint64_t ieee) {
     bool      ok    = false;
     uint16_t  count = 0;
     ZapDevice* tail = nullptr;
-    // Before the delete: a write of this device still queued or in flight
-    // would land after it and bring the device back (review 2026-10-28 R-11).
-    zap_store_flush_cancel(ieee);
     store_lock();   // F16: serialise with save + protect the IEEE index
     do {
         if (!s_ready || ieee == 0) break;

@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -59,6 +60,7 @@ extern "C" void nvs_stub_cut_after(int writes);           // power cut after n w
 extern "C" void nvs_stub_open_fails(bool f);
 extern "C" void nvs_stub_part_fails(const char* part, bool f);   // a partition that cannot be read at all
 extern "C" void nvs_stub_fail_key(const char* key, bool f);      // writes of this key fail (partition full)
+void nvs_stub_when_unlocked(std::function<void()> f);            // another task's work, once no lock is held
 extern "C" int  nvs_stub_count(const char* part, const char* ns);
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -90,9 +92,11 @@ static bool pool_has(const ZapDevice* pool, uint16_t n, uint64_t ieee) {
 // The flush layer stores only the dirty IEEE; at flush time it calls back for
 // the current device state. This map is that "live pool".
 static std::map<uint64_t, ZapDevice> g_live;
-// R-11: when set, the snapshot of this IEEE is taken and THEN the device is
-// hard-deleted (pool entry and record) before the flusher writes it -- what a
-// concurrent device_cmd_remove does in that gap on the real chip.
+// R-11: when set, a hard delete of this IEEE starts on "another task" right
+// after the flusher copied the device: it leaves the pool at once, and its
+// record goes as soon as no lock is held (device_cmd_remove's order). Then the
+// power goes two NVS writes later. Whatever the store wrote, the device must
+// not be there after the reboot.
 static uint64_t g_delete_during_snapshot = 0;
 static bool test_snapshot(uint64_t ieee, ZapDevice* out) {
     auto it = g_live.find(ieee);
@@ -101,7 +105,10 @@ static bool test_snapshot(uint64_t ieee, ZapDevice* out) {
     if (ieee == g_delete_during_snapshot) {
         g_delete_during_snapshot = 0;
         g_live.erase(ieee);
-        (void)zap_store_delete_device(ieee);
+        nvs_stub_when_unlocked([ieee] {
+            (void)zap_store_delete_device(ieee);
+            nvs_stub_cut_after(2);
+        });
     }
     return true;
 }
@@ -347,20 +354,32 @@ int main() {
         g_delete_during_snapshot = 0x0505ULL;
         // flush_device, not flush_now: flush_now first saves last_seen, whose
         // snapshot would fire the delete before any write is in flight.
-        (void)zap_store_flush_device(0x0505ULL);    // snapshot, the delete, then the write
+        (void)zap_store_flush_device(0x0505ULL);    // the copy, the delete, the power cut
+        nvs_stub_cut_after(-1);
+        zap_store_init();                           // the reboot
         ZapDevice pool[4]{};
         CHECK(zap_store_load_devices(pool, 4) == 0,
-              "a device deleted while its flush was writing stays deleted");
+              "a device deleted while its flush ran is gone after a power cut right after the delete");
 
-        // A write still queued when the device is deleted is dropped, even
-        // while its pool entry lingers.
-        ZapDevice q = make_dev(0x0606ULL, 0x0F0F, "queued");
-        g_live[0x0606ULL] = q;
-        zap_store_mark_dirty(&q, ZAP_PERSIST_LOW);
-        (void)zap_store_delete_device(0x0606ULL);
+        // The full-table fallback writes at once. It must write the pool's copy,
+        // so a caller's copy taken before a delete cannot bring the device back.
+        fresh_store();
+        for (int i = 0; i < 64; i++) {
+            ZapDevice f = make_dev(0x1000ULL + i, static_cast<uint16_t>(0x1000 + i), "filler");
+            g_live[f.ieee_addr] = f;
+            zap_store_mark_dirty(&f, ZAP_PERSIST_LOW);
+        }
+        g_live[0x0707ULL] = make_dev(0x0707ULL, 0x0707, "stale copy");
+        ZapDevice copy = g_live[0x0707ULL];         // a caller copies it out of the pool
+        g_live.erase(0x0707ULL);                     // the delete: the pool first,
+        (void)zap_store_delete_device(0x0707ULL);    // then the store
+        zap_store_mark_dirty(&copy, ZAP_PERSIST_LOW);   // the table is full: written at once
+        ZapDevice big[80]{};
+        const uint16_t n = zap_store_load_devices(big, 80);
+        CHECK(!pool_has(big, n, 0x0707ULL),
+              "the full-table fallback does not write a device the pool no longer has");
         zap_store_flush_now();
-        g_live.erase(0x0606ULL);
-        CHECK(zap_store_load_devices(pool, 4) == 0, "a write queued before the delete is dropped");
+        for (int i = 0; i < 64; i++) g_live.erase(0x1000ULL + i);
     }
 
     // ── G13: uplink selector — absent key, round-trip, OOR fallback ────────
@@ -731,6 +750,27 @@ int main() {
               "unwritable move marks: every device survives the next boot");
         CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && nvs_stub_count("nvs", "zap_v0") == 0,
               "... which finishes the move");
+
+        // The update path (review R-03, S1): the image is confirmed on a trial
+        // boot that runs on zhac_data. With both marks failing, confirming must
+        // say so, so the caller retries; nothing to confirm is not a failure.
+        seed();
+        CHECK(zap_store_confirm_move(), "store on nvs: nothing to confirm is success");
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial boot: copied, runs on zhac_data
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        CHECK(!zap_store_confirm_move(), "update path: confirming while both marks fail reports it");
+        nvs_stub_fail_key("live", false);
+        nvs_stub_fail_key("moved", false);
+        CHECK(zap_store_confirm_move(), "update path: the retry once the marks write confirms");
+        ZapDevice nine = make_dev(0x09ULL, 9, "paired after the update");
+        (void)zap_store_save_device(&nine);
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();                           // the next plain boot
+        CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x09ULL),
+              "update path: after the confirmed retry the next boot keeps zhac_data");
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();

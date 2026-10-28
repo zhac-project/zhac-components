@@ -57,9 +57,10 @@ const char* zap_store_data_part();
 // Makes a move to zhac_data final. Call once the running image is marked
 // valid (it can no longer roll back to a build that reads the store from
 // nvs); a boot that is not an update's trial does it by itself. Two small
-// NVS writes; a no-op when the store is not on zhac_data. True when a mark
-// reads back, so the next boot opens the store on zhac_data: only then may
-// the copy on nvs go (review 2026-10-28 R-03).
+// NVS writes. True when a mark reads back, so the next boot opens the store on
+// zhac_data -- only then may the copy on nvs go -- and when there is nothing
+// to confirm (the store is on nvs). False means the next boot would copy nvs
+// over zhac_data: call it again until it is true (review 2026-10-28 R-03).
 bool zap_store_confirm_move();
 
 // One-time marks kept in the device store's namespace, so they travel with
@@ -72,10 +73,10 @@ bool zap_store_flag_set(const char* key);
 bool zap_store_save_device(const ZapDevice* dev);
 
 // Delete a single device from NVS by IEEE address. Returns true if found and removed.
-// Also drops the device's queued write and takes back one already in flight
-// (zap_store_flush_cancel), so a deleted device does not return at the next boot.
+// Take the device out of the pool first (zigbee_pool_remove): the deferred
+// writes save the pool's copy under the store lock (zap_store_save_live), so
+// none can bring back a device the pool no longer has (review 2026-10-28 R-11).
 bool zap_store_delete_device(uint64_t ieee);
-void zap_store_flush_cancel(uint64_t ieee);
 
 // Load all saved devices into pool. Returns number loaded.
 uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count);
@@ -107,6 +108,11 @@ typedef enum {
 // device state and true is returned. Returning false (device gone)
 // causes the dirty entry to be dropped silently.
 typedef bool (*ZapStoreSnapshotCb)(uint64_t ieee, ZapDevice* out);
+
+// Save the device as `snapshot` reports it, read and written under the store
+// lock. Writes nothing, and sets `*gone`, when the snapshot reports the device
+// gone. The deferred writes use it (review 2026-10-28 R-11).
+bool zap_store_save_live(uint64_t ieee, ZapStoreSnapshotCb snapshot, bool* gone);
 
 // Install once at startup, before any mark_dirty calls.
 void zap_store_set_snapshot_cb(ZapStoreSnapshotCb cb);
