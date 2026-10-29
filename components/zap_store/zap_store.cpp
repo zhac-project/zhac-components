@@ -41,7 +41,9 @@ static bool        s_ready = false;
 //     copy while `nvs` still matches its checksum (nothing wrote `nvs` since,
 //     so the copy with this build's writes on top is the newest store) and
 //     copies afresh once `nvs` changed (a trial rolled back and the build
-//     before ran on it, or this build came back by USB after that);
+//     before wrote to it, or this build came back by USB after that). A
+//     rollback whose build wrote nothing keeps the trial's changes, as the
+//     Zigbee network does;
 //   - zap_store_confirm_move() (the image was marked valid) or a boot that is
 //     not a trial makes the move final: "live" on `zhac_data`, beside the data,
 //     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
@@ -343,6 +345,12 @@ static bool data_part_select() {
     // Before the move nvs holds a whole store, so an unusable zhac_data is
     // formatted (this build cannot read what it holds anyway); after it (or with
     // nothing on nvs, so zhac_data may hold the only copy) it is never formatted.
+    // ponytail: with no mark yet, a zhac_data that will not open cannot tell a
+    // first move from a kept update whose marks failed (review 2026-10-29 N-05),
+    // so this boot falls back to nvs or formats, and what was saved since the
+    // copy is lost. That takes a second fault on the same partition; fail closed
+    // here (store shut) if it ever matters more than a first move onto a broken
+    // zhac_data needing a storage reset.
     const bool before_move = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
     esp_err_t e = nvs_flash_init_partition(DATA_PART);
     if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
@@ -377,12 +385,24 @@ static bool data_part_select() {
     // was taken from. Then nothing wrote nvs since, and the copy with this
     // build's writes on top is the newest store, also after a restart that came
     // before a mark would write (review 2026-10-29 N-05). Once nvs changed (a
-    // trial rolled back and the build before ran on it, or this build came back
-    // by USB after that) the copy is stale and is taken afresh. "done" alone
-    // cannot tell the two apart; the checksum kept with the copy can.
+    // trial rolled back and the build before wrote to it, or this build came
+    // back by USB after that) the copy is stale and is taken afresh. "done"
+    // alone cannot tell the two apart; the checksum kept with the copy can.
     uint32_t now = 0, then = 0;
     const bool read = nvs_store_sum(&now);
-    if (read && mark_get(DATA_PART, "done") && src_get(&then) && then == now) {
+    const bool copy = mark_get(DATA_PART, "done") && src_get(&then);
+    if (copy && !read) {
+        // Whether the copy is current cannot be told this boot, and it may hold
+        // writes nvs lacks. Running on nvs would let this boot's writes make it
+        // look stale at the next one, so the store stays shut (fix review S-1).
+        ESP_LOGE(TAG, "the device store on nvs cannot be read whole -- store shut this boot");
+        s_part = DATA_PART;   // so the shadow cannot write nvs meanwhile
+        return false;
+    }
+    // An nvs with no store at all was wiped by a tool (this store always keeps
+    // its schema there, and a storage reset erases zhac_data first). It is not
+    // a newer store: the copy stays, as it would after a final move.
+    if (copy && (then == now || !ns_present(NVS_DEFAULT_PART_NAME, NVS_NS))) {
         ESP_LOGI(TAG, "the copy on '%s' is current (nvs unchanged since it was taken)", DATA_PART);
     } else {
         uint32_t sum = 0;

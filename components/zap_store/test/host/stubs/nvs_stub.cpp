@@ -24,6 +24,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -44,11 +45,18 @@ static int                               g_writes_left = -1; // -1 = no cut
 static bool                              g_open_fails = false;
 static std::set<std::string>             g_part_fails;       // partitions that cannot be read at all
 static std::set<std::string>             g_fail_keys;        // keys whose writes fail (a full partition)
+static std::set<std::string>             g_fail_reads;       // "part|key" whose reads fail (a flash read error)
+static bool                              g_reverse_iter = false;   // list entries in the other order
 
 static std::string full(const char* part, const char* ns) { return std::string(part) + "/" + ns; }
 static Ns* ns_of(nvs_handle_t h) {
     if (h == 0 || h > g_handles.size()) return nullptr;
     return &g_ns[g_handles[h - 1]];
+}
+static bool read_fails(nvs_handle_t h, const char* key) {
+    if (g_fail_reads.empty() || h == 0 || h > g_handles.size()) return false;
+    const std::string& pn = g_handles[h - 1];
+    return g_fail_reads.count(pn.substr(0, pn.find('/')) + "|" + key) > 0;
 }
 static bool write_ok() {
     if (g_writes_left < 0) return true;
@@ -84,6 +92,7 @@ static esp_err_t put(nvs_handle_t h, const char* key, nvs_type_t type, const voi
 static esp_err_t get(nvs_handle_t h, const char* key, nvs_type_t type, void* out, size_t len) {
     Ns* ns = ns_of(h);
     if (!ns) return ESP_ERR_INVALID_ARG;
+    if (read_fails(h, key)) return ESP_FAIL;
     auto it = ns->find(key);
     if (it == ns->end() || it->second.type != type) return ESP_ERR_NVS_NOT_FOUND;
     memcpy(out, it->second.bytes.data(), len);
@@ -107,6 +116,7 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char* key, const void* val, size_t 
 static esp_err_t get_bytes(nvs_handle_t h, const char* key, nvs_type_t type, void* out, size_t* len) {
     Ns* ns = ns_of(h);
     if (!ns) return ESP_ERR_INVALID_ARG;
+    if (read_fails(h, key)) return ESP_FAIL;
     auto it = ns->find(key);
     if (it == ns->end() || it->second.type != type) return ESP_ERR_NVS_NOT_FOUND;
     if (!out) { *len = it->second.bytes.size(); return ESP_OK; }      // size query
@@ -181,6 +191,7 @@ esp_err_t nvs_entry_find(const char* part, const char* ns, nvs_type_t type, nvs_
     auto* it = new StubIter{ns, {}, 0};
     for (auto& kv : n->second)
         if (type == NVS_TYPE_ANY || kv.second.type == type) it->keys.emplace_back(kv.first, kv.second.type);
+    if (g_reverse_iter) std::reverse(it->keys.begin(), it->keys.end());   // flash order is not key order
     if (it->keys.empty()) { delete it; return ESP_ERR_NVS_NOT_FOUND; }
     *out = it; return ESP_OK;
 }
@@ -233,12 +244,17 @@ void vTaskDelay(TickType_t) {}
 // ── Test helpers ───────────────────────────────────────────────────────────
 extern "C" void nvs_stub_reset(void) {
     g_ns.clear(); g_handles.clear(); g_parts.clear(); g_init_result.clear(); g_part_fails.clear();
-    g_fail_keys.clear();
+    g_fail_keys.clear(); g_fail_reads.clear(); g_reverse_iter = false;
     g_ota = ESP_OTA_IMG_VALID; g_writes_left = -1; g_open_fails = false;
 }
 extern "C" void nvs_stub_fail_key(const char* key, bool f) {
     if (f) g_fail_keys.insert(key); else g_fail_keys.erase(key);
 }
+extern "C" void nvs_stub_fail_read(const char* part, const char* key, bool f) {
+    const std::string k = std::string(part) + "|" + key;
+    if (f) g_fail_reads.insert(k); else g_fail_reads.erase(k);
+}
+extern "C" void nvs_stub_reverse_iteration(bool r) { g_reverse_iter = r; }
 extern "C" void nvs_stub_part_fails(const char* part, bool f) {
     if (f) g_part_fails.insert(part); else g_part_fails.erase(part);
 }
