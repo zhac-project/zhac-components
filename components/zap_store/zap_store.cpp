@@ -32,19 +32,24 @@ static bool        s_ready = false;
 // without it (main-core, mono) keep everything on `nvs`.
 //
 // The move is a copy, final only once the image that made it is confirmed:
-//   - both namespaces are copied from `nvs`, then "done" is set on `zhac_data`
-//     (cleared first, so a copy cut short is never taken for a whole one), and
-//     the store runs on `zhac_data`;
+//   - both namespaces are copied from `nvs`, then a checksum of what was copied
+//     ("src") and "done" are set on `zhac_data` ("done" cleared first, so a
+//     copy cut short is never taken for a whole one), and the store runs on
+//     `zhac_data`;
 //   - on an update's trial boot the originals stay: the build before finds
-//     them if the update rolls back. Until the move is final, every boot
-//     copies afresh from them (a copy left by a trial that rolled back is
-//     stale, and the build can come back by USB, without a trial);
+//     them if the update rolls back. Until the move is final, a boot keeps the
+//     copy while `nvs` still matches its checksum (nothing wrote `nvs` since,
+//     so the copy with this build's writes on top is the newest store) and
+//     copies afresh once `nvs` changed (a trial rolled back and the build
+//     before ran on it, or this build came back by USB after that);
 //   - zap_store_confirm_move() (the image was marked valid) or a boot that is
 //     not a trial makes the move final: "live" on `zhac_data`, beside the data,
 //     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
 //     never copied over, never formatted, and leftovers on `nvs` are erased.
+//     A mark that will not write only leaves the old copy on `nvs` for a later
+//     boot to erase (review 2026-10-29 N-05).
 static const char* DATA_PART = "zhac_data";
-static const char* MIG_NS    = "zap_mig";   // "done"/"live" on zhac_data, "moved" on nvs
+static const char* MIG_NS    = "zap_mig";   // "done"/"live"/"src" on zhac_data, "moved" on nvs
 static const char* s_part    = NVS_DEFAULT_PART_NAME;   // where the pool lives
 
 // F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
@@ -146,51 +151,60 @@ static constexpr uint16_t ZAP_STORE_SCHEMA_VERSION = 6;
 
 // ── Moving the store to zhac_data ────────────────────────────────────────
 
+// Each value read goes to `dst` when there is one, and into `*crc`, which lets
+// a later boot tell whether nvs changed since the copy.
 template <typename T, esp_err_t (*Get)(nvs_handle_t, const char*, T*),
           esp_err_t (*Set)(nvs_handle_t, const char*, T)>
-static bool copy_num(nvs_handle_t src, nvs_handle_t dst, const char* key) {
+static bool copy_num(nvs_handle_t src, const nvs_handle_t* dst, const char* key, uint32_t* crc) {
     T v{};
-    return Get(src, key, &v) == ESP_OK && Set(dst, key, v) == ESP_OK;
+    if (Get(src, key, &v) != ESP_OK) return false;
+    *crc = esp_rom_crc32_le(*crc, reinterpret_cast<const uint8_t*>(&v), sizeof v);
+    return !dst || Set(*dst, key, v) == ESP_OK;
 }
 
-static bool copy_bytes(nvs_handle_t src, nvs_handle_t dst, const char* key, bool str) {
+static bool copy_bytes(nvs_handle_t src, const nvs_handle_t* dst, const char* key, bool str, uint32_t* crc) {
     size_t len = 0;
     if ((str ? nvs_get_str(src, key, nullptr, &len) : nvs_get_blob(src, key, nullptr, &len)) != ESP_OK)
         return false;
     void* buf = heap_caps_malloc(len ? len : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) buf = std::malloc(len ? len : 1);
     if (!buf) return false;
-    const bool ok = str ? nvs_get_str(src, key, static_cast<char*>(buf), &len) == ESP_OK &&
-                          nvs_set_str(dst, key, static_cast<const char*>(buf)) == ESP_OK
-                        : nvs_get_blob(src, key, buf, &len) == ESP_OK &&
-                          nvs_set_blob(dst, key, buf, len) == ESP_OK;
+    bool ok = (str ? nvs_get_str(src, key, static_cast<char*>(buf), &len)
+                   : nvs_get_blob(src, key, buf, &len)) == ESP_OK;
+    if (ok) *crc = esp_rom_crc32_le(*crc, static_cast<const uint8_t*>(buf), len);
+    if (ok && dst)
+        ok = (str ? nvs_set_str(*dst, key, static_cast<const char*>(buf))
+                  : nvs_set_blob(*dst, key, buf, len)) == ESP_OK;
     heap_caps_free(buf);
     return ok;
 }
 
-static bool copy_entry(nvs_handle_t src, nvs_handle_t dst, const char* key, nvs_type_t type) {
+static bool copy_entry(nvs_handle_t src, const nvs_handle_t* dst, const char* key, nvs_type_t type,
+                       uint32_t* crc) {
     switch (type) {
-    case NVS_TYPE_U8:   return copy_num<uint8_t,  nvs_get_u8,  nvs_set_u8>(src, dst, key);
-    case NVS_TYPE_I8:   return copy_num<int8_t,   nvs_get_i8,  nvs_set_i8>(src, dst, key);
-    case NVS_TYPE_U16:  return copy_num<uint16_t, nvs_get_u16, nvs_set_u16>(src, dst, key);
-    case NVS_TYPE_I16:  return copy_num<int16_t,  nvs_get_i16, nvs_set_i16>(src, dst, key);
-    case NVS_TYPE_U32:  return copy_num<uint32_t, nvs_get_u32, nvs_set_u32>(src, dst, key);
-    case NVS_TYPE_I32:  return copy_num<int32_t,  nvs_get_i32, nvs_set_i32>(src, dst, key);
-    case NVS_TYPE_U64:  return copy_num<uint64_t, nvs_get_u64, nvs_set_u64>(src, dst, key);
-    case NVS_TYPE_I64:  return copy_num<int64_t,  nvs_get_i64, nvs_set_i64>(src, dst, key);
-    case NVS_TYPE_STR:  return copy_bytes(src, dst, key, true);
-    case NVS_TYPE_BLOB: return copy_bytes(src, dst, key, false);
+    case NVS_TYPE_U8:   return copy_num<uint8_t,  nvs_get_u8,  nvs_set_u8>(src, dst, key, crc);
+    case NVS_TYPE_I8:   return copy_num<int8_t,   nvs_get_i8,  nvs_set_i8>(src, dst, key, crc);
+    case NVS_TYPE_U16:  return copy_num<uint16_t, nvs_get_u16, nvs_set_u16>(src, dst, key, crc);
+    case NVS_TYPE_I16:  return copy_num<int16_t,  nvs_get_i16, nvs_set_i16>(src, dst, key, crc);
+    case NVS_TYPE_U32:  return copy_num<uint32_t, nvs_get_u32, nvs_set_u32>(src, dst, key, crc);
+    case NVS_TYPE_I32:  return copy_num<int32_t,  nvs_get_i32, nvs_set_i32>(src, dst, key, crc);
+    case NVS_TYPE_U64:  return copy_num<uint64_t, nvs_get_u64, nvs_set_u64>(src, dst, key, crc);
+    case NVS_TYPE_I64:  return copy_num<int64_t,  nvs_get_i64, nvs_set_i64>(src, dst, key, crc);
+    case NVS_TYPE_STR:  return copy_bytes(src, dst, key, true, crc);
+    case NVS_TYPE_BLOB: return copy_bytes(src, dst, key, false, crc);
     default:            return false;
     }
 }
 
-// Every entry of `ns`, from one partition to the other.
-static bool copy_ns(const char* from, const char* to, const char* ns) {
+// Every entry of `ns`, from one partition to the other, or only read when `to`
+// is null. Each entry's checksum (namespace, key, type and value) is added to
+// `*sum`, so the total does not depend on the order the entries come in.
+static bool copy_ns(const char* from, const char* to, const char* ns, uint32_t* sum) {
     nvs_handle_t src = 0, dst = 0;
     const esp_err_t oe = nvs_open_from_partition(from, ns, NVS_READONLY, &src);
     if (oe == ESP_ERR_NVS_NOT_FOUND) return true;   // never written: nothing to copy
     if (oe != ESP_OK) return false;
-    if (nvs_open_from_partition(to, ns, NVS_READWRITE, &dst) != ESP_OK) {
+    if (to && nvs_open_from_partition(to, ns, NVS_READWRITE, &dst) != ESP_OK) {
         nvs_close(src);
         return false;
     }
@@ -201,16 +215,28 @@ static bool copy_ns(const char* from, const char* to, const char* ns) {
     while (ok && e == ESP_OK) {
         nvs_entry_info_t info{};
         nvs_entry_info(it, &info);
-        ok = copy_entry(src, dst, info.key, info.type);
-        if (!ok) ESP_LOGE(TAG, "copying %s/%s failed", ns, info.key);
+        uint32_t crc = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(ns), strlen(ns) + 1);
+        crc = esp_rom_crc32_le(crc, reinterpret_cast<const uint8_t*>(info.key), strlen(info.key) + 1);
+        crc = esp_rom_crc32_le(crc, reinterpret_cast<const uint8_t*>(&info.type), sizeof info.type);
+        ok = copy_entry(src, to ? &dst : nullptr, info.key, info.type, &crc);
+        if (!ok) ESP_LOGE(TAG, "%s %s/%s failed", to ? "copying" : "reading", ns, info.key);
+        *sum += crc;
         n++;
         e = nvs_entry_next(&it);
     }
     nvs_release_iterator(it);
-    nvs_close(dst);
+    if (to) nvs_close(dst);
     nvs_close(src);
-    if (ok) ESP_LOGI(TAG, "copied %u entries of %s to %s", n, ns, to);
+    if (ok && to) ESP_LOGI(TAG, "copied %u entries of %s to %s", n, ns, to);
     return ok && e == ESP_ERR_NVS_NOT_FOUND;
+}
+
+// The checksum of the two namespaces as they are on nvs. False when they
+// cannot be read.
+static bool nvs_store_sum(uint32_t* sum) {
+    *sum = 0;
+    return copy_ns(NVS_DEFAULT_PART_NAME, nullptr, NVS_NS, sum) &&
+           copy_ns(NVS_DEFAULT_PART_NAME, nullptr, zap_nvs::SHADOW, sum);
 }
 
 static bool erase_ns(const char* part, const char* ns) {
@@ -250,6 +276,25 @@ static bool mark_clear(const char* part, const char* key) {
     const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(h) == ESP_OK;
     nvs_close(h);
     return ok;
+}
+
+// "src": the checksum of nvs the copy on zhac_data was taken from.
+static bool src_get(uint32_t* v) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    const bool ok = nvs_get_u32(h, "src", v) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+static bool src_set(uint32_t v) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u32(h, "src", v), TAG, "set_u32 copy checksum");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit copy checksum");
+    nvs_close(h);
+    return acc == ESP_OK;
 }
 
 // The namespace holds at least one entry.
@@ -295,9 +340,9 @@ static bool data_part_select() {
         if (moved) ESP_LOGE(TAG, "the device store lives on '%s', which this build does not have", DATA_PART);
         return !moved;
     }
-    // Before the move the store of record is on nvs, so nothing depends on
-    // zhac_data yet; after it (or with nothing on nvs, so zhac_data may hold
-    // the only copy) zhac_data is never formatted.
+    // Before the move nvs holds a whole store, so an unusable zhac_data is
+    // formatted (this build cannot read what it holds anyway); after it (or with
+    // nothing on nvs, so zhac_data may hold the only copy) it is never formatted.
     const bool before_move = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
     esp_err_t e = nvs_flash_init_partition(DATA_PART);
     if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
@@ -328,18 +373,28 @@ static bool data_part_select() {
     // Not moved: nvs holds the store of record. If nvs itself cannot be read,
     // leave zhac_data alone (the store then fails to open and stays shut).
     if (!ns_readable(NVS_DEFAULT_PART_NAME, NVS_NS)) return true;
-    // Copied afresh at every boot until the move is final: a copy an earlier
-    // trial left may predate a rollback and days on the build before, and this
-    // build can come back without a trial (a USB flash), so "done" alone does
-    // not tell a current copy from a stale one.
-    const bool ok = mark_clear(DATA_PART, "done") &&
-                    erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
-                    copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS) &&
-                    copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW) &&
-                    mark_set(DATA_PART, "done");
-    if (!ok) {
-        ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
-        return true;
+    // Until the move is final the copy counts only while nvs is still what it
+    // was taken from. Then nothing wrote nvs since, and the copy with this
+    // build's writes on top is the newest store, also after a restart that came
+    // before a mark would write (review 2026-10-29 N-05). Once nvs changed (a
+    // trial rolled back and the build before ran on it, or this build came back
+    // by USB after that) the copy is stale and is taken afresh. "done" alone
+    // cannot tell the two apart; the checksum kept with the copy can.
+    uint32_t now = 0, then = 0;
+    const bool read = nvs_store_sum(&now);
+    if (read && mark_get(DATA_PART, "done") && src_get(&then) && then == now) {
+        ESP_LOGI(TAG, "the copy on '%s' is current (nvs unchanged since it was taken)", DATA_PART);
+    } else {
+        uint32_t sum = 0;
+        const bool ok = read && mark_clear(DATA_PART, "done") &&
+                        erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
+                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS, &sum) &&
+                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW, &sum) &&
+                        src_set(sum) && mark_set(DATA_PART, "done");
+        if (!ok) {
+            ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
+            return true;
+        }
     }
     s_part = DATA_PART;
     if (image_on_trial()) {
@@ -347,10 +402,9 @@ static bool data_part_select() {
         return true;
     }
     if (!zap_store_confirm_move()) {   // this image cannot roll back
-        // With neither mark the next boot copies nvs over zhac_data again, so
-        // nvs stays the store of record until a mark sticks (review R-03).
-        s_part = NVS_DEFAULT_PART_NAME;
-        ESP_LOGW(TAG, "could not mark the move to '%s' -- the store stays on nvs, retry next boot", DATA_PART);
+        // Still on zhac_data: the store does not write nvs from there, so the
+        // next boot finds the copy current and keeps it (above).
+        ESP_LOGW(TAG, "could not mark the move to '%s' final -- the copy on nvs stays, retry next boot", DATA_PART);
         return true;
     }
     erase_old_copy();

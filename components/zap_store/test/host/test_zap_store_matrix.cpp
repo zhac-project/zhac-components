@@ -624,7 +624,7 @@ int main() {
 
         // A power cut anywhere in the copy: the next boot ends with every device.
         bool all_ok = true;
-        for (int cut = 0; cut <= 12; cut++) {
+        for (int cut = 0; cut <= 24; cut++) {
             seed();
             nvs_stub_add_partition("zhac_data");
             nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
@@ -771,6 +771,54 @@ int main() {
         zap_store_init();                           // the next plain boot
         CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x09ULL),
               "update path: after the confirmed retry the next boot keeps zhac_data");
+
+        // Review 2026-10-29 N-05: the update was kept (valid, no rollback any
+        // more), neither move mark writes, and the hub restarts before a retry
+        // sticks. nvs has not changed since the copy, so the copy with what was
+        // saved on it since is the newest store: the restart must keep it.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial boot: copied, runs on zhac_data
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);      // marked valid; confirming fails
+        CHECK(!zap_store_confirm_move(), "kept update: confirming while both marks fail reports it");
+        ZapDevice ten = make_dev(0x0AULL, 10, "paired before the restart");
+        CHECK(zap_store_save_device(&ten), "kept update: a device paired meanwhile is saved");
+        zap_store_init();                           // the restart, the marks still failing
+        CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 &&
+              zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x0AULL),
+              "kept update, marks failing: a restart keeps what was saved since the copy");
+        CHECK(nvs_stub_count("nvs", "zap_v0") > 0, "... and keeps the old copy on nvs (the move is not final)");
+        ZapDevice eleven = make_dev(0x0BULL, 11, "paired after the restart");
+        (void)zap_store_save_device(&eleven);
+        nvs_stub_fail_key("live", false);
+        nvs_stub_fail_key("moved", false);
+        zap_store_init();                           // a later boot, the marks write again
+        CHECK(zap_store_load_devices(pool, 8) == 4 && pool_has(pool, 4, 0x0BULL) &&
+              nvs_stub_count("nvs", "zap_v0") == 0,
+              "... and a later boot finishes the move with every device");
+
+        // A copy whose source changed since is stale even with the same devices:
+        // after a rollback the build before renamed one on nvs (a value, not a key).
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial boot: copied
+        nvs_stub_drop_partition("zhac_data");       // rolled back: the build before runs on nvs
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();
+        ZapDevice renamed = make_dev(0x01ULL, 1, "renamed");
+        (void)zap_store_save_device(&renamed);
+        nvs_stub_add_partition("zhac_data");        // updated again
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();
+        bool got_rename = false;
+        const uint16_t nr = zap_store_load_devices(pool, 8);
+        for (uint16_t i = 0; i < nr; i++)
+            if (pool[i].ieee_addr == 0x01ULL) got_rename = strcmp(pool[i].friendly_name, "renamed") == 0;
+        CHECK(nr == 2 && got_rename, "a rename made on nvs after the copy reaches the store");
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();
