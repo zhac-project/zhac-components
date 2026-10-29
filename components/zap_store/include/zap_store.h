@@ -57,11 +57,16 @@ const char* zap_store_data_part();
 // Makes a move to zhac_data final. Call once the running image is marked
 // valid (it can no longer roll back to a build that reads the store from
 // nvs); a boot that is not an update's trial does it by itself. Two small
-// NVS writes. True when a mark reads back, so the next boot opens the store on
-// zhac_data -- only then may the copy on nvs go -- and when there is nothing
-// to confirm (the store is on nvs). False means the next boot would copy nvs
-// over zhac_data: call it again until it is true (review 2026-10-28 R-03).
+// NVS writes, only from a boot that opened the store on zhac_data: on one that
+// kept it shut nothing is written (fix re-review N1). Returns
+// zap_store_move_final(); false means the copy on nvs must stay: call it again
+// until it is true (review 2026-10-28 R-03).
 bool zap_store_confirm_move();
+
+// True when the store is on nvs or its move to zhac_data is marked final, so
+// the copy on nvs is no longer needed. False while the move is not final: an
+// older build would run on that copy. Reads, never writes.
+bool zap_store_move_final();
 
 // One-time marks kept in the device store's namespace, so they travel with
 // the device records: copied with them to zhac_data, rolled back and reset

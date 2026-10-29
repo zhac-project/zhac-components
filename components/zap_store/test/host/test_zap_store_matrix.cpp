@@ -758,7 +758,7 @@ int main() {
         // boot that runs on zhac_data. With both marks failing, confirming must
         // say so, so the caller retries; nothing to confirm is not a failure.
         seed();
-        CHECK(zap_store_confirm_move(), "store on nvs: nothing to confirm is success");
+        CHECK(zap_store_confirm_move() && zap_store_move_final(), "store on nvs: nothing to confirm is success");
         nvs_stub_add_partition("zhac_data");
         nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
         zap_store_init();                           // trial boot: copied, runs on zhac_data
@@ -868,6 +868,7 @@ int main() {
 
         // Page compaction lists nvs in another order: the checksum still matches.
         unconfirmed();
+        CHECK(!zap_store_move_final(), "unconfirmed: the move is not final (an older build is refused)");
         nvs_stub_reverse_iteration(true);
         zap_store_init();                           // the restart
         nvs_stub_reverse_iteration(false);
@@ -909,6 +910,46 @@ int main() {
         zap_store_init();
         CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x0AULL),
               "unconfirmed, nvs wiped: the copy is kept with every device");
+
+        // Fix re-review N1: a boot that keeps the store shut must not mark the
+        // move final, or the copy it refused to choose becomes the store of
+        // record. A trial copied the store and rolled back, the build before
+        // paired a device on nvs, and this build came back by USB to a boot that
+        // could not read one entry on nvs.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial boot: copied
+        nvs_stub_drop_partition("zhac_data");       // rolled back: the build before runs on nvs
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();
+        ZapDevice older = make_dev(0x0BULL, 11, "paired by the build before");
+        (void)zap_store_save_device(&older);
+        nvs_stub_add_partition("zhac_data");        // this build again, by USB: a plain boot
+        nvs_stub_fail_read("nvs", "schema_ver", true);
+        zap_store_init();
+        CHECK(!zap_store_is_ready(), "back by USB, nvs not readable whole: the store stays shut");
+        CHECK(!zap_store_confirm_move() && !zap_store_move_final() && nvs_stub_count("nvs", "zap_mig") == 0,
+              "... confirming on that boot writes no mark and says the move is not final");
+        nvs_stub_fail_read("nvs", "schema_ver", false);
+        zap_store_init();
+        CHECK(zap_store_load_devices(pool, 8) == 3 && pool_has(pool, 3, 0x0BULL),
+              "... so the next boot copies the changed nvs, with the device the build before paired");
+
+        // The same before a first move, with nothing on nvs: zhac_data cannot be
+        // used for one boot. A mark written then would shut the store for good.
+        fresh_store();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_init_result("zhac_data", ESP_FAIL);
+        nvs_stub_part_fails("zhac_data", true);
+        zap_store_init();
+        CHECK(!zap_store_is_ready() && !zap_store_confirm_move() && nvs_stub_count("nvs", "zap_mig") == 0,
+              "zhac_data unusable, nothing on nvs: the store is shut and confirming writes no mark");
+        nvs_stub_init_result("zhac_data", ESP_OK);
+        nvs_stub_part_fails("zhac_data", false);
+        zap_store_init();
+        CHECK(zap_store_is_ready() && strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_move_final(),
+              "... and the next good boot moves the store to zhac_data, final");
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();

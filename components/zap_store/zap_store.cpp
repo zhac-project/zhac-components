@@ -45,7 +45,8 @@ static bool        s_ready = false;
 //     rollback whose build wrote nothing keeps the trial's changes, as the
 //     Zigbee network does;
 //   - zap_store_confirm_move() (the image was marked valid) or a boot that is
-//     not a trial makes the move final: "live" on `zhac_data`, beside the data,
+//     not a trial makes the move final, once that boot opened the store on
+//     `zhac_data` (fix re-review N1): "live" on `zhac_data`, beside the data,
 //     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
 //     never copied over, never formatted, and leftovers on `nvs` are erased.
 //     A mark that will not write only leaves the old copy on `nvs` for a later
@@ -332,6 +333,17 @@ static void erase_old_copy() {
         ESP_LOGW(TAG, "the old device store on nvs could not be erased -- retry next boot");
 }
 
+// Writes the move's marks; true when one reads back. Only for a boot that
+// chose zhac_data (zap_store_confirm_move()).
+static bool confirm_marks() {
+    // With the data first: an nvs that cannot be read later must not make a
+    // trial boot copy over the store of record.
+    if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
+        ESP_LOGW(TAG, "could not mark the move to '%s' final", DATA_PART);
+    if (!mark_get(NVS_DEFAULT_PART_NAME, "moved")) mark_set(NVS_DEFAULT_PART_NAME, "moved");
+    return zap_store_move_final();
+}
+
 // Picks the partition the store lives on, moving it there once (see the top
 // of this file). False when the store of record sits on a partition that
 // cannot be used: the store then stays shut.
@@ -372,7 +384,7 @@ static bool data_part_select() {
             ESP_LOGE(TAG, "'%s' lost the device store (no move mark) -- store shut; reset storage", DATA_PART);
             return false;
         }
-        zap_store_confirm_move();   // either mark may be missing: nvs was erased, or a write failed
+        confirm_marks();   // either mark may be missing: nvs was erased, or a write failed
         // Confirmed at run time, or left by an older build since. Not on a
         // trial boot: if this update rolls back, that older build wants them.
         if (!image_on_trial()) erase_old_copy();
@@ -421,7 +433,7 @@ static bool data_part_select() {
         ESP_LOGI(TAG, "device store on '%s'; the copy on nvs stays until this update is confirmed", DATA_PART);
         return true;
     }
-    if (!zap_store_confirm_move()) {   // this image cannot roll back
+    if (!confirm_marks()) {   // this image cannot roll back
         // Still on zhac_data: the store does not write nvs from there, so the
         // next boot finds the copy current and keeps it (above).
         ESP_LOGW(TAG, "could not mark the move to '%s' final -- the copy on nvs stays, retry next boot", DATA_PART);
@@ -432,14 +444,15 @@ static bool data_part_select() {
     return true;
 }
 
+bool zap_store_move_final() {
+    return s_part != DATA_PART || mark_get(DATA_PART, "live") || mark_get(NVS_DEFAULT_PART_NAME, "moved");
+}
+
 bool zap_store_confirm_move() {
-    if (s_part != DATA_PART) return true;   // the store is on nvs: nothing to confirm
-    // With the data first: an nvs that cannot be read later must not make a
-    // trial boot copy over the store of record.
-    if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
-        ESP_LOGW(TAG, "could not mark the move to '%s' final", DATA_PART);
-    if (!mark_get(NVS_DEFAULT_PART_NAME, "moved")) mark_set(NVS_DEFAULT_PART_NAME, "moved");
-    return mark_get(DATA_PART, "live") || mark_get(NVS_DEFAULT_PART_NAME, "moved");
+    // A boot that kept the store shut did not choose zhac_data: a mark would make
+    // the copy it refused the store of record (fix re-review N1).
+    if (!s_ready) return zap_store_move_final();
+    return s_part != DATA_PART || confirm_marks();
 }
 
 bool zap_store_flag_get(const char* key) {
