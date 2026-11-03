@@ -56,6 +56,10 @@ static constexpr uint32_t FLUSH_WAIT_MAX_MS  = 5000;
 //   FLUSHING + NVS write failed → settle reverts to DIRTY (retry next
 //                                 tick, in place — no re-queue)
 //
+// A hard delete changes no slot: every write reads the pool's copy under the
+// store lock (zap_store_save_live), so a device the pool no longer has is
+// dropped, never written back (review 2026-10-28 R-11).
+//
 // A FLUSHING slot is skipped by find_free_slot_locked, so it cannot be
 // reused for a different IEEE while its NVS write is in flight, and the
 // flush barriers (flush_now / flush_device) can wait on it. Only the
@@ -140,22 +144,17 @@ static FlushOutcome flush_slot(size_t idx, const uint64_t* expect_ieee = nullptr
     s_dirty[idx].remarked = false;
     xSemaphoreGive(s_mtx);
 
-    bool persisted = false;
-    bool dropped   = false;
-    if (!s_snapshot) {
-        ESP_LOGW(TAG, "no snapshot_cb — dropping dirty ieee=0x%016llx",
+    // The pool's copy, read and written under the store lock: a hard delete
+    // (pool first, then the store) either removes what this wrote or comes
+    // first and leaves nothing to copy (review 2026-10-28 R-11).
+    bool dropped = false;
+    const bool persisted = zap_store_save_live(snap.ieee, s_snapshot, &dropped);
+    if (dropped) {
+        ESP_LOGD(TAG, "snapshot missing for ieee=0x%016llx — skip",
+                 (unsigned long long)snap.ieee);   // device left the pool; nothing to persist
+    } else if (!persisted) {
+        ESP_LOGE(TAG, "save failed ieee=0x%016llx — retrying next tick",
                  (unsigned long long)snap.ieee);
-        dropped = true;
-    } else {
-        ZapDevice dev{};
-        if (!s_snapshot(snap.ieee, &dev)) {
-            ESP_LOGD(TAG, "snapshot missing for ieee=0x%016llx — skip",
-                     (unsigned long long)snap.ieee);
-            dropped = true;   // device left the pool; nothing to persist
-        } else if (!(persisted = zap_store_save_device(&dev))) {
-            ESP_LOGE(TAG, "save failed ieee=0x%016llx — retrying next tick",
-                     (unsigned long long)snap.ieee);
-        }
     }
 
     // Settle. Only we (the FLUSHING owner) may free the slot; mark_dirty
@@ -178,34 +177,37 @@ static FlushOutcome flush_slot(size_t idx, const uint64_t* expect_ieee = nullptr
 
 void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {
     if (!dev) return;
-    // No writeback task yet (init order): fall back to immediate write.
-    if (!s_mtx || !s_task_started) {
+    // No writeback task yet (init order), or nothing to read the device back
+    // from at flush time: write it now, as the header promises. (Without a
+    // snapshot callback every deferred write was dropped -- the single-chip
+    // build never installed one, review 2026-10-28 M7.)
+    if (!s_mtx || !s_task_started || !s_snapshot) {
         zap_store_save_device(dev);
         return;
     }
+    const uint64_t ieee = dev->ieee_addr;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    int slot = find_slot_locked(dev->ieee_addr);
+    int slot = find_slot_locked(ieee);
     if (slot < 0) slot = find_free_slot_locked();
     if (slot < 0) {
         xSemaphoreGive(s_mtx);
         // Dirty-table full: force immediate persist as fallback to avoid
         // losing the write. Rare — 64 concurrent dirty devices is a lot.
-        // Stack-snapshot the device first: callers from the interview
-        // path pass `dev` into the live pool, and the flush-mutex release
-        // above can race with a `pool_remove` (swap-with-last) that
-        // relocates the entry at `dev` to a different device — passing
-        // the raw pointer to save_device would then write the wrong
-        // record under our IEEE.
-        ZapDevice snap = *dev;
+        // The pool's current copy, by IEEE, under the store lock -- not the
+        // caller's: callers from the interview path pass `dev` into the live
+        // pool, where a `pool_remove` (swap-with-last) can relocate another
+        // device to it, and a copy taken before a hard delete must not be
+        // written after it (review 2026-10-28 R-11).
         ESP_LOGW(TAG, "dirty table full — immediate save ieee=0x%016llx",
-                 (unsigned long long)snap.ieee_addr);
-        zap_store_save_device(&snap);
+                 (unsigned long long)ieee);
+        bool gone = false;
+        (void)zap_store_save_live(ieee, s_snapshot, &gone);
         return;
     }
     // If entry exists, upgrade priority (HIGH wins) but keep original
     // marked_ms so older HIGH writes don't get delayed by renewed LOW.
     if (s_dirty[slot].state == SLOT_FREE) {
-        s_dirty[slot].ieee      = dev->ieee_addr;
+        s_dirty[slot].ieee      = ieee;
         s_dirty[slot].marked_ms = now_ms();
         s_dirty[slot].pri       = (uint8_t)pri;
         s_dirty[slot].state     = SLOT_DIRTY;

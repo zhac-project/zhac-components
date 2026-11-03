@@ -96,9 +96,15 @@ int main() {
     RuleSlot e = make_slot(3, "rule-e", "ON x#s=1 DO log m ENDON", true);
     rule_store_save(&e);
     CHECK(rule_store_count() == 1, "one rule before schema bump");
-    nvs_stub_set_schema(99);              // simulate a different on-disk schema
+    nvs_stub_set_schema(99);              // written by a newer firmware (a downgrade)
+    rule_store_init();
+    CHECK(!rule_store_save(&e), "newer schema: the store is unavailable");
+    nvs_stub_set_schema(1);               // the newer firmware's rules, read by it again
+    rule_store_init();
+    CHECK(rule_store_count() == 1, "newer schema: the rules were not erased");
+    nvs_stub_set_schema(0);               // an older on-disk schema
     rule_store_init();                    // re-init detects the mismatch
-    CHECK(rule_store_count() == 0, "schema-version mismatch wipes all rules");
+    CHECK(rule_store_count() == 0, "older schema-version wipes all rules");
 
     // ── overlay / flush ──────────────────────────────────────────────────
     nvs_stub_reset();

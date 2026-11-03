@@ -26,6 +26,7 @@ add_executable(device_shadow_host_test
     test_device_shadow.cpp
     stubs/nvs_stub.cpp
     stubs/nvs_u8_stub.cpp
+    stubs/zap_store_platform_stub.cpp
     ${COMPONENTS_DIR}/device_shadow/device_shadow.cpp
     ${COMPONENTS_DIR}/device_shadow/shadow_pipeline.cpp
     ${COMPONENTS_DIR}/event_bus/event_bus.cpp

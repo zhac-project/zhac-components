@@ -43,6 +43,7 @@
 #include "zigbee_mgr.h"
 #include "zigbee_pool.h"
 #include "zigbee_configure_queue.h"
+#include "zigbee_interview_utils.h"   // zigbee_parse_basic_identity (G14)
 #include "zap_common.h"
 #include "zap_store.h"
 #include "zhc_adapter.h"   // zhac_shadow_update_fn_t (G12 battery mirroring)
@@ -721,6 +722,15 @@ int main() {
         CHECK(!device_shadow_get_attr(kBatIeee, "dp_20", &sa), "REMOVE kind drops the saved dp_20");
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
               "and leaves the device alone");
+
+        // A float is stored ×100 to the nearest hundredth: 20.05f is 20.0499…,
+        // which truncation stored as 2004 (shown 20.04).
+        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, 20.05f, false, nullptr);
+        CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == 2005,
+              "float 20.05 is stored as 2005, not 2004");
+        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, -5.05f, false, nullptr);
+        CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == -505,
+              "float -5.05 is stored as -505");
     }
 
     // ── G13: meter-poll device source (zhc_shadow_bridge) ───────────────
@@ -776,6 +786,77 @@ int main() {
         if (g_stub_seen_fn) g_stub_seen_fn(0xA4C1380000000001ULL);
         CHECK(seen_ieee == 0xA4C1380000000001ULL, "seen hook publishes DEVICE_SEEN with the ieee");
         event_bus_unsubscribe(h);
+    }
+
+    // ── G14: radio text is stored JSON-safe (review 2026-10-24 ZR-03) ───
+    // A control byte in a model or manufacturer string reached every JSON
+    // the hub writes raw (ArduinoJson escapes only a few), and one such
+    // device emptied the hub page's device list. Control bytes and invalid
+    // UTF-8 become '?', and a cut never splits a character.
+    {
+        printf("\nG14 identity and string values are stored JSON-safe\n");
+        const uint8_t model[] = {'A', 0x01, 'B', 0x1F, 0x7F, 'C', 0xC3, 0xA9};   // ..."Cé"
+        uint8_t mfg[34];                                     // 32 x 'x' + "é": the cut lands inside it
+        memset(mfg, 'x', 32);
+        mfg[32] = 0xC3; mfg[33] = 0xA9;
+        uint8_t f[3 + 5 + sizeof(model) + 5 + sizeof(mfg)];
+        size_t n = 0;
+        f[n++] = 0x18; f[n++] = 0x01; f[n++] = 0x01;        // Read Attributes Response
+        f[n++] = 0x05; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x42; f[n++] = sizeof(model);
+        memcpy(f + n, model, sizeof(model)); n += sizeof(model);
+        f[n++] = 0x04; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x42; f[n++] = sizeof(mfg);
+        memcpy(f + n, mfg, sizeof(mfg)); n += sizeof(mfg);
+        char mo[34] = {}, mf[34] = {};
+        uint16_t code = 0;
+        CHECK(zigbee_parse_basic_identity(f, (uint8_t)n, mo, sizeof(mo), mf, sizeof(mf), &code),
+              "the identity frame parses");
+        CHECK(strcmp(mo, "A?B??C\xC3\xA9") == 0, "control bytes become '?', UTF-8 stays");
+        CHECK(strlen(mf) == 32 && strspn(mf, "x") == 32, "a cut never keeps half a character");
+
+        const uint8_t bad[] = {0xFF, 0x80, 'Z', 0x00, 'Q'};
+        uint8_t g[3 + 5 + sizeof(bad)] = {0x18, 0x02, 0x01, 0x05, 0x00, 0x00, 0x42, sizeof(bad)};
+        memcpy(g + 8, bad, sizeof(bad));
+        CHECK(zigbee_parse_basic_identity(g, sizeof(g), mo, sizeof(mo), nullptr, 0, nullptr) &&
+              strcmp(mo, "??Z") == 0, "invalid UTF-8 becomes '?', a NUL ends the text");
+
+        // Two definitions match on such text and carry these stored forms (embedded-zhc
+        // lumi/SJCGQ12LM_ES.cpp, lonsonho/generated/Lon_ZB_RGBCW.cpp): keep them in step.
+        char t[40];
+        const uint8_t es[] = {'l', 'u', 'm', 'i', '.', 'f', 'l', 'o', 'o', 'd', '.', 'a', 'g', 'l', '0', '2',
+                              '\t', 'F', 0x01};
+        zigbee_copy_text(t, sizeof(t), es, sizeof(es));
+        CHECK(strcmp(t, "lumi.flood.agl02?F?") == 0, "Aqara SJCGQ12LM-ES modelID as stored");
+        const uint8_t ew[] = {'e', 'W', 'e', 'L', 'i', 0x01, 0x00, 0x10};
+        zigbee_copy_text(t, sizeof(t), ew, sizeof(ew));
+        CHECK(strcmp(t, "eWeLi?") == 0, "Lonsonho manufacturer eWeLi 01 00 10 as stored (the NUL ends it)");
+
+        // A record stored before this fix is cleaned when it is restored.
+        pool_clear();
+        ZapDevice old{};
+        old.ieee_addr = 0x5333000000000033ULL;
+        std::strcpy(old.model_id, "TS\x01" "0601");
+        std::strcpy(old.manufacturer_name, "_TZ\x02");
+        CHECK(zap_store_save_device(&old), "seed a stored record with control bytes");
+        zigbee_pool_restore_persisted();
+        CHECK(zigbee_pool_snapshot(0x5333000000000033ULL, &snap) &&
+              strcmp(snap.model_id, "TS?0601") == 0 && strcmp(snap.manufacturer_name, "_TZ?") == 0,
+              "restore stores the cleaned identity");
+        zap_store_delete_device(0x5333000000000033ULL);
+
+        // String values a definition decodes from radio bytes.
+        zhc_shadow_bridge_register();
+        const uint64_t kPad = 0x2222000000000016ULL;
+        ZapDevice* pad = pool_add();
+        pad->ieee_addr = kPad;
+        g_stub_shadow_fn(kPad, "mode", 5 /*String*/, 0, 0, 0.0f, false, "12\x01" "4");
+        ShadowAttr sa{};
+        CHECK(device_shadow_get_attr(kPad, "mode", &sa) && strcmp(sa.str_val, "12?4") == 0,
+              "a decoded string value is stored with '?' for the control byte");
+        // The one such value seen so far, a keypad's action_code, is the PIN
+        // typed on it: published with its press, never kept (review ZR-06).
+        g_stub_shadow_fn(kPad, "action_code", 5 /*String*/, 0, 0, 0.0f, false, "1234");
+        CHECK(!device_shadow_get_attr(kPad, "action_code", &sa), "a keypad code is not kept in the shadow");
+        pool_clear();
     }
 
     printf("\n%s (failures=%d)\n", s_failures ? "FAILED" : "OK", s_failures);

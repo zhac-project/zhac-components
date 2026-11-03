@@ -105,6 +105,13 @@ void device_cmd_permit_join_status(bool* open, int* remaining_s);
 // leftovers of a device the pool no longer has).
 DevCmdResult device_cmd_remove(uint64_t ieee, bool hard);
 
+// Records a core keeps per device outside this component (its options, its
+// group-membership mirror) must go with a hard remove, or a device paired
+// again later inherits them (review PB-08). Called after the hard sweep, on the
+// caller's task; a soft remove keeps them for the rejoin. Register once at boot.
+typedef void (*DevCmdRemovedFn)(uint64_t ieee);
+void device_cmd_set_removed_hook(DevCmdRemovedFn fn);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

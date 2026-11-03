@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "nvs_checked.h"
+#include "zap_store.h"     // zap_store_data_part: the cache lives beside the device store
 #include "esp_rom_crc.h"   // F26: esp_rom_crc32_le for blob integrity
 #include <cstring>
 #include <cstdio>
@@ -25,6 +26,10 @@
 static const char* TAG = "device_shadow";
 static const char* NVS_NS = "zap_shadow";
 static constexpr uint32_t NVS_MIN_INTERVAL_S = 300; // max one NVS write per 5min per device
+// A device whose cached keys are those on flash and only their values moved:
+// at most one write per 30 min (review 2026-10-24 PB-02). A graceful restart or
+// an OTA writes the rest first (device_shadow_flush_now).
+static constexpr uint32_t NVS_VALUE_INTERVAL_S = 1800;
 // task_shadow cadence: the queue-drain timeout AND the housekeeping/
 // persistence sweep period. Comments below cite this constant by name.
 static constexpr uint32_t SWEEP_PERIOD_MS = 100;
@@ -149,6 +154,20 @@ static uint16_t           s_count  = 0;
 // the old code had on s_mutex, just on the outer lock now.
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_emit_mutex;
+// Flash order (review 2026-10-28, fix review M5): a sweep or a config setter
+// copies an entry under s_mutex and writes it to flash after releasing it, so
+// a remove (or clear_attrs) that erased the keys in between saw them written
+// back -- a deleted device's cache and settings returned at the next boot, and
+// a re-paired one inherited them. Every flash write of an entry holds this from
+// before its copy to after its write, and every erase holds it too. Taken
+// before s_emit_mutex and s_mutex, never inside them.
+static SemaphoreHandle_t s_flash_mutex;
+struct FlashOrder {
+    FlashOrder()  { if (s_flash_mutex) xSemaphoreTakeRecursive(s_flash_mutex, portMAX_DELAY); }
+    ~FlashOrder() { if (s_flash_mutex) xSemaphoreGiveRecursive(s_flash_mutex); }
+    FlashOrder(const FlashOrder&) = delete;
+    FlashOrder& operator=(const FlashOrder&) = delete;
+};
 
 // One housekeeping queue for both timer-callback kinds. Timer callbacks run
 // on the SHARED FreeRTOS timer service task and must never block on s_mutex
@@ -162,21 +181,47 @@ static DeviceShadowEntry* find_entry(uint64_t ieee);   // fwd — used by persis
 
 // ── NVS helpers ───────────────────────────────────────────────────────────
 
+// Keys a restore does not need, which change with every frame: _last_seen (the
+// device store keeps last_seen) and linkquality. Saving them made every blob
+// differ from the one on flash, so each device was rewritten every 5 min.
+static bool persisted_key(const char* key) {
+    return strncmp(key, KEY_LAST_SEEN, ATTR_KEY_MAX) != 0 && strncmp(key, "linkquality", ATTR_KEY_MAX) != 0;
+}
+
 // Serialize [ShadowBlobHdr][attrs] into `buf` (capacity must be at least
 // sizeof(ShadowBlobHdr) + SHADOW_ATTR_MAX*sizeof(ShadowAttr)). Pure RAM work
 // — safe under s_mutex. F26: prepends version + count + CRC header (see
-// ShadowBlobHdr). Returns the total blob length.
+// ShadowBlobHdr). Only what a restore needs (PB-02): the volatile keys above
+// are left out and `ts` (seconds since that boot) is saved as 0, so the same
+// values give the same bytes. Returns the total blob length.
 static size_t attr_blob_serialize(uint8_t* buf, const ShadowAttr* attrs, uint8_t count) {
     if (count > SHADOW_ATTR_MAX) count = SHADOW_ATTR_MAX;
-    const size_t plen = (size_t)count * sizeof(ShadowAttr);
     auto* h   = reinterpret_cast<ShadowBlobHdr*>(buf);
     auto* pay = buf + sizeof(ShadowBlobHdr);
-    memcpy(pay, attrs, plen);
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        if (!persisted_key(attrs[i].key)) continue;
+        uint8_t* p = pay + (size_t)n++ * sizeof(ShadowAttr);
+        memcpy(p, &attrs[i], sizeof(ShadowAttr));
+        memset(p + offsetof(ShadowAttr, ts), 0, sizeof(uint32_t));
+    }
+    const size_t plen = (size_t)n * sizeof(ShadowAttr);
     h->ver   = SHADOW_ATTR_BLOB_VER;
-    h->count = count;
+    h->count = n;
     h->_pad  = 0;
     h->crc   = esp_rom_crc32_le(0, pay, plen);
     return sizeof(ShadowBlobHdr) + plen;
+}
+
+// Caller holds s_mutex; `blob` was just serialized from `e`. False when flash
+// already holds these bytes (nothing to write); else books them as written.
+static bool persist_changed_locked(DeviceShadowEntry* e, const uint8_t* blob) {
+    const uint32_t crc = reinterpret_cast<const ShadowBlobHdr*>(blob)->crc;
+    e->nvs_attr_count = e->attr_count;
+    if (e->nvs_crc_valid && crc == e->nvs_crc) return false;
+    e->nvs_crc       = crc;
+    e->nvs_crc_valid = true;
+    return true;
 }
 
 // Flash half — tens to hundreds of ms incl. page erase, so it must run with
@@ -571,6 +616,7 @@ static void occupancy_apply_locked(DeviceShadowEntry* e) {
 static void upsert_cache(DeviceShadowEntry* e, const ZclAttribute* attrs, uint8_t count) {
     uint32_t now_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
     for (uint8_t i = 0; i < count; i++) {
+        if (zcl_attr_key_is_secret(attrs[i].key)) continue;   // staged and published, never kept (ZR-06)
         bool found = false;
         for (uint8_t j = 0; j < e->attr_count; j++) {
             if (strncmp(e->attrs[j].key, attrs[i].key, ATTR_KEY_MAX) == 0) {
@@ -782,6 +828,7 @@ static void task_shadow(void* arg) {
         for (uint16_t i = 0; ; i++) {
             size_t   blob_len = 0;
             uint64_t ieee     = 0;
+            FlashOrder flash_order;   // from the copy below to its flash write (M5)
 
             xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -796,8 +843,11 @@ static void task_shadow(void* arg) {
             if (e->no_occ_pending)            no_occ_fire_locked(e);
 
             uint32_t now_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
+            // The keys on flash, only their values moved: the longer wait.
+            const uint32_t wait_s = (e->nvs_crc_valid && e->attr_count == e->nvs_attr_count)
+                                        ? NVS_VALUE_INTERVAL_S : NVS_MIN_INTERVAL_S;
             if (e->nvs_dirty &&
-                (e->nvs_force || (now_s - e->nvs_last_write_s) >= NVS_MIN_INTERVAL_S)) {
+                (e->nvs_force || (now_s - e->nvs_last_write_s) >= wait_s)) {
                 ieee     = e->ieee;
                 blob_len = attr_blob_serialize(s_sweep_blob, e->attrs, e->attr_count);
                 // Stamp + clear optimistically under the lock. An update
@@ -808,7 +858,8 @@ static void task_shadow(void* arg) {
                 // flash (and spamming ESP_LOGE) every SWEEP_PERIOD_MS.
                 e->nvs_dirty        = false;
                 e->nvs_force        = false;
-                e->nvs_last_write_s = now_s;
+                if (persist_changed_locked(e, s_sweep_blob)) e->nvs_last_write_s = now_s;
+                else blob_len = 0;   // flash holds these bytes already
             }
             xSemaphoreGive(s_mutex);
             publish_staged();
@@ -823,7 +874,7 @@ static void task_shadow(void* arg) {
                 // device was removed mid-write (nothing left to persist).
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
                 DeviceShadowEntry* re = find_entry(ieee);
-                if (re) re->nvs_dirty = true;
+                if (re) { re->nvs_dirty = true; re->nvs_crc_valid = false; }
                 xSemaphoreGive(s_mutex);
             }
         }
@@ -847,9 +898,19 @@ void device_shadow_init() {
     // and a same-value re-report won't refresh the tag — so wipe on upgrade and
     // let devices re-report as VAL_FLOAT.
     static constexpr uint8_t NVS_SHADOW_VERSION = 9;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
+    // Same partition as the device store (zhac_data on wired-core, WC-04).
+    if (nvs_open_from_partition(zap_store_data_part(), NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         uint8_t ver = 0;
-        if (nvs_get_u8(s_nvs, "ver", &ver) != ESP_OK || ver != NVS_SHADOW_VERSION) {
+        const bool have_ver = nvs_get_u8(s_nvs, "ver", &ver) == ESP_OK;
+        if (have_ver && ver > NVS_SHADOW_VERSION) {
+            // Written by a newer firmware (this one is a downgrade): keep it
+            // for that firmware and run from RAM (review 2026-10-24 PB-01).
+            ESP_LOGE(TAG, "shadow NVS format v%u is newer than this firmware's v%u -- "
+                          "not erased; the cache runs without persistence",
+                     (unsigned)ver, (unsigned)NVS_SHADOW_VERSION);
+            nvs_close(s_nvs);
+            s_nvs = 0;
+        } else if (!have_ver || ver != NVS_SHADOW_VERSION) {
             esp_err_t acc = ESP_OK;
             nvs_seq(&acc, nvs_erase_all(s_nvs), TAG, "erase_all shadow");
             if (acc == ESP_OK) {
@@ -879,6 +940,8 @@ void device_shadow_init() {
     configASSERT(s_mutex);
     s_emit_mutex = xSemaphoreCreateMutex();
     configASSERT(s_emit_mutex);
+    s_flash_mutex = xSemaphoreCreateRecursiveMutex();
+    configASSERT(s_flash_mutex);
     s_task_queue = zhac_queue_create(TASK_QUEUE_DEPTH, sizeof(ShadowTaskMsg));
     configASSERT(s_task_queue);
 
@@ -935,8 +998,18 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
             e->cfg_crc_valid = true;
         }
         if (has_attrs && ac > 0) {
-            memcpy(e->attrs, sc.attrs, (size_t)ac * sizeof(ShadowAttr));
-            e->attr_count = ac;
+            uint8_t kept = 0;
+            for (uint8_t j = 0; j < ac; j++)
+                if (!zcl_attr_key_is_secret(sc.attrs[j].key)) e->attrs[kept++] = sc.attrs[j];
+            e->attr_count = kept;
+            // Book what flash holds, so a device that reports the values it
+            // had writes nothing (PB-02). s_attr_blob is free again: the load
+            // above copied out of it.
+            attr_blob_serialize(s_attr_blob, e->attrs, kept);
+            (void)persist_changed_locked(e, s_attr_blob);
+            // A secret older firmware saved (ZR-06) is not restored, and the
+            // next sweep writes the blob again without it.
+            if (kept < ac) { e->nvs_crc_valid = false; mark_attrs_dirty(e); }
         }
         // The time of the device's last report, saved with its attrs.
         for (uint8_t j = 0; j < e->attr_count; j++) {
@@ -966,9 +1039,10 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count) {
 
 void device_shadow_flush_now() {
     if (!s_mutex) return;
-    // Own scratch: task_shadow may be mid-write from s_sweep_blob. If it is
-    // writing the same device right now, the older of two snapshots taken
-    // milliseconds apart can land last; accepted on the way to a restart.
+    // Own scratch: task_shadow may be mid-write from s_sweep_blob. Each entry's
+    // copy-and-write holds FlashOrder, like the sweep's, so two writes of one
+    // device land in the order they were copied, and never after a remove's
+    // erase (fix review M5, N3).
     auto* blob = static_cast<uint8_t*>(
         heap_caps_malloc(sizeof(s_sweep_blob), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!blob) return;
@@ -976,6 +1050,7 @@ void device_shadow_flush_now() {
     for (uint16_t i = 0; ; i++) {
         uint64_t ieee = 0;
         size_t   len  = 0;
+        FlashOrder flash_order;   // from the copy below to its flash write
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (i >= s_count) { xSemaphoreGive(s_mutex); break; }
         DeviceShadowEntry* e = &s_shadow[i];
@@ -984,12 +1059,13 @@ void device_shadow_flush_now() {
             len  = attr_blob_serialize(blob, e->attrs, e->attr_count);
             e->nvs_dirty = false;
             e->nvs_force = false;
+            if (!persist_changed_locked(e, blob)) len = 0;   // already on flash
         }
         xSemaphoreGive(s_mutex);
         if (!len) continue;
         if (nvs_write_attr_blob(ieee, blob, len)) { written++; continue; }
         xSemaphoreTake(s_mutex, portMAX_DELAY);   // failed: the sweep retries it
-        if (DeviceShadowEntry* re = find_entry(ieee)) re->nvs_dirty = true;
+        if (DeviceShadowEntry* re = find_entry(ieee)) { re->nvs_dirty = true; re->nvs_crc_valid = false; }
         xSemaphoreGive(s_mutex);
     }
     heap_caps_free(blob);
@@ -999,13 +1075,18 @@ void device_shadow_flush_now() {
 void device_shadow_process(const ZapDevice* dev,
                            const ZclAttribute* attrs, uint8_t count)
 {
+    device_shadow_process_ieee(dev->ieee_addr, attrs, count);
+}
+
+void device_shadow_process_ieee(uint64_t ieee, const ZclAttribute* attrs, uint8_t count)
+{
     _METRIC_TIMER_SCOPE(METRIC_SHADOW_PROCESS);
     // Radio RX path. Pre-fix (:412) this committed attr blobs to NVS while
     // holding s_mutex; persistence is now a dirty-mark handled by the
     // task_shadow sweep, and the bus publish happens after the lock drops.
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    DeviceShadowEntry* e = find_or_create_entry(dev->ieee_addr);
+    DeviceShadowEntry* e = find_or_create_entry(ieee);
     if (!e) {
         xSemaphoreGive(s_mutex);
         xSemaphoreGive(s_emit_mutex);
@@ -1135,6 +1216,7 @@ bool device_shadow_get_attr(uint64_t ieee, const char* key, ShadowAttr* out) {
 }
 
 bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1166,6 +1248,7 @@ bool device_shadow_set_config(uint64_t ieee, const DeviceConfig* cfg) {
 }
 
 bool device_shadow_set_throttle_ms(uint64_t ieee, uint32_t throttle_ms) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_or_create_entry(ieee);
@@ -1188,6 +1271,7 @@ bool device_shadow_get_config(uint64_t ieee, DeviceConfig* out) {
 }
 
 void device_shadow_clear_attrs(uint64_t ieee) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     bool found = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
@@ -1209,6 +1293,7 @@ void device_shadow_clear_attrs(uint64_t ieee) {
         e->no_occ = NoOccupancySince{ e->no_occ.interval_s, false, false, false };  // keep the option
         e->nvs_dirty = false;
         e->nvs_force = false;
+        e->nvs_crc_valid = false;   // the blob is erased below
         e->attr_overflow_logged = false;  // T27: cache emptied — re-arm the
                                           // once-per-device overflow log so a
                                           // refill that overflows again is seen
@@ -1276,6 +1361,7 @@ bool device_shadow_remove_attr(uint64_t ieee, const char* key) {
 // for a rejoin). Lock model (T10): all table/timer work under the leaf
 // s_mutex; the two NVS erases run AFTER the lock is released.
 void device_shadow_remove(uint64_t ieee) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     bool found = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);
@@ -1316,10 +1402,10 @@ void device_shadow_remove(uint64_t ieee) {
 
     if (!found) return;   // unknown ieee — nothing in RAM or (by construction) NVS
 
-    // Leaf-lock rule: NVS erase outside s_mutex (same window/justification as
-    // clear_attrs — a concurrent sweep write for THIS ieee can't happen now
-    // that the slot is gone, and an in-flight one for the moved entry targets
-    // a different key). Erase BOTH the 'a' (attr) and 'c' (config) keys —
+    // Leaf-lock rule: NVS erase outside s_mutex. A sweep or config write that
+    // copied this entry before the slot went has finished: FlashOrder, taken
+    // first, orders it before this erase (M5). An in-flight one for the moved
+    // entry targets a different key. Erase BOTH the 'a' (attr) and 'c' (config) keys —
     // clear_attrs only ever erased 'a', so removed devices leaked their 'c'
     // config blob in NVS forever.
     if (s_nvs) {
@@ -1339,6 +1425,7 @@ void device_shadow_remove(uint64_t ieee) {
 }
 
 bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1371,6 +1458,7 @@ bool device_shadow_set_debounce_ms(uint64_t ieee, uint32_t debounce_ms) {
 }
 
 bool device_shadow_set_occupancy_timeout(uint64_t ieee, uint16_t timeout_s) {
+    FlashOrder flash_order;   // its flash write or erase, in order with the sweep's (M5)
     CfgPersist cp;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     DeviceShadowEntry* e = find_entry(ieee);

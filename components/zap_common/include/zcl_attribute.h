@@ -53,6 +53,21 @@ struct __attribute__((packed)) ZclAttribute {
     };
 };
 static_assert(sizeof(ZclAttribute) == 84);
+
+// Values that are secrets, not device state (review 2026-10-24 ZR-06): the
+// PIN typed on an alarm keypad, which fz_ias_ace_arm decodes as action_code,
+// and a door lock's user PIN as it is set (tz_lock_pin_code, "<user>:<pin>").
+// Such a value goes out once with its press (rules, Lua, the hub page, MQTT
+// without retain) and is never logged, kept in the shadow or saved.
+inline constexpr const char* kZclSecretKeys[] = {"action_code", "pin_code"};
+
+inline bool zcl_attr_key_is_secret(const char* key) {
+    if (!key) return false;
+    for (const char* k : kZclSecretKeys)
+        if (std::strncmp(key, k, ATTR_KEY_MAX) == 0) return true;
+    return false;
+}
+
 // Defense in depth — packed-struct rearrangements that preserve sizeof
 // would silently shift the union and corrupt every NVS-loaded blob
 // (SHA-F11). These fail the build the moment the layout drifts.

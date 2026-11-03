@@ -50,6 +50,16 @@ target_include_directories(zcl_attribute_host_test PRIVATE
 target_compile_options(zcl_attribute_host_test PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
+# zap_tls_policy.h: certificate dates and the broker pin (review 2026-10-24 HS-11, HS-13).
+add_executable(tls_policy_host_test
+    test_tls_policy.cpp
+)
+target_include_directories(tls_policy_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(tls_policy_host_test PRIVATE -Wall -Wextra -Werror)
+
 add_test(NAME nvs_checked_host  COMMAND nvs_checked_host_test)
 add_test(NAME sys_metrics_host  COMMAND sys_metrics_host_test)
 add_test(NAME zcl_attribute_host COMMAND zcl_attribute_host_test)
+add_test(NAME tls_policy_host  COMMAND tls_policy_host_test)

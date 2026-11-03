@@ -362,6 +362,71 @@ int main() {
     CHECK(simple_rules_run_now(tm) && stub_log_count('I', "rule 'tm' run now (Rules#Timer=2)") == 1,
           "log: Run now of a timer rule logs at INFO");
 
+    // ── 11. A rule that keeps re-triggering itself is held (LU-03) ────────
+    // `ON lamp#state DO zigbee.toggle lamp state`: each toggle makes the lamp
+    // report a new state, a changed value, which fires the rule again. A rule
+    // on a device's state that drives a device or runs a script runs at most
+    // 20 times a minute; then it is held, and one held report ends the loop.
+    static constexpr uint64_t kLoop = 0xA100000000000008ULL;
+    seed_device(kLoop, "looper");
+    const uint16_t loop = add("loop", "ON looper#state DO script.run loop ENDON");
+    for (int i = 0; i < 25; i++) report(kLoop, "state", VAL_BOOL, i & 1);
+    CHECK(fires("loop") == 20, "a rule fed by its own action runs 20 times in a minute, then is held");
+    s = status_of(loop);
+    CHECK(s && s->runs == 20 && strcmp(s->last_skip, "rate_limited") == 0,
+          "status: a held run is recorded as 'rate_limited'");
+    CHECK(stub_log_count('W', "rule 'loop' ran 20 times in a minute") == 1,
+          "the hold is logged once");
+    CHECK(simple_rules_run_now(loop) && fires("loop") == 21, "Run now is not held");
+    add("tap", "ON cube#action=\"tap\" DO script.run tap ENDON");
+    for (int i = 0; i < 25; i++) report_str(kCube, "action", "tap");
+    CHECK(fires("tap") == 25, "a button rule is not held: a press does not feed back");
+    // A meter reports power, voltage and current in each frame: the wildcard
+    // fires once per attribute and is not held.
+    static constexpr uint64_t kMeter = 0xA100000000000009ULL;
+    seed_device(kMeter, "meter");
+    add("feed", "ON meter DO script.run feed ENDON");
+    for (int i = 0; i < 9; i++) {
+        report(kMeter, "power", VAL_INT, 100 + i);
+        report(kMeter, "voltage", VAL_INT, 230 + i);
+        report(kMeter, "current", VAL_INT, 400 + i);
+    }
+    CHECK(fires("feed") == 27, "the bare `ON <device>` wildcard is not held");
+
+    // ── 12. A keypad's code is a secret (review 2026-10-24 ZR-06) ─────────
+    // The fired line named the trigger's value, so a PIN typed on a keypad went
+    // to every log sink. And the code is an event, not state: the shadow keeps
+    // none, and the same PIN typed again must fire again.
+    static constexpr uint64_t kPad = 0xA10000000000000AULL;
+    seed_device(kPad, "pad");
+    add("disarm", "ON pad#action_code=\"4711\" DO script.run disarm ENDON");
+    add("any", "ON pad DO script.run any ENDON");
+    publish_attr(kPad, "action_code", VAL_STR, 0, "4711");
+    publish_attr(kPad, "action_code", VAL_STR, 0, "4711");
+    CHECK(fires("disarm") == 2, "the same code typed twice fires its rule twice");
+    CHECK(stub_log_count('I', "4711") == 0 && stub_log_count('I', "pad#action_code=<hidden>") == 4,
+          "the fired lines hide the code, for the rule on it and for the wildcard");
+
+    // ── 11. Created Off (review 2026-10-28 R-08) ──────────────────────────
+    // The cloud's "create as Off" was create, then disable: live in between.
+    {
+        uint16_t off = 0;
+        CHECK(simple_rules_add("off", "ON door2#contact DO script.run off ENDON", &off, false),
+              "a rule can be created Off");
+        report(kDoor2, "contact", VAL_BOOL, 0);
+        report(kDoor2, "contact", VAL_BOOL, 1);
+        CHECK(fires("off") == 0, "a rule created Off does not fire");
+        RuleSlot slots[64]{};
+        const uint16_t n = simple_rules_list(slots, 64);
+        bool stored_off = false;
+        for (uint16_t i = 0; i < n; i++)
+            if (slots[i].rule_id == off) stored_off = slots[i].enabled == 0;
+        CHECK(stored_off, "it is stored Off, so it stays Off after a reboot");
+        simple_rules_enable(off, true);
+        report(kDoor2, "contact", VAL_BOOL, 0);
+        CHECK(fires("off") == 1, "once enabled it fires on the next change");
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

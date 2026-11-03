@@ -17,6 +17,7 @@
 extern void     stub_rule_store_reset(void);
 extern uint16_t stub_rule_store_count(void);
 extern bool     stub_rule_store_last_dirty(RuleSlot* out);
+extern int      stub_rule_store_unlocked_io(void);
 
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                         \
@@ -74,6 +75,21 @@ int main() {
               "add / enable / update / delete publish RULE_CHANGED added, updated, updated, deleted");
         CHECK(ids[0] == rid && ids[3] == rid, "RULE_CHANGED carries the rule id");
         CHECK(!simple_rules_enable(9999, true) && n == 4, "a failed mutation publishes nothing");
+    }
+
+    // LU-06: enable reads, flips and writes the slot back under the engine lock, as update does. Outside
+    // it, an edit saved between enable's read and its write is overwritten with the old text.
+    {
+        stub_rule_store_reset();
+        simple_rules_init();
+        uint16_t rid = 0;
+        simple_rules_add("r6", "ON Event#go DO log a ENDON", &rid);
+        int before = stub_rule_store_unlocked_io();
+        CHECK(simple_rules_enable(rid, false), "enable of a stored rule succeeds");
+        CHECK(stub_rule_store_unlocked_io() == before, "enable touches the store only under the engine lock");
+        before = stub_rule_store_unlocked_io();
+        CHECK(!simple_rules_enable(9998, true) && stub_rule_store_unlocked_io() == before,
+              "enable of an unknown rule looks it up under the lock too");
     }
 
     // A name longer than the 23 bytes a slot keeps is cut between characters, never inside one: a cut

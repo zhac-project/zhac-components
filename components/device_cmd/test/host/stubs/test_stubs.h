@@ -16,6 +16,7 @@ struct StubStore {
     int deletes = 0; int shadow_removes = 0; int def_cache_invalidates = 0; int fallback_clears = 0;
     int pool_removes = 0; int leave_reqs = 0; uint16_t leave_nwk = 0; uint64_t leave_ieee = 0;
     int permit_calls = 0; uint8_t permit_secs = 0; int backend_removes = 0;
+    bool pool_had_device_at_delete = false;   // R-11: the record must go after the pool entry
     int changed_calls = 0; uint64_t changed_ieee = 0;
     int leave_events = 0; uint64_t leave_event_ieee = 0;
 };

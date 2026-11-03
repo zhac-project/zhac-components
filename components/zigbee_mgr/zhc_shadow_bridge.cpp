@@ -11,10 +11,12 @@
 #include "zhc_adapter.h"
 #include "device_shadow.h"
 #include "zap_store.h"
+#include "zigbee_interview_utils.h"   // zigbee_copy_text
 #include "zigbee_pool.h"
 #include "event_bus.h"
 
 #include "esp_log.h"
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -44,8 +46,11 @@ constexpr uint8_t kValueKindString = 5;
 // Written only on change. Battery moves in single-percent steps over days, but
 // a chatty sensor re-reports the SAME value every few seconds — persisting each
 // one would turn a cosmetic field into a steady NVS write stream.
-void mirror_battery_pct(uint64_t ieee, const ZclAttribute& attr) {
-    if (std::strcmp(attr.key, "battery") != 0) return;
+//
+// Not inlined (review ZR-04): its ZapDevice copy then sits on the stack only
+// while it runs, after the shadow call, not under the whole decode -> shadow ->
+// event bus -> log chain that runs inside the radio stack's callback.
+__attribute__((noinline)) void mirror_battery_pct(uint64_t ieee, const ZclAttribute& attr) {
     if (attr.val_type != VAL_INT && attr.val_type != VAL_FLOAT) return;
 
     int32_t pct = attr.int_val;
@@ -87,14 +92,17 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
     }
 
     // F6/F35 (FINDINGS.md): pool_find_by_ieee returns a raw pointer whose
-    // array slot a concurrent swap-with-last pool_remove can relocate.
-    // Snapshot the device under the advisory lock and operate on the copy
-    // (device_shadow_process only reads ieee_addr and does not retain it).
-    ZapDevice snap;
-    bool found = false;
-    zigbee_pool_lock();
-    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
-    zigbee_pool_unlock();
+    // array slot a concurrent swap-with-last pool_remove can relocate, so
+    // copy under the lock. Only what is needed (review ZR-04: this runs on
+    // the radio task's stack): the identity, for the occupancy default; the
+    // shadow takes the IEEE.
+    struct Ident { char model[sizeof(ZapDevice::model_id)]; char manuf[sizeof(ZapDevice::manufacturer_name)]; };
+    Ident id;
+    const bool found = zigbee_pool_with_device(ieee, [](ZapDevice* d, void* c) {
+        auto* x = static_cast<Ident*>(c);
+        memcpy(x->model, d->model_id, sizeof(x->model));
+        memcpy(x->manuf, d->manufacturer_name, sizeof(x->manuf));
+    }, &id);
     if (!found) {
         ESP_LOGD(TAG, "no device for ieee=0x%016llx",
                  static_cast<unsigned long long>(ieee));
@@ -128,14 +136,16 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
             // guessed by key name (a hardcoded float-key list), so an integer
             // humidity got wrongly ÷100 (→0.49) on the live path while a float
             // temperature showed un-unscaled (×100 → 2900) on the snapshot path.
+            // Rounded, not truncated: 20.05f is 20.0499…, which was stored as 2004.
             attr.val_type = VAL_FLOAT;
-            attr.int_val  = static_cast<int32_t>(float_val * 100.0f);
+            attr.int_val  = static_cast<int32_t>(lroundf(float_val * 100.0f));
             break;
         case kValueKindString:
             if (!str_val) return;
             attr.val_type = VAL_STR;
-            strncpy(attr.str_val, str_val, ATTR_STR_MAX - 1);
-            attr.str_val[ATTR_STR_MAX - 1] = '\0';
+            // Often radio bytes (a keypad's action_code): made JSON-safe (ZR-03).
+            zigbee_copy_text(attr.str_val, ATTR_STR_MAX, reinterpret_cast<const uint8_t*>(str_val),
+                             strnlen(str_val, ATTR_STR_MAX));
             break;
         default:
             return;   // None / BytesRef / ObjectRef — not shadowable
@@ -147,10 +157,10 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
     // memoized, and a late identity (zigbee_identity) changes the def.
     if (std::strcmp(attr.key, "occupancy") == 0) {
         device_shadow_set_occupancy_default(
-            ieee, zhac_adapter_occupancy_timeout_default(snap.model_id, snap.manufacturer_name));
+            ieee, zhac_adapter_occupancy_timeout_default(id.model, id.manuf));
     }
-    device_shadow_process(&snap, &attr, 1);
-    mirror_battery_pct(ieee, attr);
+    device_shadow_process_ieee(ieee, &attr, 1);
+    if (std::strcmp(attr.key, "battery") == 0) mirror_battery_pct(ieee, attr);
 }
 
 // The device list meter polling walks (zhac_adapter_register_poll_source).

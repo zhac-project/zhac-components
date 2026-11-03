@@ -83,6 +83,9 @@ struct DeviceShadowEntry {
     bool          nvs_force;        // runtime-only — next sweep writes regardless of interval
     uint32_t      cfg_crc;          // F26: crc32 of last-persisted config (dedupe writes)
     bool          cfg_crc_valid;    // F26: true once cfg_crc reflects a persisted config
+    uint32_t      nvs_crc;          // runtime-only: crc32 of the attr blob on flash (PB-02 dedupe)
+    bool          nvs_crc_valid;    // runtime-only: nvs_crc is what flash holds
+    uint8_t       nvs_attr_count;   // runtime-only: attr_count when that blob was written
     bool          attr_overflow_logged; // T27: once-per-device log gate for the
                                         // 32-slot attr cap (avoids per-frame spam)
     uint16_t      occupancy_default_s;  // runtime-only: the definition's "no motion"
@@ -107,8 +110,9 @@ void device_shadow_init();
 // Restore shadow entries (config + attrs + last_seen) for each device
 // in the supplied pool slice. Caller must hold the pool lock for the
 // duration of the call (the pool array is iterated in place). A device's
-// last_seen is raised in place to the persisted `_last_seen` (the time of
-// its last report) when that is newer and was taken with a set clock.
+// last_seen is raised in place to a `_last_seen` (the time of its last
+// report) when that is newer and was taken with a set clock; blobs written
+// since review PB-02 no longer carry it (the device store keeps last_seen).
 // Table mutation is serialised internally against the (already-running)
 // task_shadow housekeeping loop; NVS reads and the DEVICE_JOIN event
 // fired per restored device both happen outside the shadow lock.
@@ -116,16 +120,20 @@ void device_shadow_init();
 // number of entries restored.
 uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count);
 
-// Write every device's unsaved attrs now, without the NVS_MIN_INTERVAL_S
-// (300 s) wait the sweep keeps. For the shutdown handler and OTA: a graceful
-// restart otherwise drops up to 5 min of state changes per device. Blocks on
-// flash writes; task context only.
+// Write every device's unsaved attrs now, without the wait the sweep keeps
+// (5 min after a new key, 30 min when only values changed). For the shutdown
+// handler and OTA: a graceful restart otherwise drops those changes. A blob
+// identical to the one on flash is not written. Blocks on flash writes; task
+// context only.
 void device_shadow_flush_now();
 
 // Called by zigbee_mgr / zhc_adapter_shadow_bridge to register a decoded
 // attribute against a device.
 void device_shadow_process(const ZapDevice* dev,
                            const ZclAttribute* attrs, uint8_t count);
+// The same by IEEE, the only thing of the device it reads: the decode path
+// runs on the radio task's stack and passes no ZapDevice copy (review ZR-04).
+void device_shadow_process_ieee(uint64_t ieee, const ZclAttribute* attrs, uint8_t count);
 
 // Called after a successful command send when config.optimistic==true.
 void device_shadow_update_optimistic(uint64_t ieee, const char* key,

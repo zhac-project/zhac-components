@@ -93,17 +93,18 @@ void vQueueDelete(QueueHandle_t q) {
 // ── Semaphore: single-threaded, always succeeds ──────────────────────────
 
 struct StubSemaphore { int depth; };
+static int s_locks_held = 0;   // every mutex together, so the store model can tell a locked access
 
 SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void) {
     return static_cast<SemaphoreHandle_t>(calloc(1, sizeof(StubSemaphore)));
 }
 BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t s, TickType_t ticks) {
     (void)ticks;
-    if (s) s->depth++;
+    if (s) { s->depth++; s_locks_held++; }
     return pdTRUE;
 }
 BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t s) {
-    if (s && s->depth > 0) s->depth--;
+    if (s && s->depth > 0) { s->depth--; s_locks_held--; }
     return pdTRUE;
 }
 
@@ -186,7 +187,13 @@ void stub_rule_store_seed_id(uint16_t id) {
 }
 uint16_t stub_rule_store_count(void) { return s_store_n; }
 
+// Loads and writes made with no mutex held: a read-modify-write outside the engine lock can lose a save
+// that lands in between (review LU-06).
+static int s_unlocked_io = 0;
+int stub_rule_store_unlocked_io(void) { return s_unlocked_io; }
+
 bool rule_store_load(uint16_t rule_id, RuleSlot* out) {
+    if (s_locks_held == 0) s_unlocked_io++;
     for (uint16_t i = 0; i < s_slot_n; i++) {
         if (s_slots[i].rule_id == rule_id) {
             if (out) *out = s_slots[i];
@@ -207,6 +214,7 @@ uint16_t rule_store_load_all(RuleSlot* out, uint16_t max_count) {
     return n;
 }
 void     rule_store_mark_dirty(const RuleSlot* slot) {
+    if (s_locks_held == 0) s_unlocked_io++;
     // Record the create so a subsequent next_rule_id() sees it persisted,
     // mirroring the real writeback overlay being folded into rule_store_max_id.
     if (slot && !rule_store_load(slot->rule_id, nullptr)) stub_rule_store_seed_id(slot->rule_id);

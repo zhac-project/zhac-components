@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // components/zigbee_mgr/zigbee_pool.cpp
 #include "zigbee_pool.h"
+#include "zigbee_interview_utils.h"   // zigbee_copy_text
 #include "zigbee_mgr.h"
 #include "zhc_adapter.h"
 #include "zap_store.h"
@@ -243,10 +244,24 @@ uint16_t zigbee_pool_restore_persisted() {
         ESP_LOGW("zigbee_pool", "restore skipped — zap_store not ready");
         return 0;
     }
+    // The pool lock, then the store lock inside zap_store_load_devices: the
+    // reverse of zap_store_save_live's order (store, then pool). Safe because
+    // this runs once at boot, before any deferred device-store write is queued;
+    // a restore at run time could deadlock against the flush task (fix review N2).
     lock();
     const uint16_t n = zap_store_load_devices(s_pool, ZAP_MAX_DEVICES);
     s_pool_count  = n;
     s_hash_dirty  = true;   // first lookup rebuilds ieee/nwk indices
+    // A record saved before identity text was cleaned (ZR-03) may still hold
+    // a control byte, and identity is rarely sent again: clean it here too.
+    for (uint16_t i = 0; i < n; i++) {
+        ZapDevice& d = s_pool[i];
+        zigbee_copy_text(d.model_id, sizeof(d.model_id), reinterpret_cast<const uint8_t*>(d.model_id),
+                         strnlen(d.model_id, sizeof(d.model_id)));
+        zigbee_copy_text(d.manufacturer_name, sizeof(d.manufacturer_name),
+                         reinterpret_cast<const uint8_t*>(d.manufacturer_name),
+                         strnlen(d.manufacturer_name, sizeof(d.manufacturer_name)));
+    }
     unlock();
     ESP_LOGI("zigbee_pool",
               "restored %u device%s from NVS — network preserved across reboot",

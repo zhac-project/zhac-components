@@ -39,6 +39,14 @@ add_executable(mqtt_gw_matrix_host_test
 
 target_compile_options(mqtt_gw_matrix_host_test PRIVATE -Wall -Wextra -Werror)
 
+# mqtt_gw_url.h: the broker URL the status shows, and an echo of it (review 2026-10-24, LOW review M6).
+add_executable(mqtt_gw_url_host_test
+    test_mqtt_gw_url.cpp
+)
+target_include_directories(mqtt_gw_url_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_compile_options(mqtt_gw_url_host_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME mqtt_gw_helpers_host COMMAND mqtt_gw_helpers_host_test)
 add_test(NAME mqtt_gw_matrix_host  COMMAND mqtt_gw_matrix_host_test)
+add_test(NAME mqtt_gw_url_host     COMMAND mqtt_gw_url_host_test)

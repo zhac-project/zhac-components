@@ -87,6 +87,17 @@ void rule_store_init() {
     }
     uint16_t stored_ver = 0;
     if (nvs_get_u16(s_nvs, "schema_ver", &stored_ver) == ESP_OK) {
+        if (stored_ver > RULE_STORE_SCHEMA_VERSION) {
+            // Written by a newer firmware: this one is a downgrade. Keep the
+            // owner's rules for it instead of wiping them (review 2026-10-24
+            // PB-01); the store stays unavailable meanwhile.
+            ESP_LOGE(TAG, "rule_store schema %u is newer than this firmware's %u -- "
+                          "rules not loaded and not erased (update again, or reset storage)",
+                     stored_ver, RULE_STORE_SCHEMA_VERSION);
+            nvs_close(s_nvs);
+            s_nvs = 0;
+            return;
+        }
         if (stored_ver != RULE_STORE_SCHEMA_VERSION) {
             ESP_LOGE(TAG, "rule_store schema mismatch stored=%u current=%u — wiping",
                      stored_ver, RULE_STORE_SCHEMA_VERSION);

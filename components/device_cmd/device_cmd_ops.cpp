@@ -76,6 +76,9 @@ void device_cmd_permit_join_status(bool* open, int* remaining_s) {
 
 // ── Remove ──────────────────────────────────────────────────────────────
 
+static DevCmdRemovedFn s_removed = nullptr;
+void device_cmd_set_removed_hook(DevCmdRemovedFn fn) { s_removed = fn; }
+
 DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     if (!ieee) return DEVCMD_BAD_ARGS;
     ZapDevice snap{};
@@ -103,11 +106,16 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     if (!hard) {
         zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
     } else {
+        // Out of the pool first: every deferred write reads the pool under the
+        // store lock (zap_store_save_live), so one that runs after this line
+        // writes nothing, and one already writing is removed by the delete
+        // below (review 2026-10-28 R-11).
+        zigbee_pool_remove(ieee);
         zap_store_delete_device(ieee);
         device_shadow_remove(ieee);
         zhac_adapter_invalidate_def_cache(ieee);
         zhac_adapter_fallback_clear(ieee);
-        zigbee_pool_remove(ieee);
+        if (s_removed) s_removed(ieee);   // the core's own records: options, group mirror (PB-08)
         ESP_LOGI(TAG, "removed 0x%016llX (hard)", static_cast<unsigned long long>(ieee));
     }
     // Gone from this hub, soft or hard: the web UI drops the row, Home

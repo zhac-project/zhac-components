@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "zap_common.h"   // ZAP_MAX_DEVICES — single source of device-count truth
+#include "zcl_attribute.h" // zcl_attr_key_is_secret: values that are never logged
 #include "zhac_task.h"    // zhac_task_create: PSRAM stacks where the target allows
 #include "wake_queue.hpp" // send-when-awake policy for devices that sleep between polls
 #include "meter_poll.hpp" // periodic meter reads for plugs that never report
@@ -654,6 +655,12 @@ const zhc::PreparedDefinition* resolve_supplement(std::uint64_t ieee,
                                                     const zhc::PreparedDefinition* primary) {
     if (ieee == 0 || !primary) return nullptr;
     if (find_definition(model_id, manu_name) == nullptr) return nullptr;
+    // None for Aqara/Xiaomi. Their definitions decode what the devices send and
+    // bind only where z2m does, mostly nothing; a fill-in would bind and set up
+    // reporting z2m leaves alone (a sleeping sensor never answers) and decode
+    // OnOff or illuminance a second time, on the generic scale.
+    for (std::size_t i = 0; i < zhc::devices::lumi::kLumiRegistryCount; ++i)
+        if (zhc::devices::lumi::kLumiRegistry[i] == primary) return nullptr;
 
     // Check per-slot cache before running synth. The snapshot reads the
     // cached_supplement state under s_slots_mtx and copies it out — synth
@@ -756,12 +763,18 @@ void log_payload(std::uint64_t ieee,
     if (!result.any_matched) {
         // Show why the frame didn't match: cluster, family, command/attr,
         // first 16 bytes of raw ZCL. Lets ports be debugged without a
-        // sniffer trace.
+        // sniffer trace. Not for IAS ACE (0x0501), whose arm and bypass
+        // commands carry the PIN typed on the keypad, nor for a door lock's
+        // operation and programming event notifications (0x0101, 0x20/0x21),
+        // which carry the PIN used (review ZR-06).
         char hex[3 * 16 + 1] = {0};
-        const std::size_t n = zcl_len < 16 ? zcl_len : 16;
+        const bool hide = cluster_id == 0x0501 ||
+                          (cluster_id == 0x0101 && msg && (msg->command_id == 0x20 || msg->command_id == 0x21));
+        const std::size_t n = hide ? 0 : (zcl_len < 16 ? zcl_len : 16);
         for (std::size_t i = 0; i < n; ++i) {
             std::snprintf(hex + i * 3, 4, "%02x ", zcl[i]);
         }
+        if (hide) std::snprintf(hex, sizeof(hex), "<hidden>");
         const char* family_name = "?";
         if (msg) {
             switch (msg->family) {
@@ -805,7 +818,7 @@ void log_payload(std::uint64_t ieee,
                      family_name,
                      msg ? static_cast<unsigned>(msg->type) : 0,
                      msg ? msg->command_id : 0,
-                     zcl_len, hex, zcl_len > 16 ? "…" : "");
+                     zcl_len, hex, !hide && zcl_len > 16 ? "…" : "");
         }
         return;
     }
@@ -820,7 +833,8 @@ void log_payload(std::uint64_t ieee,
     for (std::uint8_t i = 0; i < result.merged.count; ++i) {
         const auto& kv = result.merged.items[i];
         char buf[48];
-        format_value(buf, sizeof(buf), kv.value);
+        if (zcl_attr_key_is_secret(kv.key)) std::snprintf(buf, sizeof(buf), "<hidden>");   // a keypad PIN (ZR-06)
+        else format_value(buf, sizeof(buf), kv.value);
         ESP_LOGI(TAG, "  %s = %s", kv.key ? kv.key : "?", buf);
     }
 }
@@ -2001,6 +2015,7 @@ bool dispatch_and_send(uint64_t ieee,
         case zhc::ValueType::Float: std::snprintf(shown, sizeof(shown), "%.2f", static_cast<double>(value.f)); break;
         default: std::snprintf(shown, sizeof(shown), "(type %u)", static_cast<unsigned>(value.type)); break;
     }
+    if (zcl_attr_key_is_secret(key)) std::snprintf(shown, sizeof(shown), "<hidden>");   // a lock PIN (ZR-06)
     ESP_LOGI(TAG, "[zhc-send] 0x%016llx %s=%s -> ep=%u cl=0x%04x len=%u",
              static_cast<unsigned long long>(ieee), key, shown, target_ep, r.cluster_id,
              static_cast<unsigned>(r.frame_size));

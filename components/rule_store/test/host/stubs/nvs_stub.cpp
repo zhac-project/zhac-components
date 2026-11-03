@@ -23,6 +23,7 @@ static std::map<std::string, uint16_t>             g_u16;
 
 esp_err_t nvs_open(const char*, nvs_open_mode_t, nvs_handle_t* out) { *out = 1; return ESP_OK; }
 esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
+void      nvs_close(nvs_handle_t) {}
 
 esp_err_t nvs_set_blob(nvs_handle_t, const char* key, const void* val, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(val);

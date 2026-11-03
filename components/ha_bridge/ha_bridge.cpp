@@ -20,6 +20,8 @@
 #include "freertos/task.h"
 #include "mqtt_gw.h"
 #include "nvs.h"
+#include "zcl_attribute.h"   // kZclSecretKeys
+#include "zhac_task.h"   // zhac_task_create: PSRAM stacks only where flash access is safe
 
 static const char* TAG = "ha_bridge";
 
@@ -32,7 +34,8 @@ constexpr int         kQueueDepth   = 24;
 // 8 KB left 368 B at the high-water mark on the S31 (2026-09-29): the host's
 // device callback (e.g. the wired core's with_device(), ~3.6 KB of frame with
 // a pool snapshot and 32 shadow attrs) runs on this stack under the publish
-// path. The stack lives in PSRAM (see ha_bridge_init), so headroom is cheap.
+// path. The stack is in PSRAM on the S31 and the S3 builds, internal RAM on
+// the wired P4 (see ha_bridge_init).
 constexpr uint32_t    kTaskStack    = 12288;
 // A battery device that has said nothing for this long is reported offline
 // (zigbee2mqtt's default for passive devices). Mains devices are never timed
@@ -129,10 +132,22 @@ void retract_topics(const char* topics) {
     }
 }
 
+// Older firmware published a secret (a keypad's code, review ZR-06) retained,
+// and a publish without retain neither removes nor replaces a retained
+// message: an empty retained one clears it.
+void clear_secret_state(uint64_t ieee) {
+    for (const char* key : kZclSecretKeys) {
+        char topic[128];
+        if (ha::state_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee, key) >= 0)
+            publish(topic, "", 1, true);
+    }
+}
+
 void retract_device(uint64_t ieee) {
     Published* s = slot_for(ieee, false);
     if (!s) return;
     retract_topics(s->topics);
+    clear_secret_state(ieee);
     if (s->passive) {
         // Clear the retained availability too, or HA keeps a stale value
         // should the device ever be re-added under this address.
@@ -197,6 +212,7 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
         }
     }
     free(col);
+    if (ha::names_secret(d.exposes)) clear_secret_state(d.ieee);
     publish_attrs(d.ieee, d.attrs);   // HA shows the current values right away
 }
 
@@ -249,7 +265,8 @@ void retract_all() {
 void handle_command(const Msg& m) {
     if (!s_plat || !s_plat->set_attr) return;
     if (!s_plat->set_attr(m.ieee, m.key, m.value)) {
-        ESP_LOGW(TAG, "0x%016llx %s <- %s: rejected", (unsigned long long)m.ieee, m.key, m.value);
+        ESP_LOGW(TAG, "0x%016llx %s <- %s: rejected", (unsigned long long)m.ieee, m.key,
+                 zcl_attr_key_is_secret(m.key) ? "<hidden>" : m.value);   // a lock PIN (ZR-06)
     }
 }
 
@@ -289,15 +306,14 @@ bool post(Op op, uint64_t ieee = 0, const char* key = nullptr, const char* value
     return xQueueSend(s_q, &m, 0) == pdTRUE;
 }
 
-// Values arrive as JSON text; publish them as HA matches them. "action" (a
-// button press, an HA event entity) goes without retain: a retained press
-// would fire again on every Home Assistant restart.
+// Values arrive as JSON text; publish them as HA matches them. A press and a
+// keypad code go without retain (ha::state_retained).
 void publish_value(uint64_t ieee, const char* key, const char* value_json) {
     char topic[128];
     char payload[64];
     if (ha::state_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee, key) < 0) return;
     if (!ha::state_payload(value_json, payload, sizeof(payload))) return;
-    mqtt_gw_publish(topic, payload, strlen(payload), 0, strcmp(key, "action") != 0);
+    mqtt_gw_publish(topic, payload, strlen(payload), 0, ha::state_retained(key));
 }
 
 void publish_attrs(uint64_t ieee, const char* attrs_json) {
@@ -334,15 +350,24 @@ void ha_bridge_init(const HaBridgePlatform* platform) {
     }
     if (!s_q) {
         s_q = xQueueCreate(kQueueDepth, sizeof(Msg));
-        // Stack in PSRAM: internal RAM is the tight budget on every ZHAC chip,
-        // and this task never writes flash (NVS writes happen in the caller of
-        // ha_bridge_configure), which is what a PSRAM stack must not do.
+        // A PSRAM stack panics on any flash access unless the firmware runs
+        // from PSRAM (zhac_task.h), and on the wired P4 a Home Assistant
+        // command calls the Zigbee library, a binary, from this task (review
+        // 2026-10-24 PB-09): zhac_task_create keeps it internal there and puts
+        // it in PSRAM on the S31. The S3 builds keep their PSRAM stack: internal
+        // RAM is scarcest there, and their command path (HAP to the P4, or
+        // device_cmd to a UART radio) only sends and updates the shadow.
+#if CONFIG_IDF_TARGET_ESP32S3
         BaseType_t ok = s_q ? xTaskCreateWithCaps(task, "ha_bridge", kTaskStack, nullptr,
                                                   tskIDLE_PRIORITY + 2, nullptr,
                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                             : pdFAIL;
         if (s_q && ok != pdPASS)
             ok = xTaskCreate(task, "ha_bridge", kTaskStack, nullptr, tskIDLE_PRIORITY + 2, nullptr);
+#else
+        BaseType_t ok = s_q ? zhac_task_create(task, "ha_bridge", kTaskStack, nullptr, tskIDLE_PRIORITY + 2, nullptr)
+                            : pdFAIL;
+#endif
         if (ok != pdPASS) {
             ESP_LOGE(TAG, "task start failed -- Home Assistant discovery unavailable");
             return;

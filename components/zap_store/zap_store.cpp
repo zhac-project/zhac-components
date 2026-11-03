@@ -8,6 +8,8 @@
 #include "nvs_checked.h"
 #include "nvs_namespaces.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_rom_crc.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -21,6 +23,37 @@ static const char* TAG     = "zap_store";
 // inlined "zap_v0" literal — one place audits every NVS namespace string.
 static const char* NVS_NS  = zap_nvs::DEVICE_POOL;
 static bool        s_ready = false;
+
+// ── Data partition (review 2026-10-24 WC-04) ─────────────────────────────
+// The device pool, and device_shadow's cache (it asks zap_store_data_part()),
+// live on `zhac_data` when the firmware has that partition: wired-core's
+// 64 KB `nvs` also holds rules, groups, options, sign-in and the coordinator
+// pin, and the pool and shadow filled it at a few dozen devices. Firmwares
+// without it (main-core, mono) keep everything on `nvs`.
+//
+// The move is a copy, final only once the image that made it is confirmed:
+//   - both namespaces are copied from `nvs`, then a checksum of what was copied
+//     ("src") and "done" are set on `zhac_data` ("done" cleared first, so a
+//     copy cut short is never taken for a whole one), and the store runs on
+//     `zhac_data`;
+//   - on an update's trial boot the originals stay: the build before finds
+//     them if the update rolls back. Until the move is final, a boot keeps the
+//     copy while `nvs` still matches its checksum (nothing wrote `nvs` since,
+//     so the copy with this build's writes on top is the newest store) and
+//     copies afresh once `nvs` changed (a trial rolled back and the build
+//     before wrote to it, or this build came back by USB after that). A
+//     rollback whose build wrote nothing keeps the trial's changes, as the
+//     Zigbee network does;
+//   - zap_store_confirm_move() (the image was marked valid) or a boot that is
+//     not a trial makes the move final, once that boot opened the store on
+//     `zhac_data` (fix re-review N1): "live" on `zhac_data`, beside the data,
+//     then "moved" on `nvs`. From then on `zhac_data` holds the store of record:
+//     never copied over, never formatted, and leftovers on `nvs` are erased.
+//     A mark that will not write only leaves the old copy on `nvs` for a later
+//     boot to erase (review 2026-10-29 N-05).
+static const char* DATA_PART = "zhac_data";
+static const char* MIG_NS    = "zap_mig";   // "done"/"live"/"src" on zhac_data, "moved" on nvs
+static const char* s_part    = NVS_DEFAULT_PART_NAME;   // where the pool lives
 
 // F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
 // previously unsynchronised, a latent race on the slot table — and back save
@@ -41,7 +74,7 @@ static void dev_key(char* out, uint16_t idx) {
 
 static nvs_handle_t open_ns(nvs_open_mode_t mode) {
     nvs_handle_t h;
-    esp_err_t err = nvs_open(NVS_NS, mode, &h);
+    esp_err_t err = nvs_open_from_partition(s_part, NVS_NS, mode, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_open: %s", esp_err_to_name(err));
         return 0;
@@ -119,53 +152,417 @@ static uint32_t zap_device_crc(const ZapDevice* d) {
 //          configure_attempts) to ZapDevice; struct grew 518 → 522 bytes.
 static constexpr uint16_t ZAP_STORE_SCHEMA_VERSION = 6;
 
-void zap_store_init() {
-    if (!s_store_mutex) s_store_mutex = xSemaphoreCreateMutex();   // F16
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS flash erasing and reinitialising");
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
+// ── Moving the store to zhac_data ────────────────────────────────────────
 
-    // Schema version check: detect struct layout changes between firmware versions.
-    nvs_handle_t h = open_ns(NVS_READWRITE);
-    if (h) {
-        uint16_t stored_ver = 0;
-        if (nvs_get_u16(h, "schema_ver", &stored_ver) == ESP_OK) {
-            if (stored_ver != ZAP_STORE_SCHEMA_VERSION) {
-                ESP_LOGW(TAG, "NVS schema version mismatch: stored=%u current=%u — "
-                         "erasing device store",
-                         stored_ver, ZAP_STORE_SCHEMA_VERSION);
-                esp_err_t acc = ESP_OK;
-                nvs_seq(&acc, nvs_erase_all(h), TAG, "erase_all devpool");
-                if (acc == ESP_OK) {
-                    // Version marker only after a clean wipe — writing the
-                    // new version over a failed erase would let stale-layout
-                    // blobs sit behind the current marker.
-                    nvs_seq(&acc, nvs_set_u16(h, "schema_ver",
-                                              ZAP_STORE_SCHEMA_VERSION),
-                            TAG, "set_u16 schema_ver");
-                    nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
-                }
-                if (acc != ESP_OK)
-                    ESP_LOGE(TAG, "schema wipe incomplete — will retry next boot");
-            }
-        } else {
-            // First boot with versioning — write current version
-            esp_err_t acc = ESP_OK;
-            nvs_seq(&acc, nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION),
-                    TAG, "set_u16 schema_ver");
-            nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
-        }
+// Each value read goes to `dst` when there is one, and into `*crc`, which lets
+// a later boot tell whether nvs changed since the copy.
+template <typename T, esp_err_t (*Get)(nvs_handle_t, const char*, T*),
+          esp_err_t (*Set)(nvs_handle_t, const char*, T)>
+static bool copy_num(nvs_handle_t src, const nvs_handle_t* dst, const char* key, uint32_t* crc) {
+    T v{};
+    if (Get(src, key, &v) != ESP_OK) return false;
+    *crc = esp_rom_crc32_le(*crc, reinterpret_cast<const uint8_t*>(&v), sizeof v);
+    return !dst || Set(*dst, key, v) == ESP_OK;
+}
+
+static bool copy_bytes(nvs_handle_t src, const nvs_handle_t* dst, const char* key, bool str, uint32_t* crc) {
+    size_t len = 0;
+    if ((str ? nvs_get_str(src, key, nullptr, &len) : nvs_get_blob(src, key, nullptr, &len)) != ESP_OK)
+        return false;
+    void* buf = heap_caps_malloc(len ? len : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = std::malloc(len ? len : 1);
+    if (!buf) return false;
+    bool ok = (str ? nvs_get_str(src, key, static_cast<char*>(buf), &len)
+                   : nvs_get_blob(src, key, buf, &len)) == ESP_OK;
+    if (ok) *crc = esp_rom_crc32_le(*crc, static_cast<const uint8_t*>(buf), len);
+    if (ok && dst)
+        ok = (str ? nvs_set_str(*dst, key, static_cast<const char*>(buf))
+                  : nvs_set_blob(*dst, key, buf, len)) == ESP_OK;
+    heap_caps_free(buf);
+    return ok;
+}
+
+static bool copy_entry(nvs_handle_t src, const nvs_handle_t* dst, const char* key, nvs_type_t type,
+                       uint32_t* crc) {
+    switch (type) {
+    case NVS_TYPE_U8:   return copy_num<uint8_t,  nvs_get_u8,  nvs_set_u8>(src, dst, key, crc);
+    case NVS_TYPE_I8:   return copy_num<int8_t,   nvs_get_i8,  nvs_set_i8>(src, dst, key, crc);
+    case NVS_TYPE_U16:  return copy_num<uint16_t, nvs_get_u16, nvs_set_u16>(src, dst, key, crc);
+    case NVS_TYPE_I16:  return copy_num<int16_t,  nvs_get_i16, nvs_set_i16>(src, dst, key, crc);
+    case NVS_TYPE_U32:  return copy_num<uint32_t, nvs_get_u32, nvs_set_u32>(src, dst, key, crc);
+    case NVS_TYPE_I32:  return copy_num<int32_t,  nvs_get_i32, nvs_set_i32>(src, dst, key, crc);
+    case NVS_TYPE_U64:  return copy_num<uint64_t, nvs_get_u64, nvs_set_u64>(src, dst, key, crc);
+    case NVS_TYPE_I64:  return copy_num<int64_t,  nvs_get_i64, nvs_set_i64>(src, dst, key, crc);
+    case NVS_TYPE_STR:  return copy_bytes(src, dst, key, true, crc);
+    case NVS_TYPE_BLOB: return copy_bytes(src, dst, key, false, crc);
+    default:            return false;
+    }
+}
+
+// Every entry of `ns`, from one partition to the other, or only read when `to`
+// is null. Each entry's checksum (namespace, key, type and value) is added to
+// `*sum`, so the total does not depend on the order the entries come in.
+static bool copy_ns(const char* from, const char* to, const char* ns, uint32_t* sum) {
+    nvs_handle_t src = 0, dst = 0;
+    const esp_err_t oe = nvs_open_from_partition(from, ns, NVS_READONLY, &src);
+    if (oe == ESP_ERR_NVS_NOT_FOUND) return true;   // never written: nothing to copy
+    if (oe != ESP_OK) return false;
+    if (to && nvs_open_from_partition(to, ns, NVS_READWRITE, &dst) != ESP_OK) {
+        nvs_close(src);
+        return false;
+    }
+    bool ok = true;
+    unsigned n = 0;
+    nvs_iterator_t it = nullptr;
+    esp_err_t e = nvs_entry_find(from, ns, NVS_TYPE_ANY, &it);
+    while (ok && e == ESP_OK) {
+        nvs_entry_info_t info{};
+        nvs_entry_info(it, &info);
+        uint32_t crc = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(ns), strlen(ns) + 1);
+        crc = esp_rom_crc32_le(crc, reinterpret_cast<const uint8_t*>(info.key), strlen(info.key) + 1);
+        crc = esp_rom_crc32_le(crc, reinterpret_cast<const uint8_t*>(&info.type), sizeof info.type);
+        ok = copy_entry(src, to ? &dst : nullptr, info.key, info.type, &crc);
+        if (!ok) ESP_LOGE(TAG, "%s %s/%s failed", to ? "copying" : "reading", ns, info.key);
+        *sum += crc;
+        n++;
+        e = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    if (to) nvs_close(dst);
+    nvs_close(src);
+    if (ok && to) ESP_LOGI(TAG, "copied %u entries of %s to %s", n, ns, to);
+    return ok && e == ESP_ERR_NVS_NOT_FOUND;
+}
+
+// The checksum of the two namespaces as they are on nvs. False when they
+// cannot be read.
+static bool nvs_store_sum(uint32_t* sum) {
+    *sum = 0;
+    return copy_ns(NVS_DEFAULT_PART_NAME, nullptr, NVS_NS, sum) &&
+           copy_ns(NVS_DEFAULT_PART_NAME, nullptr, zap_nvs::SHADOW, sum);
+}
+
+static bool erase_ns(const char* part, const char* ns) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(part, ns, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_erase_all(h), TAG, "erase_all");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit erase_all");
+    nvs_close(h);
+    return acc == ESP_OK;
+}
+
+static bool mark_get(const char* part, const char* key) {
+    nvs_handle_t h = 0;
+    uint8_t v = 0;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, key, &v);
         nvs_close(h);
     }
+    return v == 1;
+}
+
+static bool mark_set(const char* part, const char* key) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u8(h, key, 1), TAG, "set_u8 move mark");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit move mark");
+    nvs_close(h);
+    return acc == ESP_OK;
+}
+
+static bool mark_clear(const char* part, const char* key) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, key);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+// "src": the checksum of nvs the copy on zhac_data was taken from.
+static bool src_get(uint32_t* v) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    const bool ok = nvs_get_u32(h, "src", v) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+static bool src_set(uint32_t v) {
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u32(h, "src", v), TAG, "set_u32 copy checksum");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit copy checksum");
+    nvs_close(h);
+    return acc == ESP_OK;
+}
+
+// The namespace holds at least one entry.
+static bool ns_present(const char* part, const char* ns) {
+    nvs_iterator_t it = nullptr;
+    const bool any = nvs_entry_find(part, ns, NVS_TYPE_ANY, &it) == ESP_OK;
+    nvs_release_iterator(it);
+    return any;
+}
+
+// The namespace can be read (or was never written) -- false when its
+// partition itself is unusable.
+static bool ns_readable(const char* part, const char* ns) {
+    nvs_handle_t h = 0;
+    const esp_err_t e = nvs_open_from_partition(part, ns, NVS_READONLY, &h);
+    if (e == ESP_OK) nvs_close(h);
+    return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;
+}
+
+// The first boot of an update, while it can still roll back to the build
+// before it (which reads the store from nvs).
+static bool image_on_trial() {
+    esp_ota_img_states_t st;
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    return run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+static void erase_old_copy() {
+    if (!ns_present(NVS_DEFAULT_PART_NAME, NVS_NS) && !ns_present(NVS_DEFAULT_PART_NAME, zap_nvs::SHADOW)) return;
+    if (erase_ns(NVS_DEFAULT_PART_NAME, NVS_NS) && erase_ns(NVS_DEFAULT_PART_NAME, zap_nvs::SHADOW))
+        ESP_LOGI(TAG, "old device store on nvs erased (it lives on '%s')", DATA_PART);
+    else
+        ESP_LOGW(TAG, "the old device store on nvs could not be erased -- retry next boot");
+}
+
+// Writes the move's marks; true when one reads back. Only for a boot that
+// chose zhac_data (zap_store_confirm_move()).
+static bool confirm_marks() {
+    // With the data first: an nvs that cannot be read later must not make a
+    // trial boot copy over the store of record.
+    if (!mark_get(DATA_PART, "live") && !mark_set(DATA_PART, "live"))
+        ESP_LOGW(TAG, "could not mark the move to '%s' final", DATA_PART);
+    if (!mark_get(NVS_DEFAULT_PART_NAME, "moved")) mark_set(NVS_DEFAULT_PART_NAME, "moved");
+    return zap_store_move_final();
+}
+
+// Picks the partition the store lives on, moving it there once (see the top
+// of this file). False when the store of record sits on a partition that
+// cannot be used: the store then stays shut.
+static bool data_part_select() {
+    s_part = NVS_DEFAULT_PART_NAME;
+    const bool moved = mark_get(NVS_DEFAULT_PART_NAME, "moved");
+    if (!esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, DATA_PART)) {
+        if (moved) ESP_LOGE(TAG, "the device store lives on '%s', which this build does not have", DATA_PART);
+        return !moved;
+    }
+    // Before the move nvs holds a whole store, so an unusable zhac_data is
+    // formatted (this build cannot read what it holds anyway); after it (or with
+    // nothing on nvs, so zhac_data may hold the only copy) it is never formatted.
+    // ponytail: with no mark yet, a zhac_data that will not open cannot tell a
+    // first move from a kept update whose marks failed (review 2026-10-29 N-05),
+    // so this boot falls back to nvs or formats, and what was saved since the
+    // copy is lost. That takes a second fault on the same partition; fail closed
+    // here (store shut) if it ever matters more than a first move onto a broken
+    // zhac_data needing a storage reset.
+    const bool before_move = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
+    esp_err_t e = nvs_flash_init_partition(DATA_PART);
+    if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
+        ESP_LOGW(TAG, "'%s' not usable (%s) -- formatting it, the store is still on nvs",
+                 DATA_PART, esp_err_to_name(e));
+        e = nvs_flash_erase_partition(DATA_PART);
+        if (e == ESP_OK) e = nvs_flash_init_partition(DATA_PART);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "'%s' not usable: %s%s", DATA_PART, esp_err_to_name(e),
+                 before_move ? " -- the store stays on nvs"
+                             : " -- it may hold the device store, which stays shut (not erased)");
+        if (!before_move) s_part = DATA_PART;   // so the shadow cannot fill nvs meanwhile
+        return before_move;
+    }
+    if (moved || mark_get(DATA_PART, "live")) {
+        s_part = DATA_PART;
+        if (!mark_get(DATA_PART, "done")) {
+            ESP_LOGE(TAG, "'%s' lost the device store (no move mark) -- store shut; reset storage", DATA_PART);
+            return false;
+        }
+        confirm_marks();   // either mark may be missing: nvs was erased, or a write failed
+        // Confirmed at run time, or left by an older build since. Not on a
+        // trial boot: if this update rolls back, that older build wants them.
+        if (!image_on_trial()) erase_old_copy();
+        return true;
+    }
+    // Not moved: nvs holds the store of record. If nvs itself cannot be read,
+    // leave zhac_data alone (the store then fails to open and stays shut).
+    if (!ns_readable(NVS_DEFAULT_PART_NAME, NVS_NS)) return true;
+    // Until the move is final the copy counts only while nvs is still what it
+    // was taken from. Then nothing wrote nvs since, and the copy with this
+    // build's writes on top is the newest store, also after a restart that came
+    // before a mark would write (review 2026-10-29 N-05). Once nvs changed (a
+    // trial rolled back and the build before wrote to it, or this build came
+    // back by USB after that) the copy is stale and is taken afresh. "done"
+    // alone cannot tell the two apart; the checksum kept with the copy can.
+    uint32_t now = 0, then = 0;
+    const bool read = nvs_store_sum(&now);
+    const bool copy = mark_get(DATA_PART, "done") && src_get(&then);
+    if (copy && !read) {
+        // Whether the copy is current cannot be told this boot, and it may hold
+        // writes nvs lacks. Running on nvs would let this boot's writes make it
+        // look stale at the next one, so the store stays shut (fix review S-1).
+        ESP_LOGE(TAG, "the device store on nvs cannot be read whole -- store shut this boot");
+        s_part = DATA_PART;   // so the shadow cannot write nvs meanwhile
+        return false;
+    }
+    // An nvs with no store at all was wiped by a tool (this store always keeps
+    // its schema there, and a storage reset erases zhac_data first). It is not
+    // a newer store: the copy stays, as it would after a final move.
+    if (copy && (then == now || !ns_present(NVS_DEFAULT_PART_NAME, NVS_NS))) {
+        ESP_LOGI(TAG, "the copy on '%s' is current (nvs unchanged since it was taken)", DATA_PART);
+    } else {
+        uint32_t sum = 0;
+        const bool ok = read && mark_clear(DATA_PART, "done") &&
+                        erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
+                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS, &sum) &&
+                        copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW, &sum) &&
+                        src_set(sum) && mark_set(DATA_PART, "done");
+        if (!ok) {
+            ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
+            return true;
+        }
+    }
+    s_part = DATA_PART;
+    if (image_on_trial()) {
+        ESP_LOGI(TAG, "device store on '%s'; the copy on nvs stays until this update is confirmed", DATA_PART);
+        return true;
+    }
+    if (!confirm_marks()) {   // this image cannot roll back
+        // Still on zhac_data: the store does not write nvs from there, so the
+        // next boot finds the copy current and keeps it (above).
+        ESP_LOGW(TAG, "could not mark the move to '%s' final -- the copy on nvs stays, retry next boot", DATA_PART);
+        return true;
+    }
+    erase_old_copy();
+    ESP_LOGI(TAG, "device store moved to '%s'", DATA_PART);
+    return true;
+}
+
+bool zap_store_move_final() {
+    return s_part != DATA_PART || mark_get(DATA_PART, "live") || mark_get(NVS_DEFAULT_PART_NAME, "moved");
+}
+
+bool zap_store_confirm_move() {
+    // A boot that kept the store shut did not choose zhac_data: a mark would make
+    // the copy it refused the store of record (fix re-review N1).
+    if (!s_ready) return zap_store_move_final();
+    return s_part != DATA_PART || confirm_marks();
+}
+
+bool zap_store_flag_get(const char* key) {
+    uint8_t v = 0;
+    nvs_handle_t h = 0;
+    if (nvs_open_from_partition(s_part, NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, key, &v);
+        nvs_close(h);
+    }
+    return v == 1;
+}
+
+bool zap_store_flag_set(const char* key) {
+    if (!s_ready) return false;
+    nvs_handle_t h = open_ns(NVS_READWRITE);
+    if (!h) return false;
+    esp_err_t acc = ESP_OK;
+    nvs_seq(&acc, nvs_set_u8(h, key, 1), TAG, "set_u8 flag");
+    nvs_seq(&acc, nvs_commit(h), TAG, "commit flag");
+    nvs_close(h);
+    return acc == ESP_OK;
+}
+
+// A delete cut after its first write leaves the last record twice, in the
+// deleted slot and at the tail (review 2026-09 CC-01): finish it by dropping
+// the tail. Caller holds the store lock.
+static void repair_interrupted_delete(nvs_handle_t h) {
+    uint16_t count = 0;
+    nvs_get_u16(h, "cnt", &count);
+    if (count < 2 || count > ZAP_MAX_DEVICES) return;
+    index_build_locked(h);
+    const uint64_t tail = s_idx_ieee[count - 1];
+    for (uint16_t i = 0; tail && i + 1 < count; i++) {
+        if (s_idx_ieee[i] != tail) continue;
+        char key[8]; dev_key(key, static_cast<uint16_t>(count - 1));
+        esp_err_t acc = ESP_OK;
+        nvs_seq(&acc, nvs_set_u16(h, "cnt", static_cast<uint16_t>(count - 1)), TAG, "set_u16 cnt");
+        if (acc == ESP_OK) nvs_erase_key(h, key);
+        ESP_LOGW(TAG, "finished a device delete cut short by a restart (ieee=0x%016llx)",
+                 (unsigned long long)tail);
+        break;
+    }
+    s_idx_built = false;
+}
+
+void zap_store_init() {
+    if (!s_store_mutex) s_store_mutex = xSemaphoreCreateMutex();   // F16
+    s_ready = false;
+    // NVS itself is the firmware's to bring up (every app_main does it first),
+    // and never this store's to erase (review 2026-10-24 PB-01): wired-core
+    // boots "locked and empty" when NVS cannot start, and this used to wipe
+    // the whole partition behind its back. A store that cannot be opened stays
+    // shut -- nothing is loaded or saved, and zap_store_is_ready() says so.
+    if (!data_part_select()) return;
+
+    store_lock();
+    nvs_handle_t h = open_ns(NVS_READWRITE);
+    if (!h) {
+        store_unlock();
+        ESP_LOGE(TAG, "device store unavailable -- running without it");
+        return;
+    }
+    // Schema version check: detect struct layout changes between firmware versions.
+    bool ok = true;
+    uint16_t stored_ver = 0;
+    if (nvs_get_u16(h, "schema_ver", &stored_ver) == ESP_OK) {
+        if (stored_ver > ZAP_STORE_SCHEMA_VERSION) {
+            // Written by a newer firmware: this image is a downgrade. Keep the
+            // store for that firmware instead of wiping it.
+            ESP_LOGE(TAG, "device store has schema %u, newer than this firmware's %u -- "
+                          "not loaded and not erased (update again, or reset storage)",
+                     stored_ver, ZAP_STORE_SCHEMA_VERSION);
+            ok = false;
+        } else if (stored_ver != ZAP_STORE_SCHEMA_VERSION) {
+            ESP_LOGW(TAG, "NVS schema version mismatch: stored=%u current=%u — "
+                     "erasing device store",
+                     stored_ver, ZAP_STORE_SCHEMA_VERSION);
+            esp_err_t acc = ESP_OK;
+            nvs_seq(&acc, nvs_erase_all(h), TAG, "erase_all devpool");
+            if (acc == ESP_OK) {
+                // Version marker only after a clean wipe — writing the
+                // new version over a failed erase would let stale-layout
+                // blobs sit behind the current marker.
+                nvs_seq(&acc, nvs_set_u16(h, "schema_ver",
+                                          ZAP_STORE_SCHEMA_VERSION),
+                        TAG, "set_u16 schema_ver");
+                nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
+            }
+            if (acc != ESP_OK) {
+                ESP_LOGE(TAG, "schema wipe incomplete — will retry next boot");
+                ok = false;
+            }
+        }
+    } else {
+        // First boot with versioning — write current version
+        esp_err_t acc = ESP_OK;
+        nvs_seq(&acc, nvs_set_u16(h, "schema_ver", ZAP_STORE_SCHEMA_VERSION),
+                TAG, "set_u16 schema_ver");
+        nvs_seq(&acc, nvs_commit(h), TAG, "commit schema_ver");
+    }
+    if (ok) repair_interrupted_delete(h);
+    nvs_close(h);
+    store_unlock();
+    if (!ok) return;
 
     s_ready = true;
-    ESP_LOGI(TAG, "zap_store init OK (schema=%u)", ZAP_STORE_SCHEMA_VERSION);
+    ESP_LOGI(TAG, "zap_store init OK (schema=%u, on %s)", ZAP_STORE_SCHEMA_VERSION, s_part);
 }
+
+const char* zap_store_data_part() { return s_part; }
 
 bool zap_store_is_ready() { return s_ready; }
 
@@ -177,12 +574,10 @@ bool zap_store_is_ready() { return s_ready; }
 // never-implemented A/B-snapshot + journal scheme was removed 2026-05-29; NVS
 // is the store.
 
-bool zap_store_save_device(const ZapDevice* dev) {
-    if (!dev) return false;
-
-    store_lock();   // F16: serialise with delete + protect the IEEE index
+// The save itself; the caller holds store_lock.
+static bool save_locked(const ZapDevice* dev) {
     nvs_handle_t h = open_ns(NVS_READWRITE);
-    if (!h) { store_unlock(); return false; }
+    if (!h) return false;
 
     uint16_t count = 0;
     nvs_get_u16(h, "cnt", &count);
@@ -208,7 +603,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
                  count, (unsigned)ZAP_MAX_DEVICES,
                  (unsigned long long)dev->ieee_addr);
         nvs_close(h);
-        store_unlock();
         return false;
     }
 
@@ -235,7 +629,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
         if (cnt_err != ESP_OK) {
             ESP_LOGE(TAG, "nvs_set_u16 cnt: %s", esp_err_to_name(cnt_err));
             nvs_close(h);
-            store_unlock();
             return false;
         }
     }
@@ -243,7 +636,6 @@ bool zap_store_save_device(const ZapDevice* dev) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_set_blob: %s", esp_err_to_name(err));
         nvs_close(h);
-        store_unlock();
         return false;
     }
 
@@ -251,13 +643,12 @@ bool zap_store_save_device(const ZapDevice* dev) {
     nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool save");
     nvs_close(h);
 
-    // F16: keep the index in sync on success. NVS commits atomically, so on
-    // failure NVS is unchanged and the index must stay as-is.
+    // F16: keep the index in sync on success. (nvs_commit is a no-op on IDF:
+    // each write above was durable when it returned.)
     if (acc == ESP_OK && idx < ZAP_MAX_DEVICES) {
         s_idx_ieee[idx] = dev->ieee_addr;
         if (idx >= s_idx_count) s_idx_count = static_cast<uint16_t>(idx + 1);
     }
-    store_unlock();
 
     // Success log gated on the commit — a failed save must not read as
     // "Device saved" in the log while the function returns false.
@@ -266,98 +657,94 @@ bool zap_store_save_device(const ZapDevice* dev) {
     return acc == ESP_OK;
 }
 
-// ── Delete device — atomic read-all / erase-all / rewrite / commit ───────
-// Old approach (shift-in-place with single commit) was vulnerable to power
-// loss producing duplicate entries. New approach: read everything into RAM,
-// erase all keys, write back compacted set, single commit.
+bool zap_store_save_device(const ZapDevice* dev) {
+    if (!dev || !s_ready) return false;
+    store_lock();   // F16: serialise with delete + protect the IEEE index
+    const bool ok = save_locked(dev);
+    store_unlock();
+    return ok;
+}
+
+// The pool's copy, read and written under the store lock. A hard delete takes
+// the device out of the pool before it deletes the record, so this either
+// writes before that delete (which then removes the record) or finds the
+// device gone and writes nothing: a copy taken before the delete can no
+// longer be written after it (review 2026-10-28 R-11).
+bool zap_store_save_live(uint64_t ieee, ZapStoreSnapshotCb snapshot, bool* gone) {
+    if (gone) *gone = false;
+    if (!snapshot || !s_ready) return false;
+    ZapDevice dev{};
+    bool ok = false;
+    store_lock();
+    if (!snapshot(ieee, &dev)) {
+        if (gone) *gone = true;
+    } else {
+        ok = save_locked(&dev);
+    }
+    store_unlock();
+    return ok;
+}
+
+// ── Delete device — three writes, safe at every cut ──────────────────────
+// nvs_commit() is a no-op on IDF (every set and erase is durable when it
+// returns), so the old erase-everything-then-rewrite delete lost the whole
+// pool to a power cut in its window (review 2026-09 CC-01). Now: (1) the last
+// record is copied into the deleted slot, (2) the count shrinks, (3) the old
+// tail key is erased. A cut after (1) leaves the tail record twice, which
+// zap_store_init() finishes (repair_interrupted_delete); a cut after (2)
+// leaves an unreferenced key that the next new device overwrites.
 
 bool zap_store_delete_device(uint64_t ieee) {
     bool      ok    = false;
     uint16_t  count = 0;
-    ZapDevice* devs = nullptr;
+    ZapDevice* tail = nullptr;
     store_lock();   // F16: serialise with save + protect the IEEE index
     do {
-        // 1. Read the stored count first, then size the scratch buffer to
-        //    the ACTUAL device count — not ZAP_MAX_DEVICES (FINDINGS §8.2).
-        //    The old fixed 200 × 522 B (~102 KB) alloc could fail on a
-        //    fragmented heap with PSRAM unavailable, making delete
-        //    impossible. cnt is read under the store lock to stay
-        //    consistent with the rewrite below.
-        nvs_handle_t h = open_ns(NVS_READONLY);
+        if (!s_ready || ieee == 0) break;
+        nvs_handle_t h = open_ns(NVS_READWRITE);
         if (!h) break;
         nvs_get_u16(h, "cnt", &count);
         if (count > ZAP_MAX_DEVICES) count = ZAP_MAX_DEVICES;
-        if (count == 0) { nvs_close(h); break; }  // empty store — nothing to delete
+        if (!s_idx_built) index_build_locked(h);
+        const int16_t found = index_find_locked(ieee);
+        if (found < 0 || found >= count) { nvs_close(h); break; }
 
-        // ZapDevice is ~522 B. Prefer PSRAM (P4 has it), fall back to
-        // internal heap. Sized to `count`, so a near-empty store costs
-        // a few hundred bytes rather than ~102 KB.
-        devs = static_cast<ZapDevice*>(heap_caps_calloc(
-            count, sizeof(ZapDevice), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!devs) devs = static_cast<ZapDevice*>(
-            std::calloc(count, sizeof(ZapDevice)));
-        if (!devs) {
-            ESP_LOGE(TAG, "delete: alloc %u×%u failed",
-                     (unsigned)count, (unsigned)sizeof(ZapDevice));
-            nvs_close(h);
-            break;
-        }
-
-        bool read_ok = true;
-        for (uint16_t i = 0; i < count; i++) {
-            char key[8]; dev_key(key, i);
+        const uint16_t last = static_cast<uint16_t>(count - 1);
+        char key[8];
+        esp_err_t acc = ESP_OK;
+        if (found != last) {
+            // ZapDevice is ~522 B: off the caller's stack, PSRAM first.
+            tail = static_cast<ZapDevice*>(heap_caps_malloc(sizeof(ZapDevice),
+                                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (!tail) tail = static_cast<ZapDevice*>(std::malloc(sizeof(ZapDevice)));
+            if (!tail) { nvs_close(h); break; }
             size_t sz = sizeof(ZapDevice);
-            if (nvs_get_blob(h, key, &devs[i], &sz) != ESP_OK) {
-                read_ok = false;
-                break;
+            dev_key(key, last);
+            const esp_err_t ge = nvs_get_blob(h, key, tail, &sz);
+            dev_key(key, static_cast<uint16_t>(found));
+            if (ge == ESP_OK && tail->ieee_addr != ieee) {
+                nvs_seq(&acc, nvs_set_blob(h, key, tail, sizeof(ZapDevice)), TAG, "set_blob devpool");
+            } else {
+                // The tail is a hole (a load skips those) or this same device:
+                // leave a hole here instead.
+                nvs_seq(&acc, nvs_erase_key(h, key), TAG, "erase_key devpool");
             }
         }
+        if (acc == ESP_OK) nvs_seq(&acc, nvs_set_u16(h, "cnt", last), TAG, "set_u16 cnt");
+        if (acc == ESP_OK) {
+            dev_key(key, last);
+            const esp_err_t ee = nvs_erase_key(h, key);
+            if (ee != ESP_ERR_NVS_NOT_FOUND) nvs_seq(&acc, ee, TAG, "erase_key devpool tail");
+        }
         nvs_close(h);
-        if (!read_ok) break;
-
-        // 2. Find and remove (swap-with-last to keep array compact).
-        int16_t found_idx = -1;
-        for (uint16_t i = 0; i < count; i++) {
-            if (devs[i].ieee_addr == ieee) { found_idx = (int16_t)i; break; }
-        }
-        if (found_idx < 0) break;
-
-        if (found_idx < (int16_t)(count - 1))
-            devs[found_idx] = devs[count - 1];
-        count--;
-
-        // 3. Erase ALL old device keys + count, then write back compacted
-        //    set with a single commit at the end.
-        h = open_ns(NVS_READWRITE);
-        if (!h) break;
-
-        // Any erase/rewrite failure aborts WITHOUT the commit: a partial
-        // rewrite must not become durable (committing after a failed
-        // erase/set could persist a half-compacted slot table).
-        esp_err_t acc = ESP_OK;
-        uint16_t old_count = count + 1;  // +1 for the removed device
-        for (uint16_t i = 0; i < old_count && acc == ESP_OK; i++) {
-            char key[8]; dev_key(key, i);
-            nvs_seq(&acc, nvs_erase_key(h, key), TAG, "erase_key devpool");
-        }
-        for (uint16_t i = 0; i < count && acc == ESP_OK; i++) {
-            char key[8]; dev_key(key, i);
-            nvs_seq(&acc, nvs_set_blob(h, key, &devs[i], sizeof(ZapDevice)),
-                    TAG, "set_blob devpool");
-        }
-        if (acc == ESP_OK)
-            nvs_seq(&acc, nvs_set_u16(h, "cnt", count), TAG, "set_u16 cnt");
-        if (acc == ESP_OK)
-            nvs_seq(&acc, nvs_commit(h), TAG, "commit devpool delete");
-        nvs_close(h);
-
         if (acc != ESP_OK) break;
+        count = last;
         ok = true;
     } while (0);
 
     s_idx_built = false;   // F16: slot order changed — index rebuilt on next save
     store_unlock();
-    heap_caps_free(devs);
+    heap_caps_free(tail);
     if (ok) {
         ESP_LOGI(TAG, "Device deleted ieee=0x%016llx remaining=%u",
                  (unsigned long long)ieee, count);
@@ -373,14 +760,17 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
     // FINDINGS §8.3: validate the destination, and take the store lock so the
     // multi-blob scan is consistent vs a concurrent save/delete once the flush
     // task is running (load is normally a cold boot path, but the flush task
-    // can write before the boot relist completes). Lock order: store_lock is
-    // the INNERMOST lock — the flush layer (zap_store_flush.cpp) always
-    // releases its own s_mtx before calling into save/delete, so taking
-    // s_store_mutex here cannot invert against it.
+    // can write before the boot relist completes). Lock order: the flush
+    // layer (zap_store_flush.cpp) releases its own s_mtx before calling into
+    // save/delete; store_lock comes before the pool lock (zap_store_save_live
+    // reads the pool under it). zigbee_pool_restore_persisted calls this while
+    // holding the pool lock -- the other way round -- which is safe only at
+    // boot, before any deferred write is queued (fix review N2).
     if (!pool || max_count == 0) {
         ESP_LOGE(TAG, "load_devices: null pool or zero capacity");
         return 0;
     }
+    if (!s_ready) return 0;
 
     store_lock();
     nvs_handle_t h = open_ns(NVS_READONLY);
@@ -405,6 +795,11 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
                      (unsigned long)pool[loaded].crc32, (unsigned long)expected);
             continue;
         }
+        // One record per device: the lower slot wins if an interrupted delete
+        // left a second copy (init normally finishes it first).
+        bool dup = false;
+        for (uint16_t j = 0; j < loaded && !dup; j++) dup = pool[j].ieee_addr == pool[loaded].ieee_addr;
+        if (dup) continue;
 
         loaded++;
     }
@@ -436,12 +831,13 @@ uint16_t zap_store_load_devices(ZapDevice* pool, uint16_t max_count) {
 
 bool zap_store_save_last_seen(ZapStoreSnapshotCb snap) {
     if (!snap) return true;   // no live pool to read yet
+    if (!s_ready) return false;
     LastSeenRow* rows = last_seen_rows_alloc();
     if (!rows) return false;
 
     // The stored devices, copied under the store lock. Their live values are
-    // read after it is released: `snap` takes the pool lock, and the pool lock
-    // is taken before this one elsewhere.
+    // read after it is released: `snap` takes the pool lock, and the boot-time
+    // restore takes the two the other way round, so this loop holds one at a time.
     uint16_t n = 0;
     store_lock();
     if (!s_idx_built) {

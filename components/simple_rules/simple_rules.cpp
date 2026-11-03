@@ -235,8 +235,8 @@ static bool resolve_action_value(const RuleAction& a, const char* legacy_arg,
     const long long v = strtoll(event_val, &end, 10);
     if (end == event_val || *end != '\0' || errno == ERANGE ||
         v > INT32_MAX || v < INT32_MIN) {
-        ESP_LOGW(TAG, "value expression: non-numeric trigger value '%s' — action skipped",
-                 event_val);
+        // Not the value itself: it may be a keypad's PIN (review ZR-06).
+        ESP_LOGW(TAG, "value expression: the trigger value is not a number — action skipped");
         return false;
     }
     int32_t res = 0;
@@ -363,12 +363,14 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 // home. The memory (RuleEdge) is seeded from the device shadow whenever a rule
 // is (re)loaded, so a reboot, an edit or a rename never fires a rule either.
 
-// Momentary attributes are events, not state: every report counts.
+// Momentary attributes are events, not state: every report counts. So is a
+// secret (a keypad's code, review ZR-06): the same PIN typed again fires
+// again, and no RuleEdge keeps it.
 static bool is_momentary(const char* key) {
     static const char* const kMomentary[] = {"action", "click", "event", "scene"};
     for (const char* k : kMomentary)
         if (strcmp(key, k) == 0) return true;
-    return false;
+    return zcl_attr_key_is_secret(key);
 }
 
 // Triggers that fire on a change and so keep memory. Not the bare
@@ -726,7 +728,8 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
         const char* key = t.attr_key;   // the wildcard names the reported one
         if (!key[0] && ev && ev->type == EventType::ZCL_ATTR)
             key = reinterpret_cast<const ZclAttrEvent*>(ev->data)->key;
-        snprintf(what, sizeof(what), "%s#%.*s=%s", dev, (int)ATTR_KEY_MAX, key, val);
+        snprintf(what, sizeof(what), "%s#%.*s=%s", dev, (int)ATTR_KEY_MAX, key,
+                 zcl_attr_key_is_secret(key) ? "<hidden>" : val);   // a keypad PIN (ZR-06)
         break;
     }
     case TriggerType::TIME_CRON:  snprintf(what, sizeof(what), "Time#Cron"); break;
@@ -747,16 +750,63 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
         ESP_LOGI(TAG, "rule %s %s (%s)", who, how, what);
 }
 
+// ── Run cap (review 2026-10-24 LU-03) ────────────────────────────────────
+// `ON lamp#state DO zigbee.toggle lamp state`: the toggle makes the lamp report
+// a new state, which is a change, which fires the rule again -- at radio speed,
+// forever. An edge-triggered rule (a device attribute, see has_edge) whose
+// actions drive a device or run a script runs at most kRunsPerMinute times a
+// minute; past that it is held until the minute is up. Holding one report ends
+// such a loop for good, since nothing is left to report. Never held: buttons
+// (momentary keys) and other triggers, which cannot feed back; the bare
+// `ON <device>` wildcard, which fires once per attribute of every report and
+// hands them to a script; and Run now.
+static constexpr uint16_t kRunsPerMinute = 20;
+
+static bool can_feed_back(const ParsedRule& r) {
+    if (!has_edge(r.trigger)) return false;
+    for (uint8_t i = 0; i < r.action_count; i++) {
+        const ActionType t = r.actions[i].type;
+        if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT)
+            return true;
+    }
+    return false;
+}
+
+// Caller holds s_mutex. True = hold this run (booked as RATE_LIMITED).
+static bool over_run_cap(ParsedRule& r) {
+    if (!can_feed_back(r)) return false;
+    RuleStat& st = r.stat;
+    const uint32_t now = mono_s();
+    if (st.minute_runs == 0 || now - st.minute_mono >= 60) {
+        st.minute_mono = now;
+        st.minute_runs = 0;
+    }
+    if (st.minute_runs < kRunsPerMinute) {
+        st.minute_runs++;
+        return false;
+    }
+    if (st.minute_runs == kRunsPerMinute) {   // first hold this minute: say so once
+        st.minute_runs++;
+        ESP_LOGW(TAG, "rule '%s' ran %u times in a minute -- held until the minute is up "
+                      "(does its action change its own trigger?)",
+                 r.name[0] ? r.name : "?", (unsigned)kRunsPerMinute);
+    }
+    st.skip = RuleSkip::RATE_LIMITED;
+    return true;
+}
+
 // Runs rule `id` (at `idx` when matched) from a copy taken under the lock, as
 // the actions can block on MQTT / the radio / Lua, then books the run on the
 // live rule. `snap` is the caller's scratch (the event and cron tasks have the
-// stack for it). False when the rule is gone, or disabled and not `manual`.
+// stack for it). False when the rule is gone, or disabled and not `manual`, or
+// held by the run cap.
 static bool fire_rule(ParsedRule& snap, uint16_t idx, uint16_t id,
                       const char* val, const Event* ev, bool manual) {
     if (xSemaphoreTakeRecursive(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     // Re-validate the slot in case it was edited or deleted since the match.
-    const bool live = idx < s_rule_count && s_rules[idx].rule_id == id &&
-                      (manual || s_rules[idx].enabled);
+    bool live = idx < s_rule_count && s_rules[idx].rule_id == id &&
+                (manual || s_rules[idx].enabled);
+    if (live && !manual && over_run_cap(s_rules[idx])) live = false;
     if (live) snap = s_rules[idx];
     xSemaphoreGiveRecursive(s_mutex);
     if (!live) return false;
@@ -991,7 +1041,7 @@ bool simple_rules_check(const char* dsl, char* err, size_t cap) {
 }
 
 bool simple_rules_add(const char* name, const char* dsl,
-                       uint16_t* out_rule_id) {
+                       uint16_t* out_rule_id, bool enabled) {
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     // P2-T18 def 4 (FINDINGS §7): a DSL that doesn't fit slot.src would parse
     // in full for the live rule yet persist truncated, so the rule silently
@@ -1023,7 +1073,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     }
     RuleSlot slot{};
     slot.rule_id      = id;
-    slot.enabled      = 1;
+    slot.enabled      = enabled ? 1 : 0;
     slot._reserved    = 0;
     slot.rule_type    = (uint8_t)RuleType::SIMPLE;
     slot.trigger_type = (uint8_t)r.trigger.type;
@@ -1037,7 +1087,7 @@ bool simple_rules_add(const char* name, const char* dsl,
     // PSRAM writeback task flushes to flash ≤5 s later. Saves ~10–50 ms
     // per REST round-trip and cuts flash wear on rapid edits.
     rule_store_mark_dirty(&slot);
-    r.enabled = true;
+    r.enabled = enabled;
     memcpy(r.name, slot.name, sizeof(r.name));
     ParsedRule& added = s_rules[s_rule_count++];
     added = r;
@@ -1144,11 +1194,13 @@ bool simple_rules_delete(uint16_t rule_id) {
 }
 
 bool simple_rules_enable(uint16_t rule_id, bool enabled) {
+    // Read, flip and write back under the lock update holds: an edit saved between this read and the
+    // write would otherwise be overwritten with the old text (review LU-06).
+    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     RuleSlot slot{};
-    if (!rule_store_load(rule_id, &slot)) return false;
+    if (!rule_store_load(rule_id, &slot)) { xSemaphoreGiveRecursive(s_mutex); return false; }
     slot.enabled = enabled ? 1 : 0;
     rule_store_mark_dirty(&slot);  // deferred NVS commit
-    xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     for (uint16_t i = 0; i < s_rule_count; i++) {
         if (s_rules[i].rule_id == rule_id) {
             s_rules[i].enabled = enabled;
@@ -1198,6 +1250,7 @@ uint16_t simple_rules_status(SimpleRuleStatus* out, uint16_t max_count) {
         switch (r.stat.skip) {
         case RuleSkip::UNCHANGED:       snprintf(o.last_skip, sizeof(o.last_skip), "unchanged");       break;
         case RuleSkip::CONDITION_FALSE: snprintf(o.last_skip, sizeof(o.last_skip), "condition_false"); break;
+        case RuleSkip::RATE_LIMITED:    snprintf(o.last_skip, sizeof(o.last_skip), "rate_limited");    break;
         case RuleSkip::ACTION_ERROR: {
             const uint8_t k = r.stat.skip_action;
             snprintf(o.last_skip, sizeof(o.last_skip), "action_error:%s",

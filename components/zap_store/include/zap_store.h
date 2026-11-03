@@ -17,9 +17,11 @@
 //
 //   2. `ZAP_STORE_SCHEMA_VERSION` — an integer stored under key
 //      "schema_ver" inside the namespace. Bumped whenever the on-flash
-//      `ZapDevice` layout changes. A mismatch at boot calls
+//      `ZapDevice` layout changes. An OLDER stored version at boot calls
 //      `nvs_erase_all()` on the namespace and writes the new version
-//      (devices re-pair) — this is the salvage-free migration path.
+//      (devices re-pair) — this is the salvage-free migration path. A
+//      NEWER stored version (this firmware is a downgrade) is left alone
+//      and the store stays shut: zap_store_is_ready() is false.
 //
 // When to do what:
 //   - Layout-only change (new field, reordered field, widened field):
@@ -37,16 +39,48 @@
 //     "zap_v0". Keeping unrelated keys in separate namespaces makes
 //     selective wipe and schema evolution independent per dataset.
 
-// Initialise NVS — call once from app_main before any other zap_store calls.
+// Open the device store — call once from app_main, after nvs_flash_init()
+// and before any other zap_store call. Never erases NVS: a store that cannot
+// be opened stays shut (zap_store_is_ready() false, nothing saved or loaded).
+// On a firmware that has a `zhac_data` NVS partition the store (and the
+// device_shadow cache) moves there from `nvs`, once; see zap_store.cpp.
 void zap_store_init();
 
 // Returns true if zap_store_init() has been called successfully.
 bool zap_store_is_ready();
 
+// The NVS partition the device store lives on: "zhac_data" after the move,
+// else "nvs". device_shadow keeps its cache on the same one. Valid after
+// zap_store_init().
+const char* zap_store_data_part();
+
+// Makes a move to zhac_data final. Call once the running image is marked
+// valid (it can no longer roll back to a build that reads the store from
+// nvs); a boot that is not an update's trial does it by itself. Two small
+// NVS writes, only from a boot that opened the store on zhac_data: on one that
+// kept it shut nothing is written (fix re-review N1). Returns
+// zap_store_move_final(); false means the copy on nvs must stay: call it again
+// until it is true (review 2026-10-28 R-03).
+bool zap_store_confirm_move();
+
+// True when the store is on nvs or its move to zhac_data is marked final, so
+// the copy on nvs is no longer needed. False while the move is not final: an
+// older build would run on that copy. Reads, never writes.
+bool zap_store_move_final();
+
+// One-time marks kept in the device store's namespace, so they travel with
+// the device records: copied with them to zhac_data, rolled back and reset
+// with them. `key`: up to 15 characters. set fails while the store is shut.
+bool zap_store_flag_get(const char* key);
+bool zap_store_flag_set(const char* key);
+
 // Save a single device to NVS. Returns true on success.
 bool zap_store_save_device(const ZapDevice* dev);
 
 // Delete a single device from NVS by IEEE address. Returns true if found and removed.
+// Take the device out of the pool first (zigbee_pool_remove): the deferred
+// writes save the pool's copy under the store lock (zap_store_save_live), so
+// none can bring back a device the pool no longer has (review 2026-10-28 R-11).
 bool zap_store_delete_device(uint64_t ieee);
 
 // Load all saved devices into pool. Returns number loaded.
@@ -79,6 +113,11 @@ typedef enum {
 // device state and true is returned. Returning false (device gone)
 // causes the dirty entry to be dropped silently.
 typedef bool (*ZapStoreSnapshotCb)(uint64_t ieee, ZapDevice* out);
+
+// Save the device as `snapshot` reports it, read and written under the store
+// lock. Writes nothing, and sets `*gone`, when the snapshot reports the device
+// gone. The deferred writes use it (review 2026-10-28 R-11).
+bool zap_store_save_live(uint64_t ieee, ZapStoreSnapshotCb snapshot, bool* gone);
 
 // Install once at startup, before any mark_dirty calls.
 void zap_store_set_snapshot_cb(ZapStoreSnapshotCb cb);

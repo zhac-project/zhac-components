@@ -114,7 +114,11 @@ void zap_store_mark_dirty(const ZapDevice* dev, ZapPersistPriority pri) {
     g_store.dirty_flags = dev ? dev->flags : 0;
     std::snprintf(g_store.dirty_name, sizeof(g_store.dirty_name), "%s", dev ? dev->friendly_name : "");
 }
-bool zap_store_delete_device(uint64_t) { g_store.deletes++; return true; }
+bool zap_store_delete_device(uint64_t) {
+    g_store.deletes++;
+    g_store.pool_had_device_at_delete = s_have_dev;
+    return true;
+}
 void device_shadow_remove(uint64_t) { g_store.shadow_removes++; }
 extern "C" void zhac_adapter_invalidate_def_cache(uint64_t) { g_store.def_cache_invalidates++; }
 extern "C" void zhac_adapter_fallback_clear(uint64_t) { g_store.fallback_clears++; }

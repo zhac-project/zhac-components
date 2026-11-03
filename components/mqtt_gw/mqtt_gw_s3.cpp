@@ -3,14 +3,15 @@
 #include "mqtt_gw.h"
 #include "sdkconfig.h"
 #include "mqtt_client.h"
-#include "esp_crt_bundle.h"   // F10: verify broker cert for mqtts://
+#include "zap_tls.h"          // F10, HS-11, HS-13: how the broker's certificate is judged
+#include "zap_tls_policy.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "freertos/idf_additions.h"   // xTaskCreateWithCaps (non-S3 targets)
+#include "zhac_task.h"   // zhac_task_create: PSRAM stacks only where flash access is safe
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <cstdio>
@@ -54,6 +55,8 @@ static char   s_sub_filter[128]              = {};
 static int    s_sub_qos                      = 0;
 static char   s_broker_url[128]              = {};
 static char   s_client_id[32]                = {};   // empty → auto from MAC
+static uint8_t s_tls_pin[32]                 = {};   // the broker certificate pin (HS-13)
+static bool   s_tls_pin_set                  = false;
 static char   s_root_topic[32]               = "zhac";
 static uint8_t s_fail_count                  = 0;
 static esp_timer_handle_t s_rearm_tmr        = nullptr;   // F40: auto-disable cooldown re-arm
@@ -173,10 +176,12 @@ static void restart_client_locked() {
     // F10 (FINDINGS.md): for a TLS broker (mqtts:// / wss://) verify the
     // server certificate chain against the bundled CA store. Without this an
     // mqtts:// connection is unauthenticated and a MITM can impersonate the
-    // broker. Plain mqtt:// (no TLS) is unaffected.
+    // broker. Plain mqtt:// (no TLS) is unaffected. A broker with its own CA
+    // or a self-signed certificate is trusted by its pin instead (HS-13).
     if (strncmp(s_broker_url, "mqtts://", 8) == 0 ||
         strncmp(s_broker_url, "wss://",   6) == 0) {
-        cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+        zap_tls_set_broker_pin(s_tls_pin_set ? s_tls_pin : nullptr);
+        cfg.broker.verification.crt_bundle_attach = zap_tls_attach_broker;
     }
     // Bump esp-mqtt's internal task stack from the 6 KB default. Two
     // problem paths trip it:
@@ -427,21 +432,12 @@ void mqtt_gw_init() {
     if (!s_pubq) {
         s_pubq = xQueueCreate(MQTT_PUBQ_DEPTH, sizeof(PubItem*));
         if (s_pubq) {
-#if CONFIG_IDF_TARGET_ESP32S3
-            xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                         tskIDLE_PRIORITY + 3, nullptr);
-#else
-            // Single-chip builds on other targets (wired P4/S31) link this
-            // client too; their internal RAM is tighter, so the stack goes to
-            // PSRAM (the worker only publishes -- no flash writes). The S3
-            // keeps its measured, hardware-proven internal stack.
-            if (xTaskCreateWithCaps(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                                    tskIDLE_PRIORITY + 3, nullptr,
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-                xTaskCreate(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
-                            tskIDLE_PRIORITY + 3, nullptr);
-            }
-#endif
+            // PSRAM only where the firmware runs from PSRAM (zhac_task.h): the
+            // S31. The wired P4 does not, and a flash access from a PSRAM stack
+            // panics there (review 2026-10-24 PB-09). The S3 keeps its measured,
+            // hardware-proven internal stack.
+            zhac_task_create(mqtt_pub_worker, "mqtt_pub", zhac::stack::kMqttPubS3, nullptr,
+                             tskIDLE_PRIORITY + 3, nullptr);
         }
     }
     // Do NOT start the MQTT client here. mqtt_gw_init runs unconditionally
@@ -565,6 +561,17 @@ void mqtt_gw_set_broker_url(const char* url) {
     strncpy(s_broker_url, url, sizeof(s_broker_url) - 1);
     s_broker_url[sizeof(s_broker_url) - 1] = '\0';
     restart_client_locked();
+    xSemaphoreGive(s_client_mtx);
+}
+
+void mqtt_gw_set_tls_pin(const char* hex) {
+    if (!s_client_mtx) return;
+    uint8_t pin[32];
+    const bool set = hex && hex[0] && zap_tls_pin_parse(hex, pin);
+    xSemaphoreTake(s_client_mtx, portMAX_DELAY);
+    if (set) memcpy(s_tls_pin, pin, sizeof(s_tls_pin));
+    s_tls_pin_set = set;
+    if (s_client) restart_client_locked();   // the next handshake checks the new pin
     xSemaphoreGive(s_client_mtx);
 }
 
