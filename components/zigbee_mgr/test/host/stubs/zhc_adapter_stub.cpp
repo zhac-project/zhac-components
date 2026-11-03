@@ -39,6 +39,8 @@ void zhac_adapter_register_seen(zhac_seen_fn_t fn) { g_stub_seen_fn = fn; }
 // otherwise unreachable) exactly the way zhc_adapter would.
 zhac_shadow_update_fn_t g_stub_shadow_fn = nullptr;
 void zhac_adapter_register_shadow(zhac_shadow_update_fn_t fn) { g_stub_shadow_fn = fn; }
+zhac_state_text_fn_t g_stub_state_text_fn = nullptr;
+void zhac_adapter_register_state_text(zhac_state_text_fn_t fn) { g_stub_state_text_fn = fn; }
 void zhac_adapter_register_configure(zhac_configure_bind_fn_t,
                                      zhac_configure_report_fn_t) {}
 void zhac_adapter_register_configure_ex(zhac_configure_cmd_fn_t,

@@ -112,6 +112,7 @@ static bool init_responder(const ZnpRecordedReq& req, MtFrame& srsp) {
 // Captured by the zhc_adapter stub when zhc_shadow_bridge_register() runs;
 // lets the test drive the real bridge callback.
 extern zhac_shadow_update_fn_t g_stub_shadow_fn;
+extern zhac_state_text_fn_t g_stub_state_text_fn;
 extern zhac_poll_device_fn_t g_stub_poll_source;
 extern zhac_seen_fn_t g_stub_seen_fn;
 extern "C" void zhc_shadow_bridge_register(void);
@@ -856,6 +857,34 @@ int main() {
         // typed on it: published with its press, never kept (review ZR-06).
         g_stub_shadow_fn(kPad, "action_code", 5 /*String*/, 0, 0, 0.0f, false, "1234");
         CHECK(!device_shadow_get_attr(kPad, "action_code", &sa), "a keypad code is not kept in the shadow");
+        pool_clear();
+    }
+
+    // ── G15: the decoder reads a kept setting (security review 2026-11-03 F-04)
+    // A restart zeroes the decoder's per-device memory; until a device reports
+    // its temperature unit (floor sensor, meter mode) again, the decoder asks
+    // for the text the shadow kept, restored from flash at boot.
+    {
+        printf("\nG15 kept settings for the decoder\n");
+        pool_clear();
+        zhc_shadow_bridge_register();
+        CHECK(g_stub_state_text_fn != nullptr, "shadow bridge registers the state-text hook");
+        const uint64_t kIr = 0x2222000000000017ULL;
+        ZapDevice* ir = pool_add();
+        ir->ieee_addr = kIr;
+        g_stub_shadow_fn(kIr, "temperature_unit", 5 /*String*/, 0, 0, 0.0f, false, "fahrenheit");
+        g_stub_shadow_fn(kIr, "humidity", 2 /*Uint*/, 0, 40, 0.0f, false, nullptr);
+        char out[48] = "x";
+        CHECK(g_stub_state_text_fn && g_stub_state_text_fn(kIr, "temperature_unit", out, sizeof(out)) &&
+              strcmp(out, "fahrenheit") == 0, "a kept text value is handed back");
+        CHECK(g_stub_state_text_fn && !g_stub_state_text_fn(kIr, "humidity", out, sizeof(out)),
+              "a number is not a text value");
+        CHECK(g_stub_state_text_fn && !g_stub_state_text_fn(kIr, "sensor", out, sizeof(out)), "nothing kept: false");
+        CHECK(g_stub_state_text_fn && !g_stub_state_text_fn(0xFEEDFACEULL, "temperature_unit", out, sizeof(out)),
+              "unknown device: false");
+        char small[10];   // "fahrenheit" needs 11: never handed back cut
+        CHECK(g_stub_state_text_fn && !g_stub_state_text_fn(kIr, "temperature_unit", small, sizeof(small)),
+              "a text that does not fit: false, not a prefix");
         pool_clear();
     }
 
