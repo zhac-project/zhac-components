@@ -953,32 +953,30 @@ int main() {
         CHECK(zap_store_is_ready() && strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_move_final(),
               "... and the next good boot moves the store to zhac_data, final");
 
-        // K-01 (review 2026-11-03): copy taken, both move marks fail, a device is
-        // saved on zhac_data only, then zhac_data will not init at the next boot.
-        // Neither copy may be destroyed: the store stays shut and both survive.
-        seed();
-        nvs_stub_add_partition("zhac_data");
-        nvs_stub_fail_key("live", true);
-        nvs_stub_fail_key("moved", true);
-        zap_store_init();                           // plain boot: copied, both marks fail
-        ZapDevice k2 = make_dev(0x0CULL, 12, "target only");
-        CHECK(zap_store_save_device(&k2), "K-01: a target-only device is saved");
-        nvs_stub_fail_key("live", false);
-        nvs_stub_fail_key("moved", false);
-        nvs_stub_init_result("zhac_data", ESP_ERR_NVS_NO_FREE_PAGES);
-        zap_store_init();                           // reboot: zhac_data init fails
-        const bool k_shut = !zap_store_is_ready();
-        printf("  info: K-01 format case: ready=%d part=%s zhac_data zap_v0=%d\n",
-               (int)zap_store_is_ready(), zap_store_data_part(), nvs_stub_count("zhac_data", "zap_v0"));
-        nvs_stub_init_result("zhac_data", ESP_OK);
-        zap_store_init();
-        const uint16_t kn = zap_store_load_devices(pool, 8);
-        printf("  info: K-01 format case after good boot: n=%u has_target_only=%d\n", kn, (int)pool_has(pool, kn, 0x0CULL));
-        CHECK(k_shut && kn == 3 && pool_has(pool, kn, 0x0CULL),
-              "K-01: init fault after failed marks keeps the target-only device (store shut meanwhile)");
+        // K-01 (review 2026-11-03): copy taken, both final marks fail, a device
+        // is saved on zhac_data only, then zhac_data will not open. A fault that
+        // lasts until zhac_data is erased leaves nothing any build can read
+        // there: it is formatted and nvs copied again, so nvs's devices stay (a
+        // shut store would leave only a storage reset, which erases nvs too).
+        for (const esp_err_t lasting : {ESP_ERR_NVS_NO_FREE_PAGES, ESP_ERR_NVS_NEW_VERSION_FOUND}) {
+            seed();
+            nvs_stub_add_partition("zhac_data");
+            nvs_stub_fail_key("live", true);
+            nvs_stub_fail_key("moved", true);
+            zap_store_init();                       // plain boot: copied, both marks fail
+            ZapDevice k2 = make_dev(0x0CULL, 12, "target only");
+            CHECK(zap_store_save_device(&k2), "K-01: a target-only device is saved");
+            nvs_stub_fail_key("live", false);
+            nvs_stub_fail_key("moved", false);
+            nvs_stub_init_result("zhac_data", lasting);   // the stub keeps it until an erase, as flash does
+            zap_store_init();
+            const uint16_t kn = zap_store_is_ready() ? zap_store_load_devices(pool, 8) : 0;
+            CHECK(kn == 2 && strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_move_final(),
+                  "K-01: a lasting zhac_data fault formats it and copies nvs again, not a store shut for good");
+        }
 
-        // K-01b: same, but the init fault is not a format code: the boot falls
-        // back to nvs and accepts writes there; the next good boot then recopies.
+        // K-01b: same, but the fault passes. That boot keeps the store shut, so
+        // nvs cannot outrank the copy, and the next good boot keeps the copy.
         seed();
         nvs_stub_add_partition("zhac_data");
         nvs_stub_fail_key("live", true);
@@ -998,19 +996,129 @@ int main() {
         const uint16_t kbn = zap_store_load_devices(pool, 8);
         printf("  info: K-01b after good boot: n=%u has_target_only=%d\n", kbn, (int)pool_has(pool, kbn, 0x0DULL));
         CHECK(kb_shut && pool_has(pool, kbn, 0x0DULL),
-              "K-01b: a non-format init fault never lets nvs outrank the target-only device");
+              "K-01b: a passing init fault never lets nvs outrank the target-only device");
 
-        // K-01 fix: a fresh copy whose source mark will not write is not used.
+        // K-01: nvs changed since the copy (this build's trial copied, rolled
+        // back, and the build before paired a device on nvs), so nvs is the
+        // newer store. Back by USB with zhac_data out for a boot, that boot runs
+        // on nvs instead of shutting, and the next one copies nvs afresh.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+        zap_store_init();                           // trial: copied
+        nvs_stub_drop_partition("zhac_data");       // rolled back to a build without zhac_data
+        nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+        zap_store_init();
+        ZapDevice k5 = make_dev(0x0FULL, 15, "paired after the rollback");
+        (void)zap_store_save_device(&k5);
+        nvs_stub_add_partition("zhac_data");        // this build again, by USB
+        nvs_stub_init_result("zhac_data", ESP_FAIL);
+        zap_store_init();
+        CHECK(zap_store_is_ready() && strcmp(zap_store_data_part(), "nvs") == 0 && zap_store_load_devices(pool, 8) == 3,
+              "K-01: nvs changed since the copy, zhac_data out for a boot: the boot runs on nvs, not shut");
+        nvs_stub_init_result("zhac_data", ESP_OK);
+        zap_store_init();
+        CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_load_devices(pool, 8) == 3 &&
+              pool_has(pool, 3, 0x0FULL), "... and the next boot copies nvs, with the device paired after the rollback");
+
+        // K-01: a copy with no record on nvs (taken by a build before K-01, or
+        // a power cut between "done" and "copied") gets it at its next good
+        // boot, before the store writes there, and is protected from then on.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        zap_store_init();
+        { nvs_handle_t mh; if (nvs_open("zap_mig", NVS_READWRITE, &mh) == ESP_OK) { (void)nvs_erase_key(mh, "copied"); nvs_close(mh); } }
+        zap_store_init();                           // keeps the copy and records it
+        ZapDevice k6 = make_dev(0x10ULL, 16, "saved after the record");
+        (void)zap_store_save_device(&k6);
+        nvs_stub_init_result("zhac_data", ESP_FAIL);
+        zap_store_init();
+        const bool k6_shut = !zap_store_is_ready();
+        nvs_stub_init_result("zhac_data", ESP_OK);
+        zap_store_init();
+        const uint16_t k6n = zap_store_load_devices(pool, 8);
+        CHECK(k6_shut && k6n == 3 && pool_has(pool, k6n, 0x10ULL),
+              "K-01: a copy without a record gets one at its next boot and is protected after it");
+
+        // K-01: an nvs too full to take the record (the usual reason "moved"
+        // fails too) does not keep the store off zhac_data: the move completes
+        // there at the first boot and stays at the next.
         seed();
         nvs_stub_add_partition("zhac_data");
         nvs_stub_fail_key("copied", true);
         zap_store_init();
-        CHECK(strcmp(zap_store_data_part(), "nvs") == 0 && zap_store_is_ready(),
-              "K-01: no source mark, the fresh copy is not used (store on nvs)");
-        nvs_stub_fail_key("copied", false);
+        CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_move_final() &&
+              zap_store_load_devices(pool, 8) == 2,
+              "K-01: nvs refusing the copy's record does not keep the store off zhac_data");
         zap_store_init();
         CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_load_devices(pool, 8) == 2,
-              "K-01: the next boot with the mark writable moves the store");
+              "... nor at the next boot");
+
+        // K-01 sweeps: a power cut after each write of a first boot (k = 0..30).
+        // S1: a plain boot whose final marks fail, then a device saved, a
+        // zhac_data out for a boot, a good boot: nothing saved is lost.
+        {
+            int lost = 0;
+            for (int k = 0; k <= 30; k++) {
+                seed();
+                nvs_stub_add_partition("zhac_data");
+                nvs_stub_fail_key("live", true);
+                nvs_stub_fail_key("moved", true);
+                nvs_stub_cut_after(k);
+                zap_store_init();
+                nvs_stub_cut_after(-1);
+                zap_store_init();                   // the restart, marks still failing
+                ZapDevice x = make_dev(0x11ULL, 17, "saved after the cut");
+                const bool saved = zap_store_save_device(&x);
+                nvs_stub_init_result("zhac_data", ESP_FAIL);
+                zap_store_init();
+                nvs_stub_init_result("zhac_data", ESP_OK);
+                nvs_stub_fail_key("live", false);
+                nvs_stub_fail_key("moved", false);
+                zap_store_init();
+                const uint16_t n = zap_store_load_devices(pool, 8);
+                if (!pool_has(pool, n, 0x01ULL) || !pool_has(pool, n, 0x02ULL) || (saved && !pool_has(pool, n, 0x11ULL))) {
+                    lost++;
+                    printf("  S1: cut after %d writes: n=%u saved=%d\n", k, n, (int)saved);
+                }
+            }
+            CHECK(lost == 0, "K-01 S1: a cut at any write of the first boot, then a passing fault: nothing saved is lost");
+        }
+        // S2: a trial boot, rolled back to a build that pairs a device on nvs,
+        // then this build's trial again with zhac_data out for a boot: nvs is
+        // the newer store, so that boot is not shut and nothing is lost.
+        {
+            int lost = 0, shut = 0;
+            for (int k = 0; k <= 30; k++) {
+                seed();
+                nvs_stub_add_partition("zhac_data");
+                nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+                nvs_stub_cut_after(k);
+                zap_store_init();
+                nvs_stub_cut_after(-1);
+                nvs_stub_drop_partition("zhac_data");
+                nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+                zap_store_init();
+                ZapDevice x = make_dev(0x12ULL, 18, "paired by the build before");
+                (void)zap_store_save_device(&x);
+                nvs_stub_add_partition("zhac_data");
+                nvs_stub_ota_state(ESP_OTA_IMG_PENDING_VERIFY);
+                nvs_stub_init_result("zhac_data", ESP_FAIL);
+                zap_store_init();
+                if (!zap_store_is_ready()) shut++;
+                nvs_stub_init_result("zhac_data", ESP_OK);
+                zap_store_init();
+                const uint16_t n = zap_store_load_devices(pool, 8);
+                if (n != 3 || !pool_has(pool, n, 0x12ULL)) {
+                    lost++;
+                    printf("  S2: cut after %d writes: n=%u\n", k, n);
+                }
+            }
+            nvs_stub_ota_state(ESP_OTA_IMG_VALID);
+            CHECK(lost == 0 && shut == 0, "K-01 S2: nvs newer than a cut-short trial's copy: never shut, nothing lost");
+        }
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();

@@ -34,9 +34,9 @@ static bool        s_ready = false;
 // The move is a copy, final only once the image that made it is confirmed:
 //   - both namespaces are copied from `nvs`, then a checksum of what was copied
 //     ("src") and "done" are set on `zhac_data` ("done" cleared first, so a
-//     copy cut short is never taken for a whole one), then "copied" on `nvs`
-//     (a copy that cannot record it is not used), and the store runs on
-//     `zhac_data`;
+//     copy cut short is never taken for a whole one), then the same checksum as
+//     "copied" on `nvs`, readable while `zhac_data` is not (best effort, retried
+//     at the next boot), and the store runs on `zhac_data`;
 //   - on an update's trial boot the originals stay: the build before finds
 //     them if the update rolls back. Until the move is final, a boot keeps the
 //     copy while `nvs` still matches its checksum (nothing wrote `nvs` since,
@@ -282,20 +282,22 @@ static bool mark_clear(const char* part, const char* key) {
     return ok;
 }
 
-// "src": the checksum of nvs the copy on zhac_data was taken from.
-static bool src_get(uint32_t* v) {
+// The checksum of nvs the copy on zhac_data was taken from: "src" on
+// zhac_data, beside the copy, and "copied" on nvs, readable while zhac_data
+// is not.
+static bool sum_get(const char* part, const char* key, uint32_t* v) {
     nvs_handle_t h = 0;
-    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READONLY, &h) != ESP_OK) return false;
-    const bool ok = nvs_get_u32(h, "src", v) == ESP_OK;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    const bool ok = nvs_get_u32(h, key, v) == ESP_OK;
     nvs_close(h);
     return ok;
 }
 
-static bool src_set(uint32_t v) {
+static bool sum_set(const char* part, const char* key, uint32_t v) {
     nvs_handle_t h = 0;
-    if (nvs_open_from_partition(DATA_PART, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    if (nvs_open_from_partition(part, MIG_NS, NVS_READWRITE, &h) != ESP_OK) return false;
     esp_err_t acc = ESP_OK;
-    nvs_seq(&acc, nvs_set_u32(h, "src", v), TAG, "set_u32 copy checksum");
+    nvs_seq(&acc, nvs_set_u32(h, key, v), TAG, "set_u32 copy checksum");
     nvs_seq(&acc, nvs_commit(h), TAG, "commit copy checksum");
     nvs_close(h);
     return acc == ESP_OK;
@@ -358,20 +360,29 @@ static bool data_part_select() {
     // Before the move nvs holds a whole store, so an unusable zhac_data is
     // formatted (this build cannot read what it holds anyway); after it (or with
     // nothing on nvs, so zhac_data may hold the only copy) it is never formatted.
-    // "Before" also needs no "copied" mark on nvs: once a copy was taken,
-    // zhac_data may hold saves nvs lacks (its final marks failed), so an
-    // unusable zhac_data shuts the store instead of being formatted or
-    // outranked by nvs (review 2026-11-03 K-01). A zhac_data broken for good
-    // after a copy therefore needs a storage reset.
-    const bool before_move = !moved && !mark_get(NVS_DEFAULT_PART_NAME, "copied") &&
-                             ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
+    // In between, once the store ran on a copy, zhac_data may hold saves nvs
+    // lacks (its final marks failed). "copied" on nvs says so while nvs still
+    // matches it: nothing wrote nvs since, so the copy is the newer store, and a
+    // zhac_data that will not open keeps the store shut until it does instead of
+    // letting nvs outrank the copy (review 2026-11-03 K-01). Once nvs changed, a
+    // build that ran on it after the copy wrote it: nvs is the newer store, as
+    // for a stale copy below.
+    const bool nvs_store = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
+    uint32_t now = 0, then = 0, rec = 0;
+    const bool read = !moved && nvs_store_sum(&now);
+    bool newer_copy = nvs_store && sum_get(NVS_DEFAULT_PART_NAME, "copied", &rec) && (!read || rec == now);
     esp_err_t e = nvs_flash_init_partition(DATA_PART);
-    if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
-        ESP_LOGW(TAG, "'%s' not usable (%s) -- formatting it, the store is still on nvs",
-                 DATA_PART, esp_err_to_name(e));
+    // These two last until zhac_data is erased, and no build can read it
+    // before: a newer copy's saves are lost either way. Shutting would leave
+    // only a storage reset, which erases nvs too, so nvs's store is kept.
+    if (nvs_store && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
+        ESP_LOGW(TAG, "'%s' not usable (%s) -- formatting it, the store is still on nvs%s", DATA_PART,
+                 esp_err_to_name(e), newer_copy ? " (devices saved on it since the copy are lost)" : "");
+        newer_copy = false;
         e = nvs_flash_erase_partition(DATA_PART);
         if (e == ESP_OK) e = nvs_flash_init_partition(DATA_PART);
     }
+    const bool before_move = nvs_store && !newer_copy;
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "'%s' not usable: %s%s", DATA_PART, esp_err_to_name(e),
                  before_move ? " -- the store stays on nvs"
@@ -401,9 +412,7 @@ static bool data_part_select() {
     // trial rolled back and the build before wrote to it, or this build came
     // back by USB after that) the copy is stale and is taken afresh. "done"
     // alone cannot tell the two apart; the checksum kept with the copy can.
-    uint32_t now = 0, then = 0;
-    const bool read = nvs_store_sum(&now);
-    const bool copy = mark_get(DATA_PART, "done") && src_get(&then);
+    const bool copy = mark_get(DATA_PART, "done") && sum_get(DATA_PART, "src", &then);
     if (copy && !read) {
         // Whether the copy is current cannot be told this boot, and it may hold
         // writes nvs lacks. Running on nvs would let this boot's writes make it
@@ -417,24 +426,29 @@ static bool data_part_select() {
     // a newer store: the copy stays, as it would after a final move.
     if (copy && (then == now || !ns_present(NVS_DEFAULT_PART_NAME, NVS_NS))) {
         ESP_LOGI(TAG, "the copy on '%s' is current (nvs unchanged since it was taken)", DATA_PART);
-        // A copy taken by a build before K-01 has no source mark: best effort,
-        // it may already hold writes nvs lacks, so never fall back for it.
-        if (!mark_get(NVS_DEFAULT_PART_NAME, "copied")) (void)mark_set(NVS_DEFAULT_PART_NAME, "copied");
+        // A copy with no record on nvs (taken by a build before K-01, cut short
+        // after "done", or an nvs that refused it) gets one before the store
+        // writes here. Best effort, as below.
+        if (!sum_get(NVS_DEFAULT_PART_NAME, "copied", &rec) || rec != then)
+            (void)sum_set(NVS_DEFAULT_PART_NAME, "copied", then);
     } else {
         uint32_t sum = 0;
         const bool ok = read && mark_clear(DATA_PART, "done") &&
                         erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS, &sum) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW, &sum) &&
-                        src_set(sum) && mark_set(DATA_PART, "done") &&
-                        // K-01: recorded on the source before zhac_data takes a
-                        // write nvs lacks, so an unusable zhac_data later shuts
-                        // the store instead of being formatted or outranked.
-                        mark_set(NVS_DEFAULT_PART_NAME, "copied");
+                        sum_set(DATA_PART, "src", sum) && mark_set(DATA_PART, "done");
         if (!ok) {
             ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
             return true;
         }
+        // K-01: recorded on nvs before zhac_data takes a write nvs lacks. Best
+        // effort: an nvs too full for it (the usual reason "moved" fails too)
+        // must not keep the store from the room on zhac_data. Until a later
+        // boot records it (above) or the move is final, an unusable zhac_data
+        // can then lose the saves made on it, as before K-01.
+        if (!sum_set(NVS_DEFAULT_PART_NAME, "copied", sum))
+            ESP_LOGW(TAG, "could not record the copy on nvs -- retry next boot");
     }
     s_part = DATA_PART;
     if (image_on_trial()) {
