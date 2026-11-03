@@ -34,7 +34,8 @@ static bool        s_ready = false;
 // The move is a copy, final only once the image that made it is confirmed:
 //   - both namespaces are copied from `nvs`, then a checksum of what was copied
 //     ("src") and "done" are set on `zhac_data` ("done" cleared first, so a
-//     copy cut short is never taken for a whole one), and the store runs on
+//     copy cut short is never taken for a whole one), then "copied" on `nvs`
+//     (a copy that cannot record it is not used), and the store runs on
 //     `zhac_data`;
 //   - on an update's trial boot the originals stay: the build before finds
 //     them if the update rolls back. Until the move is final, a boot keeps the
@@ -52,7 +53,7 @@ static bool        s_ready = false;
 //     A mark that will not write only leaves the old copy on `nvs` for a later
 //     boot to erase (review 2026-10-29 N-05).
 static const char* DATA_PART = "zhac_data";
-static const char* MIG_NS    = "zap_mig";   // "done"/"live"/"src" on zhac_data, "moved" on nvs
+static const char* MIG_NS    = "zap_mig";   // "done"/"live"/"src" on zhac_data, "copied"/"moved" on nvs
 static const char* s_part    = NVS_DEFAULT_PART_NAME;   // where the pool lives
 
 // F16 (FINDINGS.md): serialise save (flush task) and delete (dispatch task) —
@@ -357,13 +358,13 @@ static bool data_part_select() {
     // Before the move nvs holds a whole store, so an unusable zhac_data is
     // formatted (this build cannot read what it holds anyway); after it (or with
     // nothing on nvs, so zhac_data may hold the only copy) it is never formatted.
-    // ponytail: with no mark yet, a zhac_data that will not open cannot tell a
-    // first move from a kept update whose marks failed (review 2026-10-29 N-05),
-    // so this boot falls back to nvs or formats, and what was saved since the
-    // copy is lost. That takes a second fault on the same partition; fail closed
-    // here (store shut) if it ever matters more than a first move onto a broken
-    // zhac_data needing a storage reset.
-    const bool before_move = !moved && ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
+    // "Before" also needs no "copied" mark on nvs: once a copy was taken,
+    // zhac_data may hold saves nvs lacks (its final marks failed), so an
+    // unusable zhac_data shuts the store instead of being formatted or
+    // outranked by nvs (review 2026-11-03 K-01). A zhac_data broken for good
+    // after a copy therefore needs a storage reset.
+    const bool before_move = !moved && !mark_get(NVS_DEFAULT_PART_NAME, "copied") &&
+                             ns_present(NVS_DEFAULT_PART_NAME, NVS_NS);
     esp_err_t e = nvs_flash_init_partition(DATA_PART);
     if (before_move && (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
         ESP_LOGW(TAG, "'%s' not usable (%s) -- formatting it, the store is still on nvs",
@@ -416,13 +417,20 @@ static bool data_part_select() {
     // a newer store: the copy stays, as it would after a final move.
     if (copy && (then == now || !ns_present(NVS_DEFAULT_PART_NAME, NVS_NS))) {
         ESP_LOGI(TAG, "the copy on '%s' is current (nvs unchanged since it was taken)", DATA_PART);
+        // A copy taken by a build before K-01 has no source mark: best effort,
+        // it may already hold writes nvs lacks, so never fall back for it.
+        if (!mark_get(NVS_DEFAULT_PART_NAME, "copied")) (void)mark_set(NVS_DEFAULT_PART_NAME, "copied");
     } else {
         uint32_t sum = 0;
         const bool ok = read && mark_clear(DATA_PART, "done") &&
                         erase_ns(DATA_PART, NVS_NS) && erase_ns(DATA_PART, zap_nvs::SHADOW) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, NVS_NS, &sum) &&
                         copy_ns(NVS_DEFAULT_PART_NAME, DATA_PART, zap_nvs::SHADOW, &sum) &&
-                        src_set(sum) && mark_set(DATA_PART, "done");
+                        src_set(sum) && mark_set(DATA_PART, "done") &&
+                        // K-01: recorded on the source before zhac_data takes a
+                        // write nvs lacks, so an unusable zhac_data later shuts
+                        // the store instead of being formatted or outranked.
+                        mark_set(NVS_DEFAULT_PART_NAME, "copied");
         if (!ok) {
             ESP_LOGE(TAG, "copying the device store to '%s' failed -- staying on nvs, retry next boot", DATA_PART);
             return true;

@@ -929,7 +929,9 @@ int main() {
         nvs_stub_fail_read("nvs", "schema_ver", true);
         zap_store_init();
         CHECK(!zap_store_is_ready(), "back by USB, nvs not readable whole: the store stays shut");
-        CHECK(!zap_store_confirm_move() && !zap_store_move_final() && nvs_stub_count("nvs", "zap_mig") == 0,
+        uint8_t moved_mark = 0;
+        { nvs_handle_t mh; if (nvs_open("zap_mig", NVS_READONLY, &mh) == ESP_OK) { (void)nvs_get_u8(mh, "moved", &moved_mark); nvs_close(mh); } }
+        CHECK(!zap_store_confirm_move() && !zap_store_move_final() && moved_mark == 0,
               "... confirming on that boot writes no mark and says the move is not final");
         nvs_stub_fail_read("nvs", "schema_ver", false);
         zap_store_init();
@@ -950,6 +952,65 @@ int main() {
         zap_store_init();
         CHECK(zap_store_is_ready() && strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_move_final(),
               "... and the next good boot moves the store to zhac_data, final");
+
+        // K-01 (review 2026-11-03): copy taken, both move marks fail, a device is
+        // saved on zhac_data only, then zhac_data will not init at the next boot.
+        // Neither copy may be destroyed: the store stays shut and both survive.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        zap_store_init();                           // plain boot: copied, both marks fail
+        ZapDevice k2 = make_dev(0x0CULL, 12, "target only");
+        CHECK(zap_store_save_device(&k2), "K-01: a target-only device is saved");
+        nvs_stub_fail_key("live", false);
+        nvs_stub_fail_key("moved", false);
+        nvs_stub_init_result("zhac_data", ESP_ERR_NVS_NO_FREE_PAGES);
+        zap_store_init();                           // reboot: zhac_data init fails
+        const bool k_shut = !zap_store_is_ready();
+        printf("  info: K-01 format case: ready=%d part=%s zhac_data zap_v0=%d\n",
+               (int)zap_store_is_ready(), zap_store_data_part(), nvs_stub_count("zhac_data", "zap_v0"));
+        nvs_stub_init_result("zhac_data", ESP_OK);
+        zap_store_init();
+        const uint16_t kn = zap_store_load_devices(pool, 8);
+        printf("  info: K-01 format case after good boot: n=%u has_target_only=%d\n", kn, (int)pool_has(pool, kn, 0x0CULL));
+        CHECK(k_shut && kn == 3 && pool_has(pool, kn, 0x0CULL),
+              "K-01: init fault after failed marks keeps the target-only device (store shut meanwhile)");
+
+        // K-01b: same, but the init fault is not a format code: the boot falls
+        // back to nvs and accepts writes there; the next good boot then recopies.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_fail_key("live", true);
+        nvs_stub_fail_key("moved", true);
+        zap_store_init();
+        ZapDevice k3 = make_dev(0x0DULL, 13, "target only b");
+        (void)zap_store_save_device(&k3);
+        nvs_stub_fail_key("live", false);
+        nvs_stub_fail_key("moved", false);
+        nvs_stub_init_result("zhac_data", ESP_FAIL);
+        zap_store_init();
+        const bool kb_shut = !zap_store_is_ready();
+        printf("  info: K-01b fallback case: ready=%d part=%s\n", (int)zap_store_is_ready(), zap_store_data_part());
+        { ZapDevice k4 = make_dev(0x0EULL, 14, "saved on nvs fallback"); (void)zap_store_save_device(&k4); }
+        nvs_stub_init_result("zhac_data", ESP_OK);
+        zap_store_init();
+        const uint16_t kbn = zap_store_load_devices(pool, 8);
+        printf("  info: K-01b after good boot: n=%u has_target_only=%d\n", kbn, (int)pool_has(pool, kbn, 0x0DULL));
+        CHECK(kb_shut && pool_has(pool, kbn, 0x0DULL),
+              "K-01b: a non-format init fault never lets nvs outrank the target-only device");
+
+        // K-01 fix: a fresh copy whose source mark will not write is not used.
+        seed();
+        nvs_stub_add_partition("zhac_data");
+        nvs_stub_fail_key("copied", true);
+        zap_store_init();
+        CHECK(strcmp(zap_store_data_part(), "nvs") == 0 && zap_store_is_ready(),
+              "K-01: no source mark, the fresh copy is not used (store on nvs)");
+        nvs_stub_fail_key("copied", false);
+        zap_store_init();
+        CHECK(strcmp(zap_store_data_part(), "zhac_data") == 0 && zap_store_load_devices(pool, 8) == 2,
+              "K-01: the next boot with the mark writable moves the store");
 
         // Leave the default layout for anything that runs after this block.
         nvs_stub_reset();
