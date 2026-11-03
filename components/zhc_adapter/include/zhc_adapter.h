@@ -189,6 +189,16 @@ typedef void (*zhac_shadow_update_fn_t)(uint64_t ieee,
 
 void zhac_adapter_register_shadow(zhac_shadow_update_fn_t fn);
 
+// The text the platform keeps for `key` on a device (its shadow, restored at
+// boot), copied NUL-terminated into out[0..cap); false when it keeps none or
+// the text does not fit. The decoder asks for a setting that changes how a
+// measurement reads (a Fahrenheit display unit, the floor sensor in control,
+// a meter's interface mode) while the device has not reported it since boot,
+// as z2m reads its persisted state. Called inside the decode on the RX path:
+// no allocation, no lock beyond a leaf one.
+typedef bool (*zhac_state_text_fn_t)(uint64_t ieee, const char* key, char* out, size_t cap);
+void zhac_adapter_register_state_text(zhac_state_text_fn_t fn);
+
 // ── Configure hooks ──────────────────────────────────────────────────
 //
 // Called by `zhc::run_configure(def, ctx)` at device join. Platforms

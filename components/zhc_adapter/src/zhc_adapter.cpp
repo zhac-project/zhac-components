@@ -900,6 +900,7 @@ zhac_configure_cmd_fn_t    g_cfg_cmd    = nullptr;
 zhac_configure_read_fn_t   g_cfg_read   = nullptr;
 zhac_configure_write_fn_t  g_cfg_write  = nullptr;
 zhac_configure_sleep_fn_t  g_cfg_sleep  = nullptr;
+zhac_state_text_fn_t       g_state_text = nullptr;
 
 // Per-call addressing (P2-T13, defs 3+4). The zhc library's bridge
 // function-pointer types carry (device_index, ep, cluster, ...) but NOT
@@ -982,7 +983,18 @@ bool configure_write_bridge(std::uint16_t idx, std::uint8_t ep,
 void configure_sleep_bridge(std::uint16_t wait_ms) {
     if (g_cfg_sleep) g_cfg_sleep(wait_ms);
 }
+
+// A setting the decoder needs while the device has not reported it since boot
+// (security review 2026-11-03 F-04): the text the platform kept for it.
+bool state_text_bridge(std::uint16_t idx, const char* key, char* out, std::size_t cap) {
+    const auto a = bridge_addr_for(idx);
+    return g_state_text && a.ok && g_state_text(a.ieee, key, out, cap);
+}
 }  // namespace
+
+extern "C" void zhac_adapter_register_state_text(zhac_state_text_fn_t fn) {
+    g_state_text = fn;
+}
 
 extern "C" void zhac_adapter_register_configure(
         zhac_configure_bind_fn_t   bind_fn,
@@ -1580,6 +1592,7 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     ctx.configure_cmd    = g_cfg_cmd    ? &configure_cmd_bridge    : nullptr;
     ctx.configure_read   = g_cfg_read   ? &configure_read_bridge   : nullptr;
     ctx.configure_write  = g_cfg_write  ? &configure_write_bridge  : nullptr;
+    ctx.state_text       = g_state_text ? &state_text_bridge       : nullptr;
 
     auto result = zhc::dispatch_from_zigbee(msg, dp_span, *def, raw, ctx);
 

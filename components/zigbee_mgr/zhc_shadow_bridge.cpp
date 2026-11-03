@@ -195,6 +195,21 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
     return more;
 }
 
+// The text the shadow keeps for `key` (zhac_adapter_register_state_text): a
+// setting the decoder needs before the device reports it again after a
+// restart (security review 2026-11-03 F-04). Runs inside the decode on the
+// radio task: device_shadow_get_attr takes only the shadow's leaf lock, which
+// nothing on this path holds; no allocation.
+bool zhc_state_text(uint64_t ieee, const char* key, char* out, size_t cap) {
+    ShadowAttr a{};
+    if (!out || !device_shadow_get_attr(ieee, key, &a) || a.val_type != VAL_STR) return false;
+    const size_t n = strnlen(a.str_val, sizeof(a.str_val));
+    if (n >= cap) return false;   // never cut: a prefix can name another setting
+    memcpy(out, a.str_val, n);
+    out[n] = '\0';
+    return true;
+}
+
 // A frame ended a long silence (zhac_adapter_register_seen): tell the
 // subscribers, who push the device's new last_seen.
 void zhc_device_seen(uint64_t ieee) {
@@ -208,6 +223,7 @@ void zhc_device_seen(uint64_t ieee) {
 
 extern "C" void zhc_shadow_bridge_register(void) {
     zhac_adapter_register_shadow(&zhc_shadow_update_cb);
+    zhac_adapter_register_state_text(&zhc_state_text);
     zhac_adapter_register_poll_source(&zhc_poll_device_at);
     zhac_adapter_register_seen(&zhc_device_seen);
 }
