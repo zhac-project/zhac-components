@@ -32,8 +32,20 @@ target_include_directories(ws_server_blocking_probe PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 target_compile_definitions(ws_server_blocking_probe PRIVATE CONFIG_HTTPD_QUEUE_WORK_BLOCKING=1)
 
+# Review 2026-10-24 HS-03/HS-04 (request deadline, sign-in deadline, full table): its own process,
+# so the client table starts empty.
+add_executable(ws_server_limits_test
+    test_ws_limits.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../ws_server.cpp)
+target_include_directories(ws_server_limits_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_libraries(ws_server_limits_test PRIVATE Threads::Threads)
+target_compile_options(ws_server_limits_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME ws_server_host COMMAND ws_server_host_test)
+add_test(NAME ws_server_limits COMMAND ws_server_limits_test)
 add_test(NAME ws_server_rejects_blocking_queue_work
          COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ws_server_blocking_probe)
 set_tests_properties(ws_server_rejects_blocking_queue_work PROPERTIES

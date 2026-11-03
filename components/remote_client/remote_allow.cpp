@@ -41,10 +41,10 @@ constexpr const char* kRemoteAllowedCmds[] = {
     // Rules
     "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
     // Cloud automations: per-rule run counters (a read) and "Run now", which
-    // runs one stored rule's own actions. A rule's `script.run` action runs a
-    // stored script, and the hub switch below does NOT gate it: cloud
-    // automations rely on it. The cloud, not the hub, limits rules with that
-    // action to owners and admins.
+    // runs one stored rule's own actions. A rule save that adds a `script.run`
+    // action is switch-gated (remote_rule_refusal, review LU-04); a rule already
+    // stored keeps running its script, Run now included. The cloud also limits
+    // rules with that action to owners and admins.
     "rules.status", "rule.run",
     // Remote editing (spec 2026-10-05 §3.1): a parse check stores nothing, and a
     // staged part reaches flash only through script.write, which the switch gates.
@@ -72,9 +72,9 @@ constexpr const char* kRemoteAllowedCmds[] = {
 // the cloud (script.write, script.reload, system.restart), and a direct script.run.
 // They pass only while the hub's own page has "Allow script changes from the cloud"
 // on (remote_scripts_allowed()); otherwise they are refused scripts_off, so the
-// cloud can say "turn it on" rather than "not supported". The switch does not stop
-// a stored rule's script.run action from running a script (see "Cloud automations"
-// above).
+// cloud can say "turn it on" rather than "not supported". A rule save that adds a
+// script.run action is refused the same way (remote_rule_refusal); a rule already
+// stored keeps running its script (see "Cloud automations" above).
 constexpr const char* kRemoteScriptCmds[] = {
     "script.write", "script.run", "script.reload", "system.restart",
 };
@@ -160,6 +160,14 @@ extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, 
 #endif
     }
     return listed(kRemoteAllowedCmds, cmd) ? nullptr : "cmd_not_allowed";
+}
+
+extern "C" const char* remote_rule_refusal(const char* cmd, const char* dsl, bool scripts_on) {
+    if (scripts_on || !cmd || !dsl) return nullptr;
+    if (std::strcmp(cmd, "rule.create") != 0 && std::strcmp(cmd, "rule.update") != 0) return nullptr;
+    // The rule DSL's only way to Lua is its `script.run <name>` action (simple_rules dsl_parser.cpp,
+    // matched case-sensitively); the text anywhere else, say inside a log message, is refused too.
+    return std::strstr(dsl, "script.run") ? "scripts_off" : nullptr;
 }
 
 extern "C" bool remote_cmd_allowed(const char* cmd) {

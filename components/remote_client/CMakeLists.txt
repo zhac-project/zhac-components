@@ -43,6 +43,7 @@ idf_component_register(
                   nvs_flash
                   ws_server
                   zap_common
+                  zap_tls          # how the cloud link judges the server (review HS-11)
                   hap_json
                   metrics
                   arduinojson

@@ -36,7 +36,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_websocket_client.h"
-#include "esp_crt_bundle.h"
+#include "zap_tls.h"
 #include "ArduinoJson.h"
 
 #include "ws_server.h"  // ws_server_register_reply_hook
@@ -376,7 +376,10 @@ static void handle_rx_frame(const char* data, size_t len) {
     bool local_only_key = false;   // remote_scripts, log_to_cloud: remote_allow.cpp kRemoteLocalOnlyKeys
     for (JsonPairConst kv : doc["args"].as<JsonObjectConst>())
         if (!kv.value().isNull() && remote_is_local_only_key(kv.key().c_str())) local_only_key = true;
-    if (const char* refusal = remote_cmd_refusal(cmd, local_only_key, remote_scripts_allowed())) {
+    const bool scripts_on = remote_scripts_allowed();
+    const char* refusal = remote_cmd_refusal(cmd, local_only_key, scripts_on);
+    if (!refusal) refusal = remote_rule_refusal(cmd, doc["args"]["dsl"] | (const char*)nullptr, scripts_on);   // LU-04
+    if (refusal) {
         char err_buf[96];
         int en = snprintf(err_buf, sizeof(err_buf),
             "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}", doc["id"] | 0, refusal);
@@ -406,7 +409,7 @@ static void start_ws_client() {
     cfg.ping_interval_sec  = CONFIG_ZHAC_REMOTE_PING_INTERVAL_S;
     cfg.network_timeout_ms = 10 * 1000;
     cfg.disable_auto_reconnect = true;  // we run our own backoff
-    cfg.crt_bundle_attach  = esp_crt_bundle_attach;
+    cfg.crt_bundle_attach  = zap_tls_attach;   // the CA bundle; dates once the clock is set (HS-11)
     // The TLS handshake — including X.509 chain verification (RSA bignum, up to the RSA-4096
     // ISRG root for a Let's Encrypt cert) — runs in the esp_websocket_client task. The default
     // WEBSOCKET_TASK_STACK_SIZE (~4 KiB) overflows there: a plaintext endpoint bails before any

@@ -404,6 +404,12 @@ int main() {
           "a reply still reaches a client that has not signed in (only broadcasts are re-checked)");
     do_broadcast(0);
     CHECK(read_frames(u[1], f) && f.empty(), "auth gate: a client that has not signed in gets no broadcast");
+    // Sign-in switched off with it still connected (its close only queued): it still gets nothing (HS-01).
+    ws_server_set_api_token(nullptr);
+    do_broadcast(0);
+    CHECK(read_frames(u[1], f) && f.empty(),
+          "auth gate: with sign-in off, a client that never signed in still gets no broadcast");
+    ws_server_set_api_token("0123456789abcdef0123456789abcdef");
     g_close_fn(nullptr, u[0]);
     read_frames(sv[1], f);                  // forget what was sent above
     g_closes.clear();
@@ -480,6 +486,34 @@ int main() {
         const std::string fine = "{\"name\":\"Привіт €\xf0\x9f\x98\x80\"}";
         ws_server_reply(sv[0], fine.data(), fine.size());
         CHECK(read_frames(sv[1], f) && f.size() == 1 && f[0] == fine, "UTF-8 guard: valid text goes out unchanged");
+    }
+
+    // The firmware's cross-site filter (review 2026-10-24 HS-01): without the pre-handshake callback a refused
+    // upgrade is closed at once and never becomes a client; an accepted one registers as before.
+    {
+        const int before = ws_server_client_count();
+        g_closes.clear();
+        ws_server_set_upgrade_filter([](httpd_req_t*) { return false; });
+        add_client(9001);
+        CHECK(ws_server_client_count() == before && g_closes.size() == 1 && g_closes[0].fd == 9001,
+              "upgrade filter: a refused upgrade is closed and not registered");
+        ws_server_set_upgrade_filter([](httpd_req_t*) { return true; });
+        g_closes.clear();
+        add_client(9002);
+        CHECK(ws_server_client_count() == before + 1 && g_closes.empty(), "upgrade filter: an accepted upgrade registers");
+        ws_server_set_upgrade_filter(nullptr);
+
+        // Sign-in switched off: a socket that never signed in is closed, a signed-in one stays.
+        ws_server_set_api_token("0123456789abcdef0123456789abcdef");
+        g_closes.clear();                               // a full table may already close 9003 to admit 9004 (HS-04)
+        add_client(9003);                               // no token at the handshake: not signed in
+        add_client(9004);
+        ws_server_fd_set_authed(9004);                  // signed in with the first message
+        ws_server_close_unauthed();
+        bool closed_9003 = false, closed_9004 = false;
+        for (const auto& c : g_closes) { closed_9003 |= c.fd == 9003; closed_9004 |= c.fd == 9004; }
+        CHECK(closed_9003 && !closed_9004, "close_unauthed: the socket that never signed in goes, the signed-in one stays");
+        ws_server_set_api_token(nullptr);
     }
 
     CHECK(g_lock_order_violations == 0, "lock order, every take of the run: s_tx_mutex is never taken while s_mutex is held");

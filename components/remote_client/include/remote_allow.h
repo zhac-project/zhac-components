@@ -12,12 +12,17 @@ extern "C" {
 //                     (remote_scripts), whatever the build trusts the cloud with;
 //   "scripts_off"     a switch-gated op while the hub's "Allow script changes from the cloud" switch is
 //                     off. The switch gates changing Lua and engine control (script.write, script.reload,
-//                     system.restart) and a direct script.run. It does not gate a rule's script.run
-//                     action: the cloud, not the hub, limits such rules to owners and admins;
+//                     system.restart), a direct script.run, and a rule save that adds a script.run action
+//                     (remote_rule_refusal below);
 //   "cmd_not_allowed" anything else the relay does not pass.
 // `local_only_key`: the args carry a key `remote_is_local_only_key` accepts. `scripts_on`: the switch.
 // LINEAR SCANS over static arrays (~70 entries), once per cloud frame.
 const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on);
+// The relay's answer to a rule save (rule.create / rule.update) whose text is `dsl`: "scripts_off" when
+// the text runs a stored script (a `script.run` action) while the switch is off -- the cloud may not run
+// Lua on the hub by way of a new rule either (review 2026-10-24 LU-04) -- else nullptr. Rules already on
+// the hub keep running, rule.run included. Asked once remote_cmd_refusal passed.
+const char* remote_rule_refusal(const char* cmd, const char* dsl, bool scripts_on);
 
 // True for a settings.set key that only the hub's own page may change; the relay answers settings.set
 // carrying one of them (with any non-null value) with local_only. remote_scripts: spec 2026-10-05 §3.1;

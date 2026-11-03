@@ -36,6 +36,11 @@ void             ws_server_reply(int fd, const char* json, size_t len);
 httpd_handle_t   ws_server_get_handle();
 void             ws_server_set_rx_callback(WsRxCallback cb);
 void             ws_server_set_api_token(const char* token);
+// Optional: asked about every WebSocket upgrade; false refuses it -- before the
+// handshake with CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT, else by closing the
+// new socket at once. The firmware's cross-site filter (review 2026-10-24 HS-01).
+using WsUpgradeFilter = bool(*)(httpd_req_t* req);
+void             ws_server_set_upgrade_filter(WsUpgradeFilter fn);
 int              ws_server_client_count();
 // True when the CALLING task is currently inside a send to a WS client: the
 // broadcast fan-out or ws_server_reply (the TX lock is held, the marker set).
@@ -52,6 +57,13 @@ void             ws_server_fd_set_authed(int fd);
 // Q48: clear every client's authed flag (e.g. on token rotation) so sockets that
 // authenticated with the now-stale token must re-auth with the new one.
 void             ws_server_fd_deauth_all();
+// Close every client that never signed in. For the switch from sign-in on to
+// off, after which every socket is trusted (review 2026-10-24 HS-01).
+void             ws_server_close_unauthed();
+// While a token is set, close the clients that joined more than 5 s before
+// `now_us` and have not signed in (review 2026-10-24 HS-04). Called once a
+// second by the server's own timer; public for the host test.
+void             ws_server_sign_in_sweep(int64_t now_us);
 
 // ── Reply hook for sentinel fds ─────────────────────────────────────────
 //

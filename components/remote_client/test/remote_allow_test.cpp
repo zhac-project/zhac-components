@@ -36,6 +36,22 @@ int main() {
         assert(remote_cmd_refusal(c, false, true) == nullptr);
     }
 
+    // A rule that runs a stored script is Lua from the cloud like script.run (review LU-04): with the
+    // switch off a save of one is refused scripts_off; rules without that action, other commands, and an
+    // open switch pass.
+    const char* runs = "ON lamp#state DO script.run heating ENDON";
+    const char* plain = "ON lamp#state DO zigbee.toggle lamp state ENDON";
+    for (const char* c : {"rule.create", "rule.update"}) {
+        assert(is(remote_rule_refusal(c, runs, false), "scripts_off"));
+        assert(remote_rule_refusal(c, runs, true) == nullptr);
+        assert(remote_rule_refusal(c, plain, false) == nullptr);
+        assert(remote_rule_refusal(c, nullptr, false) == nullptr);
+    }
+    assert(is(remote_rule_refusal("rule.create", "ON x#y DO log a; script.run b ENDON", false), "scripts_off"));
+    for (const char* c : {"rule.check", "rule.run", "rule.enable", "status.get"}) {   // these store no rule text
+        assert(remote_rule_refusal(c, runs, false) == nullptr);
+    }
+
     // The destructive set stays privileged: no switch opens it (denied without the Kconfig).
     for (const char* c : {"ota.s3", "ota.p4", "zigbee.reset", "device.delete", "settings.set",
                           "system.token.rotate", "uplink.set", "deploy.apply", "deploy.etag"}) {
