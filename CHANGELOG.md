@@ -7,6 +7,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ## [Unreleased]
 
+### Added
+
+- **Hub pins for rules and the device model** (GPIO control, wired hub). `simple_rules` has the actions `gpio.set <pin> <value>`, `gpio.toggle <pin>` and `pwm.set <pin> <duty>`; the firmware checks the pin when a rule is saved and drives it when it fires through `simple_rules_set_io_hooks()`, so the component stays host-testable (host test `simple_rules_gpio_actions_test`). The three count as feed-back actions for the run cap. `zap_common` gains `PROTO_LOCAL` for a device on the hub itself; `device_cmd_set_attr` hands such a device to a handler set with `device_cmd_set_local_handler()`, `device_cmd_remove` refuses it with `DEVCMD_LOCAL`, and the availability/meter poll skips it. `zhac_adapter_set_local_exposes_fn()` supplies its exposes.
+
 ### Fixed
 
 - **A setting that changes how a measurement reads survives a restart** (`zhc_adapter`, `zhc_shadow_bridge`; security review 2026-11-03 F-04). embedded-zhc's decoders remembered a device's temperature unit (HOBEIAN ZG-IR01 / ZG-204ZX), floor-thermostat sensor (TS0601_floor_thermostat_006) and meter interface mode (Develco EMIZB-132) only in the runtime store, which a restart zeroes, so until the device reported the setting again a °F sensor's 77 °F was published as 77 °C, the floor thermostat's `local_temperature` came from the wrong probe, and the meter's current read 100 times too high (its interface mode is never reported, only read at configure). The decoder now asks for the text the shadow kept, restored from flash at boot, through the new `zhac_adapter_register_state_text()`; `zhc_shadow_bridge_register()` answers it from `device_shadow_get_attr()` (the shadow's leaf lock only, no allocation; a text that does not fit is refused, never cut). Still open: a setting changed less than 30 min before a power cut may not be on flash yet (graceful restarts and OTA write it first), and frames decoded before the shadow is restored at boot use the default until it is. Host test zigbee_mgr G15.
