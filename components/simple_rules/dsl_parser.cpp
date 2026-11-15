@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>   // INT32_MAX / INT32_MIN bounds for strtod clamp
 #include <cmath>     // std::isfinite — reject NaN/inf literals before cast
+#include <strings.h> // strcasecmp
 
 static const char* TAG = "dsl_parser";
 
@@ -318,10 +319,78 @@ static ParseResult parse_value_arg(const char* s, RuleAction* a,
     return ParseResult::OK;
 }
 
+// ── Hub pins: gpio.set / gpio.toggle / pwm.set ───────────────────────────
+
+static simple_rules_io_check_t s_io_check = nullptr;
+void dsl_set_io_check(simple_rules_io_check_t check) { s_io_check = check; }
+
+// on/off/1/0/true/false/high/low, any case: the literal values gpio.set takes.
+static bool is_level_word(const char* v) {
+    static constexpr const char* kWords[] = {"on", "off", "1", "0", "true", "false", "high", "low"};
+    for (const char* w : kWords) if (strcasecmp(v, w) == 0) return true;
+    return false;
+}
+
+// A literal duty: a number 0..100, decimals allowed, nothing after it.
+static bool is_duty(const char* v) {
+    char* end = nullptr;
+    const double d = strtod(v, &end);
+    return end != v && *end == '\0' && std::isfinite(d) && d >= 0.0 && d <= 100.0;
+}
+
+// The pin token, then the firmware's check of it. `s` is left after the token.
+static ParseResult parse_pin(const char*& s, RuleAction* a, SimpleRulesIoOp op, const char* verb) {
+    s = copy_token(skip_ws(s), ' ', a->arg0, sizeof(a->arg0));
+    if (token_overflowed(s)) {
+        dsl_set_err("%s: pin name too long (max %u)", verb, (unsigned)(sizeof(a->arg0) - 1));
+        return ParseResult::ERR_BAD_ACTION;
+    }
+    if (a->arg0[0] == '\0') { dsl_set_err("%s: pin missing", verb); return ParseResult::ERR_BAD_ACTION; }
+    char err[96] = {};
+    if (s_io_check && !s_io_check(op, a->arg0, err, sizeof(err))) {
+        dsl_set_err("%s", err[0] ? err : "unknown pin");
+        return ParseResult::ERR_BAD_ACTION;
+    }
+    return ParseResult::OK;
+}
+
+// gpio.set / pwm.set: pin, then a literal of the verb's kind, %value% or an expression.
+static ParseResult parse_pin_value(const char* s, RuleAction* a, SimpleRulesIoOp op, const char* verb) {
+    ParseResult r = parse_pin(s, a, op, verb);
+    if (r != ParseResult::OK) return r;
+    r = parse_value_arg(s, a, a->arg2, sizeof(a->arg2));
+    if (r != ParseResult::OK || a->has_expr) return r;
+    if (a->arg2[0] == '\0') { dsl_set_err("%s: value missing", verb); return ParseResult::ERR_BAD_ACTION; }
+    if (strcmp(a->arg2, "%value%") == 0) return ParseResult::OK;
+    if (op == SimpleRulesIoOp::PWM ? !is_duty(a->arg2) : !is_level_word(a->arg2)) {
+        dsl_set_err(op == SimpleRulesIoOp::PWM ? "%s: duty must be 0-100, not '%s'"
+                                               : "%s: value must be on/off/1/0/true/false/high/low, not '%s'",
+                    verb, a->arg2);
+        return ParseResult::ERR_BAD_ACTION;
+    }
+    return ParseResult::OK;
+}
+
 // ── Action parsing ────────────────────────────────────────────────────────
 
 static ParseResult parse_action(const char* s, RuleAction* a) {
     s = skip_ws(s);
+    if (strncmp(s, "gpio.set ", 9) == 0) {
+        a->type = ActionType::GPIO_SET;
+        return parse_pin_value(s + 9, a, SimpleRulesIoOp::SET, "gpio.set");
+    }
+    if (strncmp(s, "pwm.set ", 8) == 0) {
+        a->type = ActionType::PWM_SET;
+        return parse_pin_value(s + 8, a, SimpleRulesIoOp::PWM, "pwm.set");
+    }
+    if (strncmp(s, "gpio.toggle", 11) == 0 && (s[11] == ' ' || s[11] == '\0')) {
+        a->type = ActionType::GPIO_TOGGLE;
+        s += 11;
+        const ParseResult r = parse_pin(s, a, SimpleRulesIoOp::TOGGLE, "gpio.toggle");
+        if (r != ParseResult::OK) return r;
+        if (*skip_ws(s) != '\0') { dsl_set_err("gpio.toggle takes one pin"); return ParseResult::ERR_BAD_ACTION; }
+        return ParseResult::OK;
+    }
     // Tail-arg note: actions are extracted as the substring between
     // `DO ` and `ENDON`, so the last action's last argument keeps the
     // trailing space before ENDON (e.g. `zigbee.toggle dev state `).

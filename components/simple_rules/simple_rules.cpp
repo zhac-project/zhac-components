@@ -69,6 +69,12 @@ static rules_error_cb_t s_error_cb = nullptr;
 // the engine.
 static simple_rules_script_hook_t s_script_hook = nullptr;
 
+static simple_rules_io_run_t s_io_run = nullptr;
+void simple_rules_set_io_hooks(simple_rules_io_check_t check, simple_rules_io_run_t run) {
+    dsl_set_io_check(check);
+    s_io_run = run;
+}
+
 void simple_rules_set_script_hook(simple_rules_script_hook_t hook) {
     s_script_hook = hook;
 }
@@ -462,6 +468,9 @@ static const char* verb(ActionType t) {
     case ActionType::TIMER:         return "timer";
     case ActionType::LOG:           return "log";
     case ActionType::SCRIPT:        return "script.run";
+    case ActionType::GPIO_SET:      return "gpio.set";
+    case ActionType::GPIO_TOGGLE:   return "gpio.toggle";
+    case ActionType::PWM_SET:       return "pwm.set";
     }
     return "?";
 }
@@ -700,6 +709,28 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
             break;
         }
 
+        case ActionType::GPIO_SET:
+        case ActionType::PWM_SET: {
+            char val_buf[32];
+            if (!resolve_action_value(a, a.arg2, event_val, val_buf, sizeof(val_buf))) {
+                fail();
+                break;   // expression skip -- the pin keeps its level
+            }
+            const SimpleRulesIoOp op = a.type == ActionType::PWM_SET ? SimpleRulesIoOp::PWM : SimpleRulesIoOp::SET;
+            if (!s_io_run || !s_io_run(op, a.arg0, val_buf)) {
+                ESP_LOGW(TAG, "%s %s %s: refused", verb(a.type), a.arg0, val_buf);
+                fail();
+            }
+            break;
+        }
+
+        case ActionType::GPIO_TOGGLE:
+            if (!s_io_run || !s_io_run(SimpleRulesIoOp::TOGGLE, a.arg0, "")) {
+                ESP_LOGW(TAG, "gpio.toggle %s: refused", a.arg0);
+                fail();
+            }
+            break;
+
         default:
             break;
         }
@@ -766,7 +797,8 @@ static bool can_feed_back(const ParsedRule& r) {
     if (!has_edge(r.trigger)) return false;
     for (uint8_t i = 0; i < r.action_count; i++) {
         const ActionType t = r.actions[i].type;
-        if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT)
+        if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT ||
+            t == ActionType::GPIO_SET || t == ActionType::GPIO_TOGGLE || t == ActionType::PWM_SET)   // Hub I/O reports back too
             return true;
     }
     return false;
