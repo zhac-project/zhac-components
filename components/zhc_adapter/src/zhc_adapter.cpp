@@ -1253,11 +1253,16 @@ extern "C" bool zhac_adapter_resolve_labels(const char* model_id,
 // overflow. Used by `hap_json_encode_device_info` to surface
 // `exposes` on the wire so the UI can drive read-only / writable /
 // enum classification from the library, not a hardcoded allowlist.
+static zhac_local_exposes_fn s_local_exposes = nullptr;
+extern "C" void zhac_adapter_set_local_exposes_fn(zhac_local_exposes_fn fn) { s_local_exposes = fn; }
+
 extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
                                                     const char* model_id,
                                                     const char* manufacturer_name,
                                                     char* buf, size_t cap) {
     if (!buf || cap < 3) return 0;
+    if (s_local_exposes && ieee)
+        if (const size_t n = s_local_exposes(ieee, buf, cap)) return n;
     const zhc::PreparedDefinition* def =
         resolve_definition(ieee, model_id, manufacturer_name);
     const zhc::PreparedDefinition* supp =

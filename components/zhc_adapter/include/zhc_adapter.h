@@ -248,6 +248,12 @@ size_t zhac_adapter_build_exposes_json(uint64_t ieee,
                                          const char* manufacturer_name,
                                          char* buf, size_t cap);
 
+// A device on the hub itself (the Hub I/O pins) has no definition: this hook
+// writes its exposes array. It returns 0 for every other ieee, and the lookup
+// above runs as before.
+typedef size_t (*zhac_local_exposes_fn)(uint64_t ieee, char* buf, size_t cap);
+void zhac_adapter_set_local_exposes_fn(zhac_local_exposes_fn fn);
+
 // Drop the per-ieee cached ZHC definition pointer. Call after anything
 // that could change the device's (model_id, manufacturer_name) tuple —
 // late-identity fill, rename, rejoin with a different interview
