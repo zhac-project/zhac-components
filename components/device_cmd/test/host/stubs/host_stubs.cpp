@@ -41,6 +41,7 @@ void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, 
     s_have_dev = true;
 }
 void stub_pool_clear() { s_have_dev = false; }
+void stub_pool_set_protocol(uint8_t proto) { s_dev.protocol = static_cast<NcpProtocol>(proto); }
 void stub_reset() {
     g_send = StubSend{}; g_shadow = StubShadow{}; g_store = StubStore{};
     g_send_result = true; g_radio_result = true; g_have_backend = false;

@@ -61,6 +61,7 @@ typedef enum {
     DEVCMD_BAD_NAME,       // rename: empty, longer than 29 bytes, or holds a quote, backslash or control character
     DEVCMD_RADIO,          // the radio refused (permit join)
     DEVCMD_BAD_COLOUR,     // color_hex that is not "#rrggbb", or is black (set_attr)
+    DEVCMD_LOCAL,          // remove: a device on the hub itself (Hub I/O) goes with its pin config
 } DevCmdResult;
 
 // The words every transport answers with. Stable: the web UI and the docs use them.
@@ -68,6 +69,12 @@ const char* device_cmd_result_str(DevCmdResult r);
 
 // `ep` 0 = the device's first endpoint (its default).
 DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, const DevCmdValue* v);
+
+// A device on the hub itself (protocol PROTO_LOCAL, the Hub I/O pins) has no
+// radio or converter: set_attr hands it to this handler instead, which drives
+// the pin and publishes the value itself. None registered: DEVCMD_NO_CONVERTER.
+typedef DevCmdResult (*device_cmd_local_fn)(uint64_t ieee, const char* key, const DevCmdValue* v);
+void device_cmd_set_local_handler(device_cmd_local_fn fn);
 
 static inline DevCmdValue device_cmd_bool(bool b)         { DevCmdValue v = {DEVCMD_BOOL, b, 0, 0.0, 0}; return v; }
 static inline DevCmdValue device_cmd_int(int64_t i)       { DevCmdValue v = {DEVCMD_INT, false, i, 0.0, 0}; return v; }

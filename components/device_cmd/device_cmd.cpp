@@ -23,6 +23,7 @@ const char* device_cmd_result_str(DevCmdResult r) {
         case DEVCMD_BAD_NAME:     return "name must be 1-29 characters without quotes, backslashes or control characters";
         case DEVCMD_RADIO:        return "radio refused";
         case DEVCMD_BAD_COLOUR:   return "colour must be #rrggbb, not black";
+        case DEVCMD_LOCAL:        return "hub I/O device: change its pins in Settings > I/O";
     }
     return "failed";
 }
@@ -73,6 +74,9 @@ void mirror_colour(uint64_t ieee, const char* model, const char* manu, const cha
 }
 }  // namespace
 
+static device_cmd_local_fn s_local = nullptr;
+void device_cmd_set_local_handler(device_cmd_local_fn fn) { s_local = fn; }
+
 DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, const DevCmdValue* v) {
     if (!key || !key[0] || !v) return DEVCMD_BAD_ARGS;
     if (v->kind == DEVCMD_STR && !v->s) return DEVCMD_BAD_VALUE;
@@ -94,12 +98,14 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
     zigbee_pool_lock();
     ZapDevice* dev = pool_find_by_ieee(ieee);
     if (!dev) { zigbee_pool_unlock(); return DEVCMD_NOT_FOUND; }
+    const bool local = dev->protocol == PROTO_LOCAL;
     ieee_cp = dev->ieee_addr;
     nwk_cp  = dev->nwk_addr;
     if (ep_cp == 0) ep_cp = dev->endpoints[0] ? dev->endpoints[0] : 1;
     std::snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
     std::snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
     zigbee_pool_unlock();
+    if (local) return s_local ? s_local(ieee_cp, key, v) : DEVCMD_NO_CONVERTER;
 
     bool ok = false;
     switch (v->kind) {

@@ -11,6 +11,7 @@ typedef enum : uint8_t {
     PROTO_THREAD  = 0x02,
     PROTO_WIFI    = 0x03,
     PROTO_ZWAVE   = 0x04,
+    PROTO_LOCAL   = 0x05,   // on the hub itself (Hub I/O pins): no radio behind it
 } NcpProtocol;
 
 // Short protocol name for JSON serialization (e.g. "zb", "ble", "th")
@@ -21,6 +22,7 @@ inline const char* ncp_protocol_name(NcpProtocol p) {
         case PROTO_THREAD: return "th";
         case PROTO_WIFI:   return "wifi";
         case PROTO_ZWAVE:  return "zw";
+        case PROTO_LOCAL:  return "local";
         default:           return "?";
     }
 }

@@ -85,6 +85,7 @@ DevCmdResult device_cmd_remove(uint64_t ieee, bool hard) {
     bool found = false;
     zigbee_pool_lock();
     if (ZapDevice* d = pool_find_by_ieee(ieee)) {
+        if (d->protocol == PROTO_LOCAL) { zigbee_pool_unlock(); return DEVCMD_LOCAL; }
         if (!hard) zap_dev_mark_removed(d);
         snap  = *d;
         found = true;

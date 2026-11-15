@@ -16,6 +16,10 @@ static const uint64_t IEEE = 0x00158D0007A1B2C3ULL;
 
 static void arm() { stub_reset(); stub_pool_set(IEEE, 0x3F1A, 2, "TS0601", "_TZE200_abc"); }
 
+static uint64_t    g_local_ieee = 0;
+static char        g_local_key[32];
+static DevCmdValue g_local_v{};
+
 static int      g_removed_calls = 0;
 static uint64_t g_removed_ieee  = 0;
 
@@ -309,6 +313,23 @@ int main() {
     stub_reset(); stub_pool_clear(); g_removed_calls = 0;
     CHECK(device_cmd_remove(IEEE, true) == DEVCMD_OK && g_removed_calls == 1, "hard remove of an unknown device still clears the core's leftovers");
     device_cmd_set_removed_hook(nullptr);
+
+    // ── local device (Hub I/O, PROTO_LOCAL): the local handler, never the adapter ──
+    device_cmd_set_local_handler([](uint64_t ieee, const char* key, const DevCmdValue* lv) {
+        g_local_ieee = ieee; std::snprintf(g_local_key, sizeof g_local_key, "%s", key); g_local_v = *lv; return DEVCMD_OK; });
+    arm(); stub_pool_set_protocol(PROTO_LOCAL); g_local_ieee = 0; v = device_cmd_bool(true);
+    CHECK(device_cmd_set_attr(IEEE, 0, "relay", &v) == DEVCMD_OK && g_local_ieee == IEEE &&
+          std::strcmp(g_local_key, "relay") == 0 && g_local_v.kind == DEVCMD_BOOL && g_local_v.b,
+          "local device: set_attr reaches the local handler with key and value");
+    CHECK(g_send.calls == 0 && g_shadow.writes == 0, "local device: nothing sent, no optimistic mirror (the handler publishes)");
+    device_cmd_set_local_handler(nullptr);
+    arm(); stub_pool_set_protocol(PROTO_LOCAL);
+    CHECK(device_cmd_set_attr(IEEE, 0, "relay", &v) == DEVCMD_NO_CONVERTER && g_send.calls == 0,
+          "local device without a handler: no converter, nothing sent");
+    arm(); stub_pool_set_protocol(PROTO_LOCAL);
+    CHECK(device_cmd_remove(IEEE, false) == DEVCMD_LOCAL && device_cmd_remove(IEEE, true) == DEVCMD_LOCAL &&
+          stub_pool_has_device() && !stub_pool_removed_flag() && g_store.deletes == 0 && g_store.leave_reqs == 0,
+          "local device: soft and hard remove refused, nothing touched");
 
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("device_cmd contract: all checks passed\n");

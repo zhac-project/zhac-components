@@ -30,6 +30,7 @@ extern int g_state_calls;
 extern int32_t g_ct_sent; extern double g_ct_asked;
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu);
 void stub_pool_clear();
+void stub_pool_set_protocol(uint8_t proto);   // the pool device's NcpProtocol
 void stub_reset();
 bool stub_pool_removed_flag();   // the REMOVED tombstone on the pool device
 bool stub_pool_has_device();

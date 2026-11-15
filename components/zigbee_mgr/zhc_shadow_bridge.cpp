@@ -171,7 +171,7 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
     const bool more = index < pool_count();
     if (more) {
         const ZapDevice& d = pool_all()[index];
-        if (!zap_dev_is_removed(&d) && d.model_id[0]) {
+        if (!zap_dev_is_removed(&d) && d.model_id[0] && d.protocol == PROTO_ZIGBEE) {   // Hub I/O: nothing to ping
             out->ieee         = d.ieee_addr;
             out->nwk          = d.nwk_addr;
             out->power_source = d.power_source;
