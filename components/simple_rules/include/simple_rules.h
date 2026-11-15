@@ -61,8 +61,9 @@ enum class ActionType : uint8_t {
 
 // Hub pins (gpio.set / gpio.toggle / pwm.set). The firmware owns them; these
 // hooks keep simple_rules free of any GPIO code. `pin` is the token as written
-// (a configured name or a GPIO number). `check` runs whenever a rule is parsed
-// (save, rule.check, reload): false refuses the rule with `err` as the reason.
+// (a configured name or a GPIO number). `check` runs when a rule is saved or
+// checked: false refuses the rule with `err` as the reason. A reload skips it, so a
+// pin renamed or removed later fails at fire time instead of unloading the rule.
 // `run` runs at fire time with the resolved value ("on", "1", "42.5"; "" for
 // TOGGLE): false is an action error. Either may be null.
 enum class SimpleRulesIoOp : uint8_t { SET, TOGGLE, PWM };

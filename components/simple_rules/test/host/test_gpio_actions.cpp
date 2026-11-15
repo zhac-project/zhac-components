@@ -32,8 +32,10 @@ static bool on_run(SimpleRulesIoOp op, const char* pin, const char* value) {
 }
 static void run_reset() { std::memset(&g_run, 0, sizeof(g_run)); g_run.result = true; }
 
-// The firmware's check: outputs "relay" (also GPIO 21), pwm "fan".
+// The firmware's check: outputs "relay" (also GPIO 21), pwm "fan". g_refuse_all = the owner removed every pin.
+static bool g_refuse_all = false;
 static bool on_check(SimpleRulesIoOp op, const char* pin, char* err, size_t cap) {
+    if (g_refuse_all) { std::snprintf(err, cap, "unknown pin '%s' (outputs: none configured)", pin); return false; }
     const bool ok = op == SimpleRulesIoOp::PWM ? std::strcmp(pin, "fan") == 0
                                                : (std::strcmp(pin, "relay") == 0 || std::strcmp(pin, "21") == 0);
     if (!ok) std::snprintf(err, cap, "unknown pin '%s' (%s: %s)", pin,
@@ -140,6 +142,17 @@ int main() {
     const uint16_t r5 = add("ON io#e DO gpio.set 21 off ENDON");
     publish_attr("e", 1); drain();
     CHECK(g_run.calls == 1 && last_skip_is(r5, "action_error:gpio.set"), "a refused write is an action error in the rule status");
+
+    // ── a pin renamed or removed after the rule was saved: the rule stays, fails at fire time (spec §3) ──
+    run_reset();
+    const uint16_t r7 = add("ON io#g DO gpio.set relay on ENDON");
+    g_refuse_all = true;
+    simple_rules_reload();   // what the firmware does after every pin-config save
+    run_reset(); g_run.result = false;
+    publish_attr("g", 1); drain();
+    CHECK(r7 && g_run.calls == 1 && last_skip_is(r7, "action_error:gpio.set"),
+          "a reload keeps a rule whose pin is gone; it fails at fire time as an action error");
+    g_refuse_all = false;
 
     simple_rules_set_io_hooks(nullptr, nullptr);
     run_reset();

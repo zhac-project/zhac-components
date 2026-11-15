@@ -69,10 +69,12 @@ static rules_error_cb_t s_error_cb = nullptr;
 // the engine.
 static simple_rules_script_hook_t s_script_hook = nullptr;
 
-static simple_rules_io_run_t s_io_run = nullptr;
+static simple_rules_io_check_t s_io_check = nullptr;
+static simple_rules_io_run_t   s_io_run   = nullptr;
 void simple_rules_set_io_hooks(simple_rules_io_check_t check, simple_rules_io_run_t run) {
     dsl_set_io_check(check);
-    s_io_run = run;
+    s_io_check = check;
+    s_io_run   = run;
 }
 
 void simple_rules_set_script_hook(simple_rules_script_hook_t hook) {
@@ -150,6 +152,10 @@ static void reload_locked() {
     if (!slots || !fresh) { free(slots); free(fresh); ESP_LOGE(TAG, "reload: malloc failed"); return; }
     uint16_t cnt = rule_store_load_all(slots, MAX_CACHED_RULES);
     uint16_t n = 0;
+    // Stored rules load whatever the pin config says now: a pin renamed or removed after
+    // the rule was saved fails at fire time (an action error in the rule status), rather
+    // than the whole rule, with its other actions, vanishing at this reload (spec §3).
+    dsl_set_io_check(nullptr);
     for (uint16_t i = 0; i < cnt && n < MAX_CACHED_RULES; i++) {
         if (slots[i].rule_type != (uint8_t)RuleType::SIMPLE) continue;
         // Parse straight into the PSRAM pool slot. ParsedRule is ~0.9 KB — each
@@ -174,6 +180,7 @@ static void reload_locked() {
         snprintf(r->name, sizeof(r->name), "%.*s", (int)sizeof(r->name) - 1, slots[i].name);
         n++;
     }
+    dsl_set_io_check(s_io_check);
     simple_rules_resolve_names(fresh, n);
     for (uint16_t i = 0; i < n; i++) {
         const ParsedRule* old = nullptr;
