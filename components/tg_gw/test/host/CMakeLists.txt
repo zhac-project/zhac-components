@@ -44,6 +44,15 @@ add_executable(tg_gw_matrix_host_test
 target_include_directories(tg_gw_matrix_host_test PRIVATE ../../include)
 target_compile_options(tg_gw_matrix_host_test PRIVATE -Wall -Wextra -Werror)
 
+add_executable(tg_gw_body_host_test
+    test_tg_gw_body.cpp
+    ../../tg_gw_body.cpp
+)
+
+target_include_directories(tg_gw_body_host_test PRIVATE ../.. ../../include)
+target_compile_options(tg_gw_body_host_test PRIVATE -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME tg_gw_helpers_host COMMAND tg_gw_helpers_host_test)
 add_test(NAME tg_gw_matrix_host COMMAND tg_gw_matrix_host_test)
+add_test(NAME tg_gw_body_host COMMAND tg_gw_body_host_test)
