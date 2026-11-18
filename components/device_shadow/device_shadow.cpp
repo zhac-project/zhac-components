@@ -476,6 +476,7 @@ static void publish_staged(EventType type = EventType::ZCL_ATTR) {
         payload->val_type = a.val_type;
         payload->cluster  = a.cluster;
         payload->attr_id  = a.attr_id;
+        payload->more     = i + 1 < s_staged.count;   // the report's last attr: 0
         // memcpy + explicit NUL avoids the -Wstringop-truncation noise
         // -O2 emits when strncpy's dest size equals the source's worst-
         // case length (the next-line NUL keeps it correct, but gcc's

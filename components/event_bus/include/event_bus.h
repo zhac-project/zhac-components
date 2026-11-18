@@ -57,7 +57,9 @@ struct __attribute__((packed)) ZclAttrEvent {
         int32_t int_val;                 // INT/BOOL
         char    str_val[ATTR_STR_MAX];   // STR
     };
-    uint8_t  _pad[4];            // 92-95 (keeps the 96-byte event-bus contract)
+    uint8_t  more;               // 92   1: more attrs of the same report follow (device_shadow);
+                                 //      0: the last or only one -- a per-report consumer acts on it
+    uint8_t  _pad[3];            // 93-95 (keeps the 96-byte event-bus contract)
 };
 static_assert(sizeof(ZclAttrEvent) == 96);
 

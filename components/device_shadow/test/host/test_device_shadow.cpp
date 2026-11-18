@@ -294,6 +294,35 @@ int main() {
         event_bus_unsubscribe(zcl);
     }
 
+    // ── G2d: one report, several attrs -> one ZCL_ATTR event each, the last
+    //    marked (more == 0), so a per-report consumer (the MQTT full state,
+    //    research 2026-11-18 A12) publishes once per report, not per attr.
+    {
+        printf("\nG2d report batch: more=1 on all but the last event\n");
+        const uint64_t A = 0x2D2DULL;   // its own device: later groups count G1's attrs
+        make_known(A);
+        uint8_t more[4] = {9, 9, 9, 9};
+        int seen = 0;
+        auto noop = [](const Event&){};
+        EventSubHandle zcl = event_bus_subscribe(EventType::ZCL_ATTR, noop,
+            [&](const Event& e){
+                if (seen < 4) more[seen] = reinterpret_cast<const ZclAttrEvent*>(e.data)->more;
+                seen++;
+                return false;
+            });
+        ZclAttribute r[3]{};
+        zcl_attr_set_int(&r[0], "temperature", 2150, VAL_FLOAT);
+        zcl_attr_set_int(&r[1], "humidity", 4800, VAL_FLOAT);
+        zcl_attr_set_int(&r[2], "battery", 90);
+        device_shadow_process_ieee(A, r, 3);
+        CHECK(seen == 3, "three attrs, three events");
+        CHECK(more[0] == 1 && more[1] == 1 && more[2] == 0, "more = 1, 1, 0");
+        seen = 0;
+        device_shadow_process_ieee(A, r + 2, 1);
+        CHECK(seen == 1 && more[0] == 0, "a one-attr report: more = 0");
+        event_bus_unsubscribe(zcl);
+    }
+
     // ── G2c: the string twin of G2b — a string optimistic write (a colour pick:
     //    color_hex / color_mode, which many lights never report back) stores
     //    VAL_STR and emits SHADOW_OPTIMISTIC only. Same probes as G2b. (Named
