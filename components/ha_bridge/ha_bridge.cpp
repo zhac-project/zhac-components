@@ -160,9 +160,14 @@ void retract_device(uint64_t ieee) {
 }
 
 // Collects a device's config topics while ha::build_device emits them.
+// 8 KB (PSRAM, per publish): device triggers add one topic per press value
+// (research 2026-11-18 A11) -- a 6-button remote alone has ~30 of ~80 B,
+// past the 2 KB this was. A topic that does not fit stays in HA after the
+// device is removed, so that is logged.
 struct Collect {
-    char   buf[2048];
-    size_t len = 0;
+    char   buf[8192];
+    size_t len  = 0;
+    bool   full = false;
 };
 
 void emit_config(const char*, const char* topic, const char* payload, void* user) {
@@ -174,6 +179,8 @@ void emit_config(const char*, const char* topic, const char* payload, void* user
         c->len += n;
         c->buf[c->len++] = '\n';
         c->buf[c->len] = '\0';
+    } else {
+        c->full = true;
     }
 }
 
@@ -199,6 +206,8 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
     const int n = ha::build_device({d.ieee, d.name, d.vendor, d.model, d.exposes, d.battery_powered},
                                    ctx, emit_config, col, &passive);
     if (n < 0) ESP_LOGW(TAG, "0x%016llx: exposes are not a JSON array", (unsigned long long)d.ieee);
+    if (col->full) ESP_LOGW(TAG, "0x%016llx: more discovery topics than fit in 8 KB -- the rest stay in Home Assistant "
+                                 "after the device is removed", (unsigned long long)d.ieee);
     if (Published* s = slot_for(d.ieee, true)) {
         free(s->topics);
         s->topics  = col->len ? dup_str(col->buf) : nullptr;

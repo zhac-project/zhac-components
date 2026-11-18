@@ -23,8 +23,10 @@ static void collect(const char* component, const char* topic, const char* payloa
     e.component = component;
     e.topic = topic;
     if (deserializeJson(e.cfg, payload)) { std::printf("FAIL: invalid JSON for %s\n", topic); g_fail++; return; }
-    const std::string uid = e.cfg["unique_id"].as<const char*>();
-    g_out[uid] = std::move(e);
+    // Entities by unique_id; configs without one (device triggers) by their topic.
+    const char* uid = e.cfg["unique_id"];
+    const std::string id = uid ? uid : e.topic;
+    g_out[id] = std::move(e);
 }
 
 static const ha::Context kCtx{"homeassistant", "zhac", "zhac"};
@@ -460,6 +462,49 @@ static void test_retain() {
     CHECK(!ha::names_secret(nullptr));
 }
 
+// A remote's presses as Home Assistant device triggers (research 2026-11-18 A11): beside the event
+// entity, one retained device_automation config per value, so the remote shows in HA's trigger
+// picker and zigbee2mqtt remote blueprints work. Triggers are not entities: not counted.
+static int count_component(const char* component) {
+    int n = 0;
+    for (const auto& kv : g_out) n += kv.second.component == component;
+    return n;
+}
+static std::string json(JsonVariantConst v) { std::string s; serializeJson(v, s); return s; }
+
+static void test_device_triggers() {
+    const char* remote = R"([
+        {"name":"action","type":"enum","access":1,"values":["single","double","hold","1_long press"]},
+        {"name":"battery","type":"numeric","access":1,"unit":"%"}
+    ])";
+    CHECK(build("hall_remote", "IKEA", "E1743", remote, 0x00158D0007A1B2C3ULL, true) == 2);
+    const Entity* ev = get("zhac_00158d0007a1b2c3_action");
+    CHECK(ev && ev->component == "event");
+    const Entity* t = get("homeassistant/device_automation/zhac_00158d0007a1b2c3_action_single/config");
+    CHECK(t && t->component == "device_automation");
+    CHECK(t && std::string(t->cfg["automation_type"]) == "trigger");
+    CHECK(t && std::string(t->cfg["type"]) == "action");
+    CHECK(t && std::string(t->cfg["subtype"]) == "single");
+    CHECK(t && std::string(t->cfg["payload"]) == "single");
+    CHECK(t && std::string(t->cfg["topic"]) == "zhac/devices/00158D0007A1B2C3/action");
+    CHECK(t && ev && json(t->cfg["device"]) == json(ev->cfg["device"]));   // the same HA device
+    CHECK(t && t->cfg["unique_id"].isNull());
+    CHECK(get("homeassistant/device_automation/zhac_00158d0007a1b2c3_action_double/config"));
+    CHECK(get("homeassistant/device_automation/zhac_00158d0007a1b2c3_action_hold/config"));
+    // A value a topic level cannot carry is cleaned in the topic only.
+    const Entity* odd = get("homeassistant/device_automation/zhac_00158d0007a1b2c3_action_1_long_press/config");
+    CHECK(odd && std::string(odd->cfg["payload"]) == "1_long press");
+    CHECK(odd && std::string(odd->cfg["subtype"]) == "1_long press");
+    CHECK(count_component("device_automation") == 4);
+
+    // None for a settable enum (a select), another read-only enum (a sensor), or an action with no values.
+    build("x", "", "", R"([{"name":"mode","type":"enum","access":3,"values":["a","b"]},
+                           {"name":"status","type":"enum","access":1,"values":["a","b"]}])");
+    CHECK(count_component("device_automation") == 0);
+    build("y", "", "", R"([{"name":"action","type":"enum","access":1}])");
+    CHECK(count_component("device_automation") == 0);
+}
+
 int main() {
     test_sensors_and_binary();
     test_climate();
@@ -470,6 +515,7 @@ int main() {
     test_bridge_metrics();
     test_topics_and_payloads();
     test_retain();
+    test_device_triggers();
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("ha_discovery: all checks passed\n");
     return 0;

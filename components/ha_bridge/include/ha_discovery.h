@@ -10,7 +10,8 @@
 // host tests.
 //
 // Topics (root defaults to "zhac", prefix to "homeassistant"):
-//   <prefix>/<component>/zhac_<ieee>_<key>/config   discovery, retained
+//   <prefix>/<component>/zhac_<ieee>_<key>/config   discovery, retained (device triggers:
+//                                                    component device_automation, key action_<value>)
 //   <root>/devices/<IEEE>/<key>                      state, retained, raw value
 //   <root>/devices/<IEEE>/<key>/set                  commands (Home Assistant or anyone;
 //                                                    taken with discovery off too)
@@ -44,8 +45,9 @@ struct Context {
 using EmitFn = void (*)(const char* component, const char* topic,
                         const char* payload, void* user);
 
-// Emit every discovery config for one device. Returns the entity count, or -1
-// when `exposes` is not a JSON array. `passive_out`, when given, says whether
+// Emit every discovery config for one device. Returns the entity count (device
+// triggers are configs, not entities: not counted), or -1 when `exposes` is
+// not a JSON array. `passive_out`, when given, says whether
 // the device got the per-device availability topic (battery devices do).
 //
 // Compositions, in this order, each consuming the exposes it uses:
@@ -57,7 +59,8 @@ using EmitFn = void (*)(const char* component, const char* topic,
 //   writable lock_state on/off, or state LOCK/UNLOCK    -> lock
 //     + a worded lock_state
 //   fan_state, or a fan_mode with "off"                 -> fan (+ preset modes)
-//   read-only enum "action" with a value list           -> event
+//   read-only enum "action" with a value list           -> event, and one device trigger
+//                                                          (device_automation) per value
 // Everything else becomes the single entity its type implies.
 int build_device(const Device& d, const Context& c, EmitFn emit, void* user,
                  bool* passive_out = nullptr);

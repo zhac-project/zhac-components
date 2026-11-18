@@ -163,6 +163,12 @@ struct Writer {
         } else {
             doc["availability_topic"] = buf;
         }
+        device(doc);
+    }
+
+    // The HA device an entity or a device trigger belongs to, and who made the config.
+    void device(JsonDocument& doc) const {
+        char buf[64];
         JsonObject dev = doc["device"].to<JsonObject>();
         snprintf(buf, sizeof(buf), "zhac_%016" PRIx64, d.ieee);
         dev["identifiers"].to<JsonArray>().add(buf);
@@ -176,14 +182,42 @@ struct Writer {
         org["support_url"] = kSupportUrl;
     }
 
-    void finish(JsonDocument& doc, const char* component, const char* key) {
+    void finish(JsonDocument& doc, const char* component, const char* key, bool entity = true) {
         char topic[160];
         if (config_topic(topic, sizeof(topic), c.prefix, component, d.ieee, key) < 0) return;
         char payload[kPayloadCap];
         const size_t n = serializeJson(doc, payload, sizeof(payload));
         if (n == 0 || n >= sizeof(payload)) return;   // would be truncated JSON
         emit(component, topic, payload, user);
-        count++;
+        if (entity) count++;
+    }
+
+    // One device trigger per press value (research 2026-11-18 A11): what HA's
+    // trigger picker lists and z2m remote blueprints match, as z2m's
+    // `device_automation/<ieee>/action_<value>`. It fires on the raw value the
+    // action state topic carries. The value is cleaned for the topic only.
+    void triggers(const Expose& e) {
+        char topic[96];
+        topic_of(topic, sizeof(topic), e.name, false);
+        for (JsonVariantConst v : e.values) {
+            const char* value = v.as<const char*>();
+            if (!value || !value[0]) continue;
+            char key[64];
+            snprintf(key, sizeof(key), "action_%s", value);
+            for (char* k = key; *k; k++) {
+                const bool ok = (*k >= 'a' && *k <= 'z') || (*k >= 'A' && *k <= 'Z') ||
+                                (*k >= '0' && *k <= '9') || *k == '_' || *k == '-';
+                if (!ok) *k = '_';
+            }
+            JsonDocument doc;
+            doc["automation_type"] = "trigger";
+            doc["type"]            = "action";
+            doc["subtype"]         = value;
+            doc["payload"]         = value;
+            doc["topic"]           = topic;
+            device(doc);
+            finish(doc, "device_automation", key, false);
+        }
     }
 
     void category(JsonDocument& doc, const Expose& e) const {
@@ -433,7 +467,8 @@ struct Writer {
             if (strcmp(e.name, "action") == 0 && e.has_values()) {
                 options(doc["event_types"].to<JsonArray>(), e);
                 doc["value_template"] = "{\"event_type\":\"{{ value }}\"}";
-                return finish(doc, "event", e.name);
+                finish(doc, "event", e.name);
+                return triggers(e);
             }
             return finish(doc, "sensor", e.name);
         }
