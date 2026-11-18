@@ -9,7 +9,12 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **Per-subscriber event queue depth** (`event_bus`, research 2026-11-18 A8): `event_bus_subscribe(type, handler, filter, depth)`, default 16 as before, 0 refused. `simple_rules` uses 1 for the boot event and pool changes, 8 for rule timers.
 - **Hub pins for rules and the device model** (GPIO control, wired hub). `simple_rules` has the actions `gpio.set <pin> <value>`, `gpio.toggle <pin>` and `pwm.set <pin> <duty>`; the firmware checks the pin when a rule is saved and drives it when it fires through `simple_rules_set_io_hooks()`, so the component stays host-testable (host test `simple_rules_gpio_actions_test`). The three count as feed-back actions for the run cap. `zap_common` gains `PROTO_LOCAL` for a device on the hub itself; `device_cmd_set_attr` hands such a device to a handler set with `device_cmd_set_local_handler()`, `device_cmd_remove` refuses it with `DEVCMD_LOCAL`, and the availability/meter poll skips it. `zhac_adapter_set_local_exposes_fn()` supplies its exposes.
+
+### Changed
+
+- **One log line per decoded frame** (`zhc_adapter`, research 2026-11-18 A13): "matched, 3 keys: temperature=21.5 humidity=40 battery=90", cut at 192 bytes. It was a line per key on the blocking 115200-baud console from TaskZigbee.
 
 ### Fixed
 
