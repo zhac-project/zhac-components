@@ -58,6 +58,6 @@ void ha_bridge_device_removed(uint64_t ieee);
 void ha_bridge_publish_state(uint64_t ieee, const char* key, const char* value_json);
 
 // Offer an inbound MQTT message from the mqtt_gw rx callback (esp-mqtt's
-// task). Returns true if it was a command for this hub; it is then queued,
-// never handled inline.
+// task). Returns true if it was a command for this hub (a `/set` topic,
+// taken with discovery on or off); it is then queued, never handled inline.
 bool ha_bridge_on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len);

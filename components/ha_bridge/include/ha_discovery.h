@@ -12,7 +12,8 @@
 // Topics (root defaults to "zhac", prefix to "homeassistant"):
 //   <prefix>/<component>/zhac_<ieee>_<key>/config   discovery, retained
 //   <root>/devices/<IEEE>/<key>                      state, retained, raw value
-//   <root>/devices/<IEEE>/<key>/set                  commands from Home Assistant
+//   <root>/devices/<IEEE>/<key>/set                  commands (Home Assistant or anyone;
+//                                                    taken with discovery off too)
 //   <root>/availability                              "online" / "offline" (LWT)
 //   <root>/devices/<IEEE>/availability               battery devices only: "offline"
 //                                                    after a day of silence (ha_bridge)

@@ -24,3 +24,26 @@ target_compile_options(ha_discovery_host_test PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
 add_test(NAME ha_discovery COMMAND ha_discovery_host_test)
+
+# ha_bridge_on_mqtt_rx(), cut out of ha_bridge.cpp (IDF-bound as a whole) at build time, so the test
+# always runs the current code: an empty or stale slice fails to compile or to pass.
+set(HA_BRIDGE_CPP ${COMPONENTS_DIR}/ha_bridge/ha_bridge.cpp)
+set(RX_SLICE ${CMAKE_CURRENT_BINARY_DIR}/on_mqtt_rx.inc)
+add_custom_command(
+    OUTPUT ${RX_SLICE}
+    COMMAND sh -c "sed -n '/^bool ha_bridge_on_mqtt_rx/,/^}/p' \"$0\" > \"$1\"" ${HA_BRIDGE_CPP} ${RX_SLICE}
+    DEPENDS ${HA_BRIDGE_CPP}
+    VERBATIM)
+add_executable(ha_command_rx_host_test
+    test_command_rx.cpp
+    ${RX_SLICE}
+    ${COMPONENTS_DIR}/ha_bridge/ha_discovery.cpp
+)
+target_include_directories(ha_command_rx_host_test PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${COMPONENTS_DIR}/ha_bridge/include
+    ${COMPONENTS_DIR}/arduinojson/src
+    ${COMPONENTS_DIR}/zap_common/include
+)
+target_compile_options(ha_command_rx_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME ha_command_rx COMMAND ha_command_rx_host_test)

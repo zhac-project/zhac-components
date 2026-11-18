@@ -422,7 +422,9 @@ void ha_bridge_publish_state(uint64_t ieee, const char* key, const char* value_j
 }
 
 bool ha_bridge_on_mqtt_rx(const char* topic, int topic_len, const char* data, int data_len) {
-    if (!s_enabled || !topic || topic_len <= 0) return false;
+    // Discovery on or off: `/set` is how anyone drives a device over MQTT, not only Home
+    // Assistant (research 2026-11-18 A12). The bridge task runs either way.
+    if (!topic || topic_len <= 0) return false;
     uint64_t ieee = 0;
     char key[32];
     if (!ha::parse_command_topic(topic, static_cast<size_t>(topic_len), mqtt_gw_get_root_topic(),
