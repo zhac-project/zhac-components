@@ -219,6 +219,14 @@ void zhc_device_seen(uint64_t ieee) {
     event_bus_publish(ev);
 }
 
+// A pinged device went silent (zhac_adapter_register_offline).
+void zhc_device_offline(uint64_t ieee) {
+    Event ev{};
+    ev.type = EventType::DEVICE_OFFLINE;
+    memcpy(ev.data, &ieee, sizeof(ieee));
+    event_bus_publish(ev);
+}
+
 }  // namespace
 
 extern "C" void zhc_shadow_bridge_register(void) {
@@ -226,4 +234,5 @@ extern "C" void zhc_shadow_bridge_register(void) {
     zhac_adapter_register_state_text(&zhc_state_text);
     zhac_adapter_register_poll_source(&zhc_poll_device_at);
     zhac_adapter_register_seen(&zhc_device_seen);
+    zhac_adapter_register_offline(&zhc_device_offline);
 }

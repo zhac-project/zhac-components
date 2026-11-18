@@ -256,6 +256,38 @@ static void test_unanswered_ping_warns_once() {
     assert(s.pinged(kPlug, 0, kPing));             // a new silence warns again
 }
 
+// A pinged device that sends nothing within kOfflineMs is offline -- said
+// once per silence -- and anything heard from it brings it back, as z2m's
+// availability (research 2026-11-18 B7). Only devices that stay awake.
+static void test_unanswered_ping_marks_offline() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    std::uint64_t out[4];
+    assert(s.take_offline(1000, out, 4) == 0);                     // never pinged
+    s.pinged(kPlug, 1000, kPing);
+    assert(s.take_offline(1000 + kOfflineMs - 1, out, 4) == 0);    // still within the answer window
+    assert(!s.offline(kPlug));
+    assert(s.take_offline(1000 + kOfflineMs, out, 4) == 1 && out[0] == kPlug);
+    assert(s.offline(kPlug));
+    assert(s.take_offline(1000 + 10 * kOfflineMs, out, 4) == 0);   // once per silence
+    s.pinged(kPlug, 2000000, kPing);                                 // the next, backed-off ping
+    assert(s.take_offline(2000000 + kOfflineMs, out, 4) == 0);      // still the same silence
+    s.heard(kPlug, 2100000, kPing);
+    assert(!s.offline(kPlug));                                       // back
+
+    s.pinged(kPlug, 3000000, kPing);
+    s.heard(kPlug, 3000000 + 5000, kPing);                           // answered in time
+    assert(s.take_offline(3000000 + kOfflineMs, out, 4) == 0 && !s.offline(kPlug));
+    s.pinged(kPlug, 4000000, kPing);                                 // a new silence
+    assert(s.take_offline(4000000 + kOfflineMs, out, 4) == 1 && s.offline(kPlug));
+
+    assert(s.add(kPlug2, 0x2222, 0, 0, kMin));                       // sleeps: never pinged, never offline
+    s.pinged(kPlug2, 5000000, kPing);
+    assert(s.take_offline(5000000 + kOfflineMs, out, 4) == 0 && !s.offline(kPlug2));
+    s.forget(kPlug);
+    assert(!s.offline(kPlug));
+}
+
 // heard() says true for the frame that ends a silence of a ping interval or
 // more (in practice the answer to a ping), so the hub can tell the cloud the
 // device's last_seen moved although no state changed. Once per silence.
@@ -312,6 +344,7 @@ int main() {
     test_answer_resets_the_backoff();
     test_unanswered_ping_warns_once();
     test_heard_reports_the_end_of_a_silence();
+    test_unanswered_ping_marks_offline();
     test_pings_go_one_per_tick();
     test_ping_wraparound();
     std::puts("meter_poll: all passed");

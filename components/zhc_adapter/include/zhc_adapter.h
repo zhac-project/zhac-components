@@ -156,6 +156,13 @@ void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn);
 typedef void (*zhac_seen_fn_t)(uint64_t ieee);
 void zhac_adapter_register_seen(zhac_seen_fn_t fn);
 
+// Called (from the adapter's poll task) when a pinged device that stays awake
+// sent nothing for 30 s after the ping: offline, once per silence; the frame
+// that ends it calls the seen callback above (research 2026-11-18 B7).
+void zhac_adapter_register_offline(zhac_seen_fn_t fn);
+// That device is offline now.
+bool zhac_adapter_device_offline(uint64_t ieee);
+
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame
 // before invoking `zhac_adapter_try_decode`. Required so fz

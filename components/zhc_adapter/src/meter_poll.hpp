@@ -47,6 +47,8 @@ constexpr std::size_t   kMaxPerTick = 2;
 
 constexpr std::uint32_t kPingJitterMs = 30u * 1000u;              // z2m max_jitter
 constexpr std::uint32_t kPingMaxMs    = 24u * 60u * 60u * 1000u;  // longest backoff
+constexpr std::uint32_t kOfflineMs    = 30u * 1000u;  // no frame this long after a ping: offline
+                                                      // (herdsman's read timeout + its retry ~25 s)
 
 // ZCL Basic powerSource (bit 7 = backup battery): mains, 3-phase, DC,
 // emergency mains. 0x03 battery and 0x00 unknown are not.
@@ -116,6 +118,11 @@ public:
     // this one went unanswered, once per silence -- the caller logs it.
     bool pinged(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
 
+    // Devices pinged kOfflineMs ago or more that sent nothing since: now
+    // offline, each said once per silence; heard() brings one back.
+    std::size_t take_offline(std::uint32_t now_ms, std::uint64_t* out, std::size_t max);
+    bool offline(std::uint64_t ieee) const;
+
 private:
     struct Slot {
         std::uint64_t ieee;         // 0 = free
@@ -128,6 +135,9 @@ private:
         bool          awake;        // pinged when quiet
         bool          seen;
         bool          warned;       // already logged this failure streak
+        bool          waiting;      // pinged, nothing heard since
+        bool          offline;      // said so (take_offline); heard() clears it
+        std::uint32_t ping_sent_ms; // the last ping
     };
     Slot* find(std::uint64_t ieee);
     Slot slots_[kSlots] = {};

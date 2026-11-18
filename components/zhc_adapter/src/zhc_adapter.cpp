@@ -1760,6 +1760,7 @@ void meter_forget(uint64_t ieee) {
 }
 
 zhac_seen_fn_t g_seen_cb = nullptr;
+zhac_seen_fn_t g_offline_cb = nullptr;
 
 // On the RX path, so a short wait: a frame missed here only means one ping
 // that was not needed.
@@ -1858,6 +1859,20 @@ void meter_tick() {
         ESP_LOGD(TAG, "[meter] 0x%016llx polled", static_cast<unsigned long long>(due[i].ieee));
         MeterLock l;
         if (l.ok) g_meter.polled(due[i].ieee, now, kMeterIntervalMs);
+    }
+
+    // Pinged and silent for kOfflineMs: offline, said once per silence until
+    // a frame brings it back through ping_heard (research 2026-11-18 B7).
+    std::uint64_t gone[4];
+    std::size_t ng = 0;
+    {
+        MeterLock l;
+        if (l.ok) ng = g_meter.take_offline(now, gone, 4);
+    }
+    for (std::size_t i = 0; i < ng; ++i) {
+        ESP_LOGW(TAG, "[ping] 0x%016llx did not answer -- offline until it is heard",
+                 static_cast<unsigned long long>(gone[i]));
+        if (g_offline_cb) g_offline_cb(gone[i]);
     }
 
     // Availability: one ping per tick to a quiet device that stays awake, as
@@ -2077,6 +2092,16 @@ extern "C" void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn) {
 extern "C" void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn) {
     ensure_worker();
     g_poll_source = fn;
+}
+
+extern "C" void zhac_adapter_register_offline(zhac_seen_fn_t fn) {
+    g_offline_cb = fn;
+}
+
+extern "C" bool zhac_adapter_device_offline(uint64_t ieee) {
+    if (kPingIntervalMs == 0) return false;
+    MeterLock l;
+    return l.ok && g_meter.offline(ieee);
 }
 
 extern "C" void zhac_adapter_register_seen(zhac_seen_fn_t fn) {
