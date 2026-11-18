@@ -48,7 +48,7 @@ void on_zcl_raw(const Event& e) {
 extern "C" void lua_engine_event_bridge_start(void) {
     event_bus_subscribe(EventType::ATTR_CHANGE, on_attr_change);
     event_bus_subscribe(EventType::MQTT_MSG,    on_mqtt_msg);
-    event_bus_subscribe(EventType::CTRL_BOOT,   on_ctrl_boot);
+    event_bus_subscribe(EventType::CTRL_BOOT,   on_ctrl_boot, nullptr, 1);   // once per boot (research 2026-11-18 A8)
     event_bus_subscribe(EventType::ZCL_RAW,     on_zcl_raw);
     ESP_LOGI(TAG, "event bridge installed (attr / mqtt / boot / raw)");
 }
