@@ -27,6 +27,9 @@
 
 // The whole scheduler TU — brings in its statics (resume_and_settle, ...).
 #include "../../src/lua_scheduler.cpp"
+#include "mqtt_payload.h"
+
+#include <string>
 
 // ── host stand-ins for symbols defined in other firmware TUs ──────────
 // None are exercised by the yield paths under test; they only need to link.
@@ -143,6 +146,29 @@ int main() {
         lua_tolstring(g_L, -1, &n); assert(n == sizeof(ZclRawEvent::payload_hex)); // FAILS pre-fix (87)
         lua_pop(g_L, 2);
         std::printf("  ok: MQTT topic/payload and raw hex are bounded by their fields\n");
+    }
+
+    // F2 (research 2026-11-18 A12): a payload too long for the event's field reaches Lua whole, from
+    // mqtt_payload, while it is one of the last 16 long ones; a short one as before.
+    {
+        EventArgs e{};
+        e.kind = LUA_EVT_MQTT;
+        auto& m = *reinterpret_cast<MqttMsgEvent*>(e.payload);
+        std::strcpy(m.topic, "zhac/x");
+        const std::string json = R"({"temperature":21.5,"humidity":48.2,"battery":90})";
+        mqtt_msg_set_payload(m, json.data(), json.size());
+        size_t n = 0;
+        assert(push_event_args(g_L, &e) == 2);
+        const char* got = lua_tolstring(g_L, -1, &n);
+        assert(n == json.size() && std::memcmp(got, json.data(), n) == 0);   // FAILS pre-fix (27)
+        lua_tolstring(g_L, -2, &n); assert(n == 6);
+        lua_pop(g_L, 2);
+        mqtt_msg_set_payload(m, "on", 2);
+        assert(push_event_args(g_L, &e) == 2);
+        got = lua_tolstring(g_L, -1, &n);
+        assert(n == 2 && std::memcmp(got, "on", 2) == 0);
+        lua_pop(g_L, 2);
+        std::printf("  ok: a long MQTT payload reaches Lua whole\n");
     }
 
     lua_close(g_L);

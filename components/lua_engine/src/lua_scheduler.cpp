@@ -55,6 +55,7 @@ extern "C" {
 #include "zcl_attribute.h"
 #include "cron_parser.h"
 #include "event_bus.h"
+#include "mqtt_payload.h"
 
 static const char* TAG = "lua_sched";
 
@@ -725,10 +726,15 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
         case LUA_EVT_MQTT: {
             // MqttMsgEvent: topic[64], payload[32]. Bounded by the field, as the ATTR path above: a
             // producer that fills a field to its end must not make the push read on (review LU-05).
-            const char* topic   = (const char*)(e->payload + offsetof(MqttMsgEvent, topic));
-            const char* payload = (const char*)(e->payload + offsetof(MqttMsgEvent, payload));
-            lua_pushlstring(co, topic,   strnlen(topic,   sizeof(MqttMsgEvent::topic)));
-            lua_pushlstring(co, payload, strnlen(payload, sizeof(MqttMsgEvent::payload)));
+            // A payload too long for its field comes whole from mqtt_payload while it is one of the
+            // last 16 long ones (research 2026-11-18 A12), else as the field's first 27 characters.
+            const auto& m = *reinterpret_cast<const MqttMsgEvent*>(e->payload);
+            lua_pushlstring(co, m.topic, strnlen(m.topic, sizeof(m.topic)));
+            luaL_Buffer b;
+            char* text = luaL_buffinitsize(co, &b, kMqttPayloadMax);
+            size_t n = mqtt_msg_full_payload(m, text, kMqttPayloadMax);
+            if (!n) memcpy(text, m.payload, n = strnlen(m.payload, sizeof(m.payload)));
+            luaL_pushresultsize(&b, n);
             return 2;
         }
         case LUA_EVT_RAW: {

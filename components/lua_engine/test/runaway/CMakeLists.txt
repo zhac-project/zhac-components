@@ -41,7 +41,8 @@ add_test(NAME lua_runaway COMMAND lua_runaway_tests)
 # drives the real kill-aware pcall. Compiled -Wall -Wextra but NOT -Werror — it
 # is a firmware TU built for a cross target, and host g++ flags a few benign
 # things the IDF toolchain does not.
-add_executable(lua_coro_leak_tests test_coro_leak.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/lua_sandbox.c)
+add_executable(lua_coro_leak_tests test_coro_leak.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/lua_sandbox.c
+    ${ZC}/event_bus/mqtt_payload.cpp)
 target_include_directories(lua_coro_leak_tests PRIVATE stubs ../../src ../../include
     ${ZC}/zap_common/include ${ZC}/event_bus/include ${ZC}/cron_parser/include)
 target_compile_options(lua_coro_leak_tests PRIVATE -Wall -Wextra)
