@@ -41,3 +41,17 @@ target_compile_options(event_bus_host_test PRIVATE -Wall -Wextra -Werror)
 
 enable_testing()
 add_test(NAME event_bus_host COMMAND event_bus_host_test)
+
+# mqtt_payload.cpp: long MQTT payloads kept whole for Lua (research 2026-11-18 A12).
+add_executable(mqtt_payload_host_test
+    test_mqtt_payload.cpp
+    ${COMPONENTS_DIR}/event_bus/mqtt_payload.cpp
+)
+target_include_directories(mqtt_payload_host_test PRIVATE
+    ${SHARED_STUBS_DIR}
+    ${COMPONENTS_DIR}/event_bus/include
+    ${COMPONENTS_DIR}/zap_common/include
+)
+target_compile_options(mqtt_payload_host_test PRIVATE -Wall -Wextra -Werror -fsanitize=address,undefined)
+target_link_options(mqtt_payload_host_test PRIVATE -fsanitize=address,undefined)
+add_test(NAME mqtt_payload_host COMMAND mqtt_payload_host_test)
