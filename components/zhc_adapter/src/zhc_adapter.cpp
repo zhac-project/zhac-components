@@ -828,15 +828,21 @@ void log_payload(std::uint64_t ieee,
                  prefix, cluster_id, msg ? msg->command_id : 0, zcl_len);
         return;
     }
-    ESP_LOGI(TAG, "%s  matched, %u keys:",
-             prefix, static_cast<unsigned>(result.merged.count));
-    for (std::uint8_t i = 0; i < result.merged.count; ++i) {
+    // One line per frame with the keys inline, like z2m's publish log (research 2026-11-18 A13): the console is a
+    // blocking 115200-baud UART written from TaskZigbee, and a line per key cost ~30 bytes of header each.
+    char line[192];
+    line[0] = '\0';
+    std::size_t at = 0;
+    for (std::uint8_t i = 0; i < result.merged.count && at < sizeof(line); ++i) {
         const auto& kv = result.merged.items[i];
         char buf[48];
         if (zcl_attr_key_is_secret(kv.key)) std::snprintf(buf, sizeof(buf), "<hidden>");   // a keypad PIN (ZR-06)
         else format_value(buf, sizeof(buf), kv.value);
-        ESP_LOGI(TAG, "  %s = %s", kv.key ? kv.key : "?", buf);
+        const int w = std::snprintf(line + at, sizeof(line) - at, "%s%s=%s", i ? " " : "", kv.key ? kv.key : "?", buf);
+        at = w < 0 ? sizeof(line) : at + static_cast<std::size_t>(w);
     }
+    ESP_LOGI(TAG, "%s  matched, %u keys: %s%s", prefix, static_cast<unsigned>(result.merged.count), line,
+             at >= sizeof(line) ? "…" : "");
 }
 
 zhac_shadow_update_fn_t g_shadow_update = nullptr;
