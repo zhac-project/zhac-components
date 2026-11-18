@@ -13,7 +13,6 @@ static const char* TAG = "event_bus";
 
 static constexpr uint8_t MAX_SUBS_PER_TYPE = 8;
 static constexpr uint8_t EVENT_TYPE_COUNT  = static_cast<uint8_t>(EventType::_COUNT);
-static constexpr uint8_t QUEUE_DEPTH       = 16;
 
 // ── Subscription slots ────────────────────────────────────────────────────
 //
@@ -142,10 +141,10 @@ void event_bus_init() {
 }
 
 EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
-                                   EventFilter filter) {
+                                   EventFilter filter, uint8_t depth) {
     uint8_t idx = static_cast<uint8_t>(type);
-    if (idx == 0 || idx >= EVENT_TYPE_COUNT) {
-        ESP_LOGE(TAG, "invalid event type %d", idx);
+    if (idx == 0 || idx >= EVENT_TYPE_COUNT || depth == 0) {
+        ESP_LOGE(TAG, "invalid event type %d or queue depth %u", idx, depth);
         return EVENT_SUB_INVALID;
     }
     if (!s_inited) {
@@ -174,7 +173,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
         return EVENT_SUB_INVALID;
     }
 
-    QueueHandle_t q = zhac_queue_create(QUEUE_DEPTH, sizeof(Event));
+    QueueHandle_t q = zhac_queue_create(depth, sizeof(Event));
     if (!q) {
         // Pre-fix this was configASSERT-only: with asserts compiled out the
         // null queue was stored and the handler later ran synchronously

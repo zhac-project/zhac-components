@@ -1012,14 +1012,16 @@ void simple_rules_init() {
     configASSERT(s_rules);
     s_mutex = xSemaphoreCreateRecursiveMutex();
 
+    // Queue depths (research 2026-11-18 A8): boot comes once; a slot per timer, as all may fire before the pump runs.
     event_bus_subscribe(EventType::ZCL_ATTR,       dispatch_event);
-    event_bus_subscribe(EventType::CTRL_BOOT,       dispatch_event);
+    event_bus_subscribe(EventType::CTRL_BOOT,       dispatch_event, nullptr, 1);
     event_bus_subscribe(EventType::RULE_EVENT,      dispatch_event);
-    event_bus_subscribe(EventType::RULE_TIMER_FIRE, dispatch_event);
+    event_bus_subscribe(EventType::RULE_TIMER_FIRE, dispatch_event, nullptr, sizeof s_timers / sizeof s_timers[0]);
     event_bus_subscribe(EventType::MQTT_MSG,        dispatch_event);
-    // CODEX H-03: re-resolve friendly-name triggers when the device pool changes.
-    event_bus_subscribe(EventType::DEVICE_JOIN,     on_pool_change);
-    event_bus_subscribe(EventType::DEVICE_LEAVE,    on_pool_change);
+    // CODEX H-03: re-resolve friendly-name triggers when the device pool changes. The handler re-scans every rule
+    // and reads nothing from the event, so one queued event covers any number of joins and leaves.
+    event_bus_subscribe(EventType::DEVICE_JOIN,     on_pool_change, nullptr, 1);
+    event_bus_subscribe(EventType::DEVICE_LEAVE,    on_pool_change, nullptr, 1);
 
     xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY);
     reload_locked();

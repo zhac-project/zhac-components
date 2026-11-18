@@ -137,8 +137,14 @@ void           event_bus_publish(const Event& e);
 // Returns EVENT_SUB_INVALID on bad type, full table, or queue allocation
 // failure. Handles are generation-stamped: a handle outlives its subscription
 // only as a safely-rejected stale value.
+// `depth` is this subscriber's queue length (each slot holds one 104-byte Event,
+// in internal RAM on builds without XIP). A handler that only needs to know
+// something happened -- a blink, a re-scan of every rule -- takes 1; 0 is
+// refused like a bad type.
+static constexpr uint8_t EVENT_QUEUE_DEPTH = 16;
 EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
-                                   EventFilter filter = nullptr);
+                                   EventFilter filter = nullptr,
+                                   uint8_t depth = EVENT_QUEUE_DEPTH);
 
 // Remove a subscription. Generation-checked: a stale or double unsubscribe is
 // ignored (logged). Contract:

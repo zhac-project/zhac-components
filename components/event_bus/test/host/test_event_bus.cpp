@@ -233,6 +233,23 @@ int main() {
         CHECK(true, "invalid unsubscribe/publish are no-ops");
     }
 
+    // ── 11. a subscriber may ask for a shorter queue (research 2026-11-18 A8) ─
+    {
+        int calls = 0;
+        uint8_t first = 0, last = 0;
+        EventSubHandle h = event_bus_subscribe(
+            EventType::DEVICE_LEAVE,
+            [&](const Event& e) { if (!calls++) first = e.data[0]; last = e.data[0]; },
+            nullptr, 2);
+        CHECK(h != EVENT_SUB_INVALID, "depth-2 subscribe ok");
+        event_bus_publish(make_event(EventType::DEVICE_LEAVE, 0x01));
+        event_bus_publish(make_event(EventType::DEVICE_LEAVE, 0x02));
+        event_bus_publish(make_event(EventType::DEVICE_LEAVE, 0x03));
+        CHECK(event_bus_drain_handle(h, 0) == 2 && first == 0x02 && last == 0x03,
+              "a depth-2 queue holds the newest two events");
+        event_bus_unsubscribe(h);
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;
