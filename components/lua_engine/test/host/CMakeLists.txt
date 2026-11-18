@@ -39,3 +39,11 @@ add_executable(lua_limits_tests lua_limits_test.cpp)
 target_include_directories(lua_limits_tests PRIVATE ../../src)
 target_link_libraries(lua_limits_tests PRIVATE host_lua m Threads::Threads)
 add_test(NAME lua_limits COMMAND lua_limits_tests)
+
+# lua_alloc.c's heap choice (research 2026-11-18 A7), against a two-heap stub, at the old P4 threshold and at 0.
+foreach(th 512 0)
+    add_executable(lua_alloc_tests_${th} lua_alloc_test.c ../../src/lua_alloc.c)
+    target_include_directories(lua_alloc_tests_${th} PRIVATE alloc_stubs ../../src ../../include)
+    target_compile_definitions(lua_alloc_tests_${th} PRIVATE CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=${th})
+    add_test(NAME lua_alloc_${th} COMMAND lua_alloc_tests_${th})
+endforeach()

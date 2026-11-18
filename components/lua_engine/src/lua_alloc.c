@@ -12,7 +12,6 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -47,8 +46,9 @@ static size_t const kEffectiveCap =
         : kBudgetBytes;
 
 static inline void bump_used(size_t delta) {
-    uint32_t now = atomic_fetch_add(&s_used_bytes, (uint32_t)delta) + delta;
-    uint32_t peak = atomic_load(&s_peak_bytes);
+    // uint_fast32_t like the atomics: 32 bits on the chip, 64 on the host test build.
+    uint_fast32_t now = atomic_fetch_add(&s_used_bytes, (uint32_t)delta) + delta;
+    uint_fast32_t peak = atomic_load(&s_peak_bytes);
     while (now > peak) {
         if (atomic_compare_exchange_weak(&s_peak_bytes, &peak, now)) break;
     }
@@ -59,9 +59,9 @@ static inline void drop_used(size_t delta) {
     // bumped would otherwise wrap to ~4 GB and trip every subsequent
     // budget check until the VM aborts. CAS loop is fine; this is
     // not a hot path compared to the actual heap op.
-    uint32_t cur = atomic_load(&s_used_bytes);
+    uint_fast32_t cur = atomic_load(&s_used_bytes);
     for (;;) {
-        uint32_t next = (cur > (uint32_t)delta) ? (cur - (uint32_t)delta) : 0;
+        uint_fast32_t next = (cur > (uint32_t)delta) ? (cur - (uint32_t)delta) : 0;
         if (atomic_compare_exchange_weak(&s_used_bytes, &cur, next)) break;
     }
 }
@@ -112,17 +112,14 @@ void* lua_engine_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
         return out;
     }
 
-    // Realloc. heap_caps_realloc preserves the backing heap of the
-    // original allocation. Keep that preference; if it can't grow in
-    // place we'll get a fresh allocation from the same heap.
-    void* out = heap_caps_realloc(ptr, nsize, MALLOC_CAP_8BIT);
-    if (!out) {
-        // Last-resort: try the other heap explicitly.
-        out = heap_caps_malloc(nsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!out) return NULL;
-        memcpy(out, ptr, osize < nsize ? osize : nsize);
-        heap_caps_free(ptr);
-    }
+    // Realloc. heap_caps_realloc keeps the block in its own heap when that heap has the asked caps and room, else
+    // takes the first heap that has them -- internal RAM first for plain 8-bit memory. So a block at or above the
+    // threshold asks for PSRAM: a small block growing past it would otherwise stay in internal RAM, and a big one
+    // PSRAM cannot grow would move there (research 2026-11-18 A7). Both asks already try every heap they allow, so
+    // a NULL here is final.
+    const uint32_t caps = nsize < kSmallThreshold ? MALLOC_CAP_8BIT : (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void* out = heap_caps_realloc(ptr, nsize, caps);
+    if (!out) return NULL;
 
     if (nsize > osize) bump_used(nsize - osize);
     else               drop_used(osize - nsize);
