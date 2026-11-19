@@ -20,6 +20,7 @@ static inline QueueHandle_t xQueueCreate(UBaseType_t, UBaseType_t) {
 }
 static inline BaseType_t xQueueSend(QueueHandle_t, const void*, TickType_t) { return pdTRUE; }
 static inline BaseType_t xQueueReceive(QueueHandle_t, void*, TickType_t) { return pdFALSE; }
+static inline BaseType_t xQueueOverwrite(QueueHandle_t, const void*) { return pdTRUE; }
 static inline void       vQueueDelete(QueueHandle_t) {}
 // zigbee_mgr reads queue depth for diagnostics/log; nothing is ever queued on
 // the host (no drainer runs), so report empty.

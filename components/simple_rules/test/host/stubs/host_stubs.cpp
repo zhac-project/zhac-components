@@ -67,6 +67,13 @@ BaseType_t xQueueSend(QueueHandle_t q, const void* item, TickType_t ticks) {
     return pdTRUE;
 }
 
+BaseType_t xQueueOverwrite(QueueHandle_t q, const void* item) {
+    if (!q || q->length != 1) return pdFALSE;   // FreeRTOS asserts this
+    q->head  = 0;
+    q->count = 0;
+    return xQueueSend(q, item, 0);
+}
+
 BaseType_t xQueueReceive(QueueHandle_t q, void* item, TickType_t ticks) {
     (void)ticks;   // single-threaded: empty means empty, no waiting
     if (!q || q->count == 0) return pdFALSE;

@@ -19,6 +19,7 @@
 // Not coverable single-threaded: a DYING slot surviving past drain exit
 // (reap-on-next-publish then runs its s_dying_count==0 fast path only).
 #include "event_bus.h"
+#include "esp_log.h"          // host shim: stub_log_count
 #include "freertos/queue.h"   // host shim instrumentation
 
 #include <cstdio>
@@ -248,6 +249,29 @@ int main() {
         CHECK(event_bus_drain_handle(h, 0) == 2 && first == 0x02 && last == 0x03,
               "a depth-2 queue holds the newest two events");
         event_bus_unsubscribe(h);
+    }
+
+    // ── 12. a one-slot queue is "latest wins": the newest event replaces the
+    //    waiting one without a warning -- a burst (a boot's DEVICE_JOIN
+    //    restore, a frame's keys) must not log a fault per event; a deeper
+    //    queue still warns when it drops one (P2 review 2026-11-19 #1) ─
+    {
+        int calls = 0;
+        uint8_t got = 0;
+        EventSubHandle h = event_bus_subscribe(
+            EventType::DEVICE_JOIN, [&](const Event& e) { calls++; got = e.data[0]; }, nullptr, 1);
+        CHECK(h != EVENT_SUB_INVALID, "depth-1 subscribe ok");
+        const int warned = stub_log_count('W', "queue full");
+        for (uint8_t i = 1; i <= 5; i++) event_bus_publish(make_event(EventType::DEVICE_JOIN, i));
+        CHECK(stub_log_count('W', "queue full") == warned, "a depth-1 queue overwrites without a warning");
+        CHECK(event_bus_drain_handle(h, 0) == 1 && calls == 1 && got == 5, "  and holds the newest event");
+        event_bus_unsubscribe(h);
+        EventSubHandle h2 = event_bus_subscribe(EventType::DEVICE_JOIN, [](const Event&) {}, nullptr, 2);
+        const int before = stub_log_count('W', "queue full");
+        for (uint8_t i = 1; i <= 3; i++) event_bus_publish(make_event(EventType::DEVICE_JOIN, i));
+        CHECK(stub_log_count('W', "queue full") == before + 1, "a deeper queue still warns when it drops one");
+        event_bus_drain_handle(h2, 0);
+        event_bus_unsubscribe(h2);
     }
 
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",

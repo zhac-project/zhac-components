@@ -49,6 +49,7 @@ struct SubEntry {
     // drainer was blocked on).
     uint8_t       inflight;
     bool          alive;
+    bool          latest;    // depth 1: "latest wins", a publish replaces the waiting event
 };
 
 static SubEntry s_subs[EVENT_TYPE_COUNT][MAX_SUBS_PER_TYPE];
@@ -187,6 +188,7 @@ EventSubHandle event_bus_subscribe(EventType type, EventHandler handler,
     s.handler = std::move(handler);
     s.queue   = q;
     s.filter  = std::move(filter);
+    s.latest  = depth == 1;
     s.gen++;            // new generation — stale handles to this slot die here
     s.alive   = true;   // inflight is 0 by the FREE-slot invariant
     const uint8_t gen = s.gen;
@@ -263,6 +265,7 @@ void event_bus_publish(const Event& e) {
         QueueHandle_t q;
         EventFilter   filter;
         uint8_t       pos;
+        bool          latest;
     };
     Target  targets[MAX_SUBS_PER_TYPE];
     uint8_t n = 0;
@@ -273,6 +276,7 @@ void event_bus_publish(const Event& e) {
         if (!s.alive || !s.queue) continue;   // FREE or DYING slot
         targets[n].q   = s.queue;
         targets[n].pos = i;
+        targets[n].latest = s.latest;
         if (s.filter) targets[n].filter = s.filter;   // copy only when set
         s.inflight++;
         n++;
@@ -282,6 +286,14 @@ void event_bus_publish(const Event& e) {
 
     for (uint8_t k = 0; k < n; k++) {
         if (targets[k].filter && !targets[k].filter(e)) continue;
+        // A one-slot queue only says "something happened" (a blink, a re-scan):
+        // replacing the waiting event is its design, not a loss to warn about --
+        // a boot's DEVICE_JOIN restore or a frame's keys would log a fault each
+        // (P2 review 2026-11-19 #1). xQueueOverwrite is atomic.
+        if (targets[k].latest) {
+            xQueueOverwrite(targets[k].q, &e);
+            continue;
+        }
         if (xQueueSend(targets[k].q, &e, 0) != pdTRUE) {
             // Eviction policy: overwrite-oldest (E3).
             // On queue full, the oldest event is silently discarded to make room
