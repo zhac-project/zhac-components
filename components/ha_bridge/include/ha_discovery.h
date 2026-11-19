@@ -47,8 +47,9 @@ using EmitFn = void (*)(const char* component, const char* topic,
 
 // Emit every discovery config for one device. Returns the entity count (device
 // triggers are configs, not entities: not counted), or -1 when `exposes` is
-// not a JSON array. `passive_out`, when given, says whether
-// the device got the per-device availability topic (battery devices do).
+// not a JSON array. Every entity needs the hub's and the device's own
+// availability topic. `passive_out`, when given, says whether the device is
+// passive (battery): offline after a day of silence, not by the availability ping.
 //
 // Compositions, in this order, each consuming the exposes it uses:
 //   local_temperature + a writable heating setpoint   -> climate (+ system_mode, preset,

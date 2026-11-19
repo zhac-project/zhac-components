@@ -185,9 +185,11 @@ static void test_plug_select_number_and_skips() {
     CHECK(act && act->component == "event");
     CHECK(act && act->cfg["event_types"].size() == 2 && has(act->cfg["event_types"], "double"));
     CHECK(act && std::string(act->cfg["value_template"]) == "{\"event_type\":\"{{ value }}\"}");
-    // mains device: one hub availability topic, no per-device one
-    CHECK(sw && std::string(sw->cfg["availability_topic"]) == "zhac/availability");
-    CHECK(sw && sw->cfg["availability"].isNull());
+    // mains device: hub topic AND its own, which the availability ping drives (research 2026-11-18 B7);
+    // no day-of-silence rule (not passive)
+    CHECK(sw && sw->cfg["availability_topic"].isNull());
+    CHECK(sw && sw->cfg["availability"].size() == 2 && std::string(sw->cfg["availability_mode"]) == "all");
+    CHECK(sw && std::string(sw->cfg["availability"][1]["topic"]) == "zhac/devices/00158D0007A1B2C3/availability");
     CHECK(!g_passive);
     CHECK(!get("zhac_00158d0007a1b2c3_identify"));
 

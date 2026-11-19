@@ -134,7 +134,6 @@ struct Writer {
     const Context& c;
     EmitFn         emit;
     void*          user;
-    bool           passive;   // gets the per-device availability topic
     int            count = 0;
 
     void topic_of(char* out, size_t cap, const char* key, bool set) const {
@@ -150,19 +149,16 @@ struct Writer {
         doc["unique_id"] = buf;
         if (name) doc["name"] = name;
         else      doc["name"] = nullptr;
+        // Hub online AND the device itself: ha_bridge sets the device topic "offline"
+        // after a day of silence (battery) or an unanswered availability ping (mains,
+        // research 2026-11-18 B7).
         snprintf(buf, sizeof(buf), "%s/availability", c.root);
-        if (passive) {
-            // Hub online AND the device heard from lately; ha_bridge flips the
-            // device topic to "offline" after a day of silence.
-            JsonArray av = doc["availability"].to<JsonArray>();
-            av.add<JsonObject>()["topic"] = buf;
-            char dt[96];
-            if (device_availability_topic(dt, sizeof(dt), c.root, d.ieee) > 0)
-                av.add<JsonObject>()["topic"] = dt;
-            doc["availability_mode"] = "all";
-        } else {
-            doc["availability_topic"] = buf;
-        }
+        JsonArray av = doc["availability"].to<JsonArray>();
+        av.add<JsonObject>()["topic"] = buf;
+        char dt[96];
+        if (device_availability_topic(dt, sizeof(dt), c.root, d.ieee) > 0)
+            av.add<JsonObject>()["topic"] = dt;
+        doc["availability_mode"] = "all";
         device(doc);
     }
 
@@ -512,7 +508,7 @@ int build_device(const Device& d, const Context& c, EmitFn emit, void* user, boo
 
     const bool passive = d.battery_powered || find("battery", "numeric") || find("battery_low", "binary");
     if (passive_out) *passive_out = passive;
-    Writer w{d, c, emit, user, passive};
+    Writer w{d, c, emit, user};
 
     // Thermostat: a measured temperature and a writable heating setpoint.
     Expose* lt = find("local_temperature", "numeric");
