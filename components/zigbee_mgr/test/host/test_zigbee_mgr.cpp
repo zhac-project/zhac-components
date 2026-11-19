@@ -115,6 +115,7 @@ extern zhac_shadow_update_fn_t g_stub_shadow_fn;
 extern zhac_state_text_fn_t g_stub_state_text_fn;
 extern zhac_poll_device_fn_t g_stub_poll_source;
 extern zhac_seen_fn_t g_stub_seen_fn;
+extern zhac_seen_fn_t g_stub_offline_fn;
 extern "C" void zhc_shadow_bridge_register(void);
 
 int main() {
@@ -787,6 +788,18 @@ int main() {
         if (g_stub_seen_fn) g_stub_seen_fn(0xA4C1380000000001ULL);
         CHECK(seen_ieee == 0xA4C1380000000001ULL, "seen hook publishes DEVICE_SEEN with the ieee");
         event_bus_unsubscribe(h);
+
+        // A device that let its ping go unanswered reaches the bus as DEVICE_OFFLINE (research 2026-11-18 B7).
+        CHECK(g_stub_offline_fn != nullptr, "shadow bridge registers the offline hook");
+        uint64_t gone_ieee = 0;
+        const EventSubHandle h2 = event_bus_subscribe(EventType::DEVICE_OFFLINE, [](const Event&) {},
+            [&gone_ieee](const Event& e) {
+                memcpy(&gone_ieee, e.data, sizeof(gone_ieee));
+                return true;
+            });
+        if (g_stub_offline_fn) g_stub_offline_fn(0xA4C1380000000002ULL);
+        CHECK(gone_ieee == 0xA4C1380000000002ULL, "offline hook publishes DEVICE_OFFLINE with the ieee");
+        event_bus_unsubscribe(h2);
     }
 
     // ── G14: radio text is stored JSON-safe (review 2026-10-24 ZR-03) ───
