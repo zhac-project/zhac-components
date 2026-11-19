@@ -1,0 +1,54 @@
+// SPDX-FileCopyrightText: 2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+#include <cstddef>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// The relay's answer to one cloud command: nullptr = pass it to the dispatcher, else the error code:
+//   "local_only"      settings.set carrying the key only the hub's own page may change
+//                     (remote_scripts), whatever the build trusts the cloud with;
+//   "scripts_off"     a switch-gated op while the hub's "Allow script changes from the cloud" switch is
+//                     off. The switch gates changing Lua and engine control (script.write, script.reload,
+//                     system.restart), a direct script.run, and a rule save that adds a script.run action
+//                     (remote_rule_refusal below);
+//   "cmd_not_allowed" anything else the relay does not pass.
+// `local_only_key`: the args carry a key `remote_is_local_only_key` accepts. `scripts_on`: the switch.
+// LINEAR SCANS over static arrays (~70 entries), once per cloud frame.
+const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on);
+// The relay's answer to a rule save (rule.create / rule.update) whose text is `dsl`: "scripts_off" when
+// the text runs a stored script (a `script.run` action) while the switch is off -- the cloud may not run
+// Lua on the hub by way of a new rule either (review 2026-10-24 LU-04) -- else nullptr. Rules already on
+// the hub keep running, rule.run included. Asked once remote_cmd_refusal passed.
+const char* remote_rule_refusal(const char* cmd, const char* dsl, bool scripts_on);
+
+// True for a settings.set key that only the hub's own page may change; the relay answers settings.set
+// carrying one of them (with any non-null value) with local_only. remote_scripts: spec 2026-10-05 §3.1;
+// log_to_cloud: spec 2026-10-06 §4.1.
+bool remote_is_local_only_key(const char* key);
+
+// True iff `cmd` passes now: remote_cmd_refusal(cmd, false, remote_scripts_allowed()) == nullptr.
+bool remote_cmd_allowed(const char* cmd);
+
+// "Allow script changes from the cloud" (spec 2026-10-05 §3.1). Weak default: false. Dual-chip and mono
+// define nothing, so script writes stay closed there; zhac-wired-core returns its NVS flag.
+bool remote_scripts_allowed(void);
+
+// True iff the event name should be mirrored to the remote sink.
+bool remote_event_allowed(const char* name);
+
+// The hub-log line for a change the cloud relays (§3.7), e.g.
+//   "script.write by 00000000-0000-4000-8000-000000000001 name=heating"
+// `by` is printed when it looks like an account id (1-40 of [0-9a-f-]), else "-"; ` id=<id>` (rules,
+// id >= 0) and ` name=<name>` (only a valid script name) follow when present. False when `cmd` is not a
+// logged change (reads, checks, script.part).
+bool remote_change_log_line(const char* cmd, const char* by, long id, const char* name, char* out, size_t cap);
+
+// A name the hub stores a script under: [A-Za-z0-9_-]{1,24}.
+bool remote_script_name_ok(const char* name);
+
+#ifdef __cplusplus
+}
+#endif

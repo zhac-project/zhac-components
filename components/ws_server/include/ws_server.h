@@ -1,0 +1,79 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+#include <cstddef>
+#include "esp_http_server.h"
+
+// Called on every text frame received from a client. `fd` identifies
+// the sending socket so the handler can issue a point-reply via
+// `ws_server_reply()`; broadcasts to every client use
+// `ws_server_broadcast()` instead.
+// httpd URI-handler slots. Every entry in rest_ops.cpp's kRoutes[] — which
+// includes the SPA static/catch-all "/*" as its LAST entry — is registered as
+// its own handler, and ws_server registers "/ws" on top. So this must stay
+// >= kRoutes count + 1; rest_ops.cpp static_asserts exactly that.
+//
+// Overflow is silent at build time and ugly at runtime: registration simply
+// fails for whatever no longer fits, and since the catch-all is registered
+// last, the Web UI 404s ("Nothing matches the given URI") while REST/WS keep
+// working, with only one `httpd_uri: no slots left` line in the boot log.
+// Headroom is deliberate so adding a route doesn't require touching this.
+static constexpr size_t WS_SERVER_MAX_URI_HANDLERS = 56;
+
+using WsRxCallback = void(*)(int fd, const char* data, size_t len);
+
+void             ws_server_init();
+void             ws_server_broadcast(const char* json, size_t len);
+// Send `json` to a single client identified by its httpd socket fd.
+// Intended for command responses correlated by `id` back to the sender.
+// It takes turns with every other sender, so it can block behind a frame that is
+// already in flight: up to about SO_SNDTIMEO (3 s) for each stalled recipient of
+// that frame. It normally runs on the httpd task, so such a stall delays every
+// HTTP request and WS frame for that long. Must not be called from inside a send
+// (ws_server_in_broadcast() true): that asserts, except through the reply hook
+// below, which takes no lock.
+void             ws_server_reply(int fd, const char* json, size_t len);
+httpd_handle_t   ws_server_get_handle();
+void             ws_server_set_rx_callback(WsRxCallback cb);
+void             ws_server_set_api_token(const char* token);
+// Optional: asked about every WebSocket upgrade; false refuses it -- before the
+// handshake with CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT, else by closing the
+// new socket at once. The firmware's cross-site filter (review 2026-10-24 HS-01).
+using WsUpgradeFilter = bool(*)(httpd_req_t* req);
+void             ws_server_set_upgrade_filter(WsUpgradeFilter fn);
+int              ws_server_client_count();
+// True when the CALLING task is currently inside a send to a WS client: the
+// broadcast fan-out or ws_server_reply (the TX lock is held, the marker set).
+// The WS log sink uses this to drop fan-out of log lines emitted from within the
+// send path itself (TX-path re-entry guard); ws_server_broadcast returns at once
+// for such a call, and ws_server_reply asserts.
+bool             ws_server_in_broadcast();
+
+// F18: per-fd auth state for first-message WS authentication. A socket may
+// open unauthenticated when a token is configured; the dispatch layer permits
+// only the `auth` command until ws_server_fd_set_authed() is called for it.
+bool             ws_server_fd_is_authed(int fd);
+void             ws_server_fd_set_authed(int fd);
+// Q48: clear every client's authed flag (e.g. on token rotation) so sockets that
+// authenticated with the now-stale token must re-auth with the new one.
+void             ws_server_fd_deauth_all();
+// Close every client that never signed in. For the switch from sign-in on to
+// off, after which every socket is trusted (review 2026-10-24 HS-01).
+void             ws_server_close_unauthed();
+// While a token is set, close the clients that joined more than 5 s before
+// `now_us` and have not signed in (review 2026-10-24 HS-04). Called once a
+// second by the server's own timer; public for the host test.
+void             ws_server_sign_in_sweep(int64_t now_us);
+
+// ── Reply hook for sentinel fds ─────────────────────────────────────────
+//
+// Some callers (e.g. remote_client) deliver responses over a different
+// transport than the local httpd. They register a hook against a
+// reserved sentinel fd (outside the legal httpd range, e.g. < 0).
+//
+// When ws_server_reply() is called with a fd that matches a registered
+// sentinel, the hook is invoked instead of httpd_ws_send_frame_async.
+//
+// Single-slot table; latest registration wins. Pass nullptr to unregister.
+typedef void (*WsReplyHook)(const char* json, size_t len);
+void ws_server_register_reply_hook(int sentinel_fd, WsReplyHook hook);
