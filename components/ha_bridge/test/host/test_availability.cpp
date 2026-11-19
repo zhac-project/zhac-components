@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // The device availability topic's state machine, cut out of ha_bridge.cpp (see CMakeLists.txt): battery devices go
-// offline after a day of silence, mains devices when the availability ping goes unanswered (research 2026-11-18 B7).
+// offline after a day of silence, mains devices when the availability ping goes unanswered (research 2026-11-18 B7),
+// and the tick repairs what an event or a publish lost (review 2026-11-19 P3 #2).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#include "ha_bridge.h"
 
 #define ESP_LOGI(tag, ...) ((void)(tag))
 static const char* TAG = "ha_bridge";
@@ -14,13 +17,28 @@ constexpr uint32_t kPassiveSilenceS = 25 * 3600;
 static uint32_t    g_now = 1000;
 static uint32_t    now_s() { return g_now; }
 static std::string g_pub;   // what reached the broker, "<ieee low byte>=online;..."
-static void publish_availability(uint64_t ieee, bool online) {
+static bool        g_broker_ok = true;   // false: the publish gives up (queue full for 2 s)
+static int         g_attempts = 0;
+static bool publish_availability(uint64_t ieee, bool online) {
+    g_attempts++;
+    if (!g_broker_ok) return false;
     char b[32];
     std::snprintf(b, sizeof b, "%02X=%s;", (unsigned)(ieee & 0xFF), online ? "online" : "offline");
     g_pub += b;
+    return true;
 }
 struct Published;
 static Published* slot_for(uint64_t ieee, bool create);
+
+// For tick_availability.
+constexpr size_t kMaxDevices = 2;
+static bool      s_enabled = true;
+static Published* s_pub = nullptr;
+const HaBridgePlatform* s_plat = nullptr;
+static bool mqtt_gw_is_connected() { return true; }
+static uint64_t g_offline_ieee = 0;   // the adapter's verdict: this mains device is offline
+static bool device_offline(uint64_t ieee) { return ieee == g_offline_ieee; }
+static const HaBridgePlatform kPlat = {"test", nullptr, nullptr, nullptr, device_offline};
 
 #include "availability.inc"
 
@@ -76,6 +94,37 @@ int main() {
 
     set_online(0xC3, false);
     expect("a device Home Assistant does not know is ignored", took().empty());
+
+    // Review 2026-11-19 P3 #2: level-triggered. The tick compares each device with the adapter's verdict, so a lost
+    // DEVICE_SEEN or DEVICE_OFFLINE, or a publish the broker did not take, is repaired within a second.
+    s_pub  = g_slots;
+    s_plat = &kPlat;
+    tick_availability();
+    expect("the tick says nothing while the broker has the adapter's verdict", took().empty());
+
+    g_offline_ieee = 0xA1;
+    g_broker_ok = false;
+    set_online(0xA1, false);
+    g_broker_ok = true;
+    expect("a publish the broker did not take reaches nothing", took().empty());
+    tick_availability();
+    expect("  and the tick sends it again", took() == "A1=offline;");
+    tick_availability();
+    expect("  once", took().empty());
+
+    g_offline_ieee = 0;   // the device answered; its DEVICE_SEEN was dropped on a full queue
+    tick_availability();
+    expect("a lost DEVICE_SEEN is repaired by the tick", took() == "A1=online;" && !plug.offline);
+
+    g_offline_ieee = 0xA1;
+    g_now = sensor.last_seen_s + kPassiveSilenceS + 1;
+    g_broker_ok = false;
+    g_attempts = 0;
+    tick_availability();
+    expect("a broker that takes nothing costs one attempt per tick, not one per device", g_attempts == 1);
+    g_broker_ok = true;
+    tick_availability();
+    expect("  and the next tick sends both", took() == "A1=offline;B2=offline;");
 
     std::printf("%s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;

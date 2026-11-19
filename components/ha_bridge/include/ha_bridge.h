@@ -41,6 +41,10 @@ struct HaBridgePlatform {
     bool (*get_device)(uint64_t ieee, HaDeviceCb cb, void* ctx);
     // `value_json` is a JSON scalar: 1, 21.5, true, "heat".
     bool (*set_attr)(uint64_t ieee, const char* key, const char* value_json);
+    // A mains device did not answer its availability ping (zhac_adapter_device_offline). The bridge checks it every
+    // second and republishes the device's availability on a mismatch, so a lost DEVICE_SEEN or a publish the broker
+    // did not take is repaired (review 2026-11-19 P3 #2). Null: only the events count.
+    bool (*device_offline)(uint64_t ieee);
 };
 
 // Loads the NVS settings and starts the task. `platform` must outlive it.

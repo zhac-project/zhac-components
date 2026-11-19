@@ -57,8 +57,9 @@ struct Msg {
 struct Published {
     uint64_t ieee;
     char*    topics;
-    bool     passive;         // has the per-device availability topic
-    bool     offline;         // what we last told the broker
+    bool     passive;         // battery: offline after a day of silence, not by the ping
+    bool     offline;         // what the device's availability topic says
+    bool     avail_ok;        // the broker took it; until then the tick sends it again (review 2026-11-19 P3 #2)
     volatile uint32_t last_seen_s;   // written from the state publisher's task; 32-bit, atomic
 };
 
@@ -186,10 +187,16 @@ void publish_attrs(uint64_t ieee, const char* attrs_json);
 
 uint32_t now_s() { return static_cast<uint32_t>(esp_timer_get_time() / 1000000); }
 
-void publish_availability(uint64_t ieee, bool online) {
+// False when the broker did not take it. A topic that does not fit is nothing to send again: true.
+bool publish_availability(uint64_t ieee, bool online) {
     char topic[96];
-    if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee) < 0) return;
-    publish(topic, online ? "online" : "offline", 1, true);
+    if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), ieee) < 0) return true;
+    return publish(topic, online ? "online" : "offline", 1, true);
+}
+
+void set_availability(Published& s, bool offline) {
+    s.offline  = offline;
+    s.avail_ok = publish_availability(s.ieee, !offline);
 }
 
 // What a (re)published device's own availability topic says. Battery devices: assume alive on (re)publish, the
@@ -199,11 +206,10 @@ void sync_availability(Published& s, bool passive, bool ping_offline) {
     s.passive = passive;
     if (passive) {
         if (!s.last_seen_s) s.last_seen_s = now_s();
-        s.offline = (now_s() - s.last_seen_s) > kPassiveSilenceS;
+        set_availability(s, (now_s() - s.last_seen_s) > kPassiveSilenceS);
     } else {
-        s.offline = ping_offline;
+        set_availability(s, ping_offline);
     }
-    publish_availability(s.ieee, !s.offline);
 }
 
 // The availability ping's verdict, from DEVICE_OFFLINE / DEVICE_SEEN (research 2026-11-18 B7). A battery device keeps
@@ -215,9 +221,8 @@ void set_online(uint64_t ieee, bool online) {
         if (online) s->last_seen_s = now_s();
         return;
     }
-    if (s->offline == !online) return;   // says so already
-    s->offline = !online;
-    publish_availability(ieee, online);
+    if (s->offline == !online && s->avail_ok) return;   // says so already
+    set_availability(*s, !online);
     ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)ieee, online ? "answered again: online" : "ping unanswered: offline");
 }
 
@@ -245,19 +250,31 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
     publish_attrs(d.ieee, d.attrs);   // HA shows the current values right away
 }
 
-// Battery devices silent for too long go offline; the first report brings
-// them back. Runs on the bridge task once a second.
+// Once a second on the bridge task. Battery devices silent for too long go
+// offline, and the first report brings them back. Mains devices follow the
+// availability ping's verdict, read from the adapter: DEVICE_OFFLINE and
+// DEVICE_SEEN only make it quicker, and a lost one is repaired here. A publish
+// the broker did not take is sent again (review 2026-11-19 P3 #2).
 void tick_availability() {
     if (!s_enabled || !s_pub || !mqtt_gw_is_connected()) return;
     const uint32_t now = now_s();
     for (size_t i = 0; i < kMaxDevices; i++) {
         Published& p = s_pub[i];
-        if (!p.ieee || !p.passive) continue;
-        const bool silent = (now - p.last_seen_s) > kPassiveSilenceS;
-        if (silent != p.offline) {
-            p.offline = silent;
-            publish_availability(p.ieee, !silent);
-            ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)p.ieee, silent ? "silent for a day: offline" : "back: online");
+        if (!p.ieee) continue;
+        bool off = p.offline;
+        if (p.passive) {
+            off = (now - p.last_seen_s) > kPassiveSilenceS;
+        } else if (s_plat && s_plat->device_offline) {
+            off = s_plat->device_offline(p.ieee);
+        }
+        if (off == p.offline && p.avail_ok) continue;
+        const bool changed = off != p.offline;
+        set_availability(p, off);
+        if (!p.avail_ok) break;   // the broker takes nothing now, and each try waits 2 s: the next tick goes on
+        if (changed) {
+            ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)p.ieee,
+                     p.passive ? (off ? "silent for a day: offline" : "back: online")
+                               : (off ? "ping unanswered: offline" : "answered again: online"));
         }
     }
 }
