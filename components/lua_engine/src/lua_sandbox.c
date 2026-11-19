@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// lua_sandbox.c — redact the unsafe bits of the standard library.
+//
+// After luaL_openlibs(), several functions provide arbitrary file or
+// process access. Strip those before the VM services any script. We
+// don't drop whole modules — `os.time` is kept — just point the
+// dangerous entries at the no-op `nil`.
+
+#include "sdkconfig.h"
+
+#if CONFIG_LUA_ENGINE_ENABLED
+
+#include <stdarg.h>
+#include <string.h>
+
+#include "esp_log.h"
+
+#include "lua_internal.h"
+
+static const char* TAG = "lua_sandbox";
+
+// Null out `<table>.<name>` by setting to Lua nil.
+static void redact(lua_State* L, const char* tbl, const char* name) {
+    lua_getglobal(L, tbl);
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    lua_pushnil(L);
+    lua_setfield(L, -2, name);
+    lua_pop(L, 1);
+}
+
+// ── LU-02: pcall / xpcall that cannot swallow the CPU-runaway kill ─────
+// The scheduler's count hook raises a Lua error once a resume passes its CPU
+// deadline (lua_scheduler.cpp). A plain pcall/xpcall catches that error, so a
+// tight loop wrapped in pcall keeps catching the raise and never returns —
+// defeating the guard and wedging TaskLua. These replacements behave exactly
+// like the stock base-lib ones (same stack handling, same multi-return, still
+// yieldable via lua_pcallk so `zhac.sleep` inside a pcall works) EXCEPT that,
+// once the resume is over budget, the caught error is re-raised instead of
+// returned — so the kill propagates out of every protected frame to the
+// scheduler, whatever pcall/xpcall nesting the script used. Ordinary errors
+// (the common, sub-deadline case) are caught as before.
+static int sandbox_finish_pcall(lua_State* L, int status, lua_KContext extra) {
+    if (status != LUA_OK && status != LUA_YIELD) {   // error?
+        if (lua_scheduler_resume_over_budget()) return lua_error(L);   // re-raise: the kill is uncatchable
+        lua_pushboolean(L, 0);   // first result (false)
+        lua_pushvalue(L, -2);    // error object
+        return 2;
+    }
+    return lua_gettop(L) - (int)extra;   // all results (true already in place)
+}
+static int sandboxed_pcall(lua_State* L) {
+    luaL_checkany(L, 1);
+    lua_pushboolean(L, 1);   // first result if no error
+    lua_insert(L, 1);
+    int status = lua_pcallk(L, lua_gettop(L) - 2, LUA_MULTRET, 0, 0, sandbox_finish_pcall);
+    return sandbox_finish_pcall(L, status, 0);
+}
+static int sandboxed_xpcall(lua_State* L) {
+    int n = lua_gettop(L);
+    luaL_checktype(L, 2, LUA_TFUNCTION);   // message handler
+    lua_pushboolean(L, 1);
+    lua_pushvalue(L, 1);
+    lua_rotate(L, 3, 2);
+    int status = lua_pcallk(L, n - 2, LUA_MULTRET, 2, 2, sandbox_finish_pcall);
+    return sandbox_finish_pcall(L, status, 2);
+}
+
+// `print(...)` → ESP_LOGI("lua", "...")
+static int sandboxed_print(lua_State* L) {
+    const int n = lua_gettop(L);
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    for (int i = 1; i <= n; ++i) {
+        if (i > 1) luaL_addchar(&b, '\t');
+        size_t len;
+        const char* s = luaL_tolstring(L, i, &len);   // pushes string
+        luaL_addlstring(&b, s, len);
+        lua_pop(L, 1);
+    }
+    luaL_pushresult(&b);
+    const char* out = lua_tostring(L, -1);
+    ESP_LOGI("lua", "%s", out ? out : "(nil)");
+    lua_pop(L, 1);
+    return 0;
+}
+
+bool lua_engine_sandbox_apply(lua_State* L) {
+    // io.* — entire module nuked.
+    lua_pushnil(L);
+    lua_setglobal(L, "io");
+
+    // Q10 (QWEN_FINDINGS triage): luaL_openlibs also cached the io library in
+    // package.loaded.io, so nilling _G.io alone leaves it recoverable via
+    // `package.loaded.io.open(...)` (or require("io")). Purge the cached ref.
+    // `require` itself stays — lua_require.c needs it for the zhac/cjson/lpeg/
+    // miniz native modules; only the fully-removed io module is cleared here.
+    lua_getglobal(L, "package");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "loaded");
+        if (lua_istable(L, -1)) {
+            lua_pushnil(L);
+            lua_setfield(L, -2, "io");
+        }
+        lua_pop(L, 1);   // package.loaded
+    }
+    lua_pop(L, 1);       // package
+
+    // os.* — keep time/clock/date/difftime; remove shell escapes.
+    redact(L, "os", "execute");
+    redact(L, "os", "exit");
+    redact(L, "os", "getenv");
+    redact(L, "os", "remove");
+    redact(L, "os", "rename");
+    redact(L, "os", "tmpname");
+    redact(L, "os", "setlocale");
+
+    // package.* — drop filesystem loaders.
+    redact(L, "package", "loadlib");
+    redact(L, "package", "searchpath");
+    redact(L, "package", "cpath");
+    redact(L, "package", "path");
+
+    // Top-level loaders. `load` / `loadstring` let a script compile
+    // arbitrary bytes — Lua accepts bytecode by default, so the
+    // mode="t" text-only gate the engine uses internally is bypassed
+    // the moment a user script calls load() directly. Nil them all.
+    lua_pushnil(L); lua_setglobal(L, "dofile");
+    lua_pushnil(L); lua_setglobal(L, "loadfile");
+    lua_pushnil(L); lua_setglobal(L, "load");
+    lua_pushnil(L); lua_setglobal(L, "loadstring");
+
+    // `string.dump` pairs with `load()` to round-trip bytecode; drop
+    // it so a script can't emit bytes the sandbox has refused to re-eat.
+    redact(L, "string", "dump");
+
+    // `collectgarbage` can stall the single-task Lua VM for tens of ms
+    // on a big heap — a tight loop DoSes every coroutine on TaskLua.
+    // The engine still drives gc via the C API (lua_gc).
+    lua_pushnil(L); lua_setglobal(L, "collectgarbage");
+
+    // Q9 (QWEN_FINDINGS triage): the CPU-runaway guard is a per-thread debug
+    // hook (lua_scheduler.cpp installs LUA_MASKCOUNT on each scheduler-resumed
+    // coroutine). A script that creates its OWN coroutine via coroutine.create
+    // / coroutine.wrap gets a thread with NO hook — an infinite loop inside it
+    // bypasses the guard and wedges TaskLua. The scheduler drives script
+    // coroutines through the C API (lua_newthread/lua_resume) and yields via
+    // zhac.sleep, so user-level coroutine *creation* isn't needed. Redact it;
+    // yield/resume/status/running stay for operating on existing threads.
+    redact(L, "coroutine", "create");
+    redact(L, "coroutine", "wrap");
+
+    // debug.* — keep only traceback for error formatting.
+    lua_getglobal(L, "debug");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "traceback");
+        lua_pop(L, 1);   // keep traceback on the table (untouched)
+        const char* drop[] = {
+            "debug", "gethook", "getinfo", "getlocal", "getregistry",
+            "getupvalue", "getuservalue", "sethook", "setlocal",
+            "setmetatable", "setupvalue", "setuservalue",
+            "upvaluejoin", "upvalueid",
+        };
+        for (size_t i = 0; i < sizeof(drop) / sizeof(drop[0]); ++i) {
+            lua_pushnil(L);
+            lua_setfield(L, -2, drop[i]);
+        }
+    }
+    lua_pop(L, 1);
+
+    // Redirect print.
+    lua_pushcfunction(L, sandboxed_print);
+    lua_setglobal(L, "print");
+
+    // LU-02: replace pcall/xpcall with kill-aware versions so a pcall-wrapped
+    // runaway loop can't catch the CPU-deadline error and keep running. Done
+    // after luaL_openlibs installed the originals; the C API (the engine's own
+    // lua_pcall) and the redacted coroutine.create/wrap are unaffected.
+    lua_pushcfunction(L, sandboxed_pcall);
+    lua_setglobal(L, "pcall");
+    lua_pushcfunction(L, sandboxed_xpcall);
+    lua_setglobal(L, "xpcall");
+
+    // LUA-F10: lock stdlib table metatables. Defense in depth — every
+    // public Lua sandbox CVE chain starts with metatable manipulation
+    // (rewriting `string.__index`, etc.). Setting a string-typed
+    // `__metatable` makes `getmetatable(t)` return that string and
+    // `setmetatable(t, …)` raise an error. The base library's
+    // `setmetatable` is unchanged for user tables; only the stdlib
+    // surfaces are locked.
+    static const char* kLockTables[] = {
+        "string", "table", "math", "os", "coroutine", "io",
+    };
+    for (size_t i = 0; i < sizeof(kLockTables) / sizeof(kLockTables[0]); ++i) {
+        lua_getglobal(L, kLockTables[i]);
+        if (lua_istable(L, -1)) {
+            lua_newtable(L);                       // mt
+            lua_pushliteral(L, "locked");
+            lua_setfield(L, -2, "__metatable");
+            lua_setmetatable(L, -2);
+        }
+        lua_pop(L, 1);
+    }
+
+    ESP_LOGI(TAG, "sandbox applied");
+    return true;
+}
+
+#endif
