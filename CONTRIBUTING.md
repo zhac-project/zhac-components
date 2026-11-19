@@ -66,13 +66,14 @@ cd components/zap_common/test
 cmake -B build -S . && cmake --build build && ctest --test-dir build
 ```
 
-Full firmware compile-check: you need to build from `zhac-main-core`
-or `zhac-net-core` with this repo checked out as an override path:
+Full firmware compile-check: build `zhac-wired-core`, the firmware these
+components go into, with this checkout as its component path:
 
 ```sh
 export IDF_COMPONENT_OVERRIDE_PATH=$PWD/components
-cd ../zhac-main-core  # or zhac-net-core
-idf.py build
+cd ../zhac-wired-core
+. ~/.espressif/v6.0/esp-idf/export.sh
+idf.py -B build build   # ESP32-P4; for the ESP32-S31 see its README, "Building for esp32s31"
 ```
 
 ## NVS schema versioning

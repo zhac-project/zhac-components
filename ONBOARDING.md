@@ -62,13 +62,13 @@ stand-alone ESP-IDF component with its own `CMakeLists.txt`,
 | `metrics` | Prometheus-style counters / gauges | Apache-2.0 | — |
 | `arduinojson` | Vendored JSON parser | **MIT** | — |
 
-If a component shows up in firmware but not here, check
-`zhac-main-core/components/` (P4-only: `lua_engine`, `ezsp_driver`,
-`znp_driver`, `ezsp_backend`, `zigbee_backend`, `zigbee_mgr`,
-`hap_slave`, `lua_cjson`) or `zhac-net-core/components/` (S3-only:
-`cron_parser`, `rule_store`, `simple_rules`, `mqtt`, `mqtt_gw`,
-`ws_server`, `hap_master`). Those are single-chip and stay with their
-firmware.
+If a component shows up in firmware but not here, it is local to
+`zhac-wired-core/components/` (`esp_zigbee_backend`, `wifi_hosted` and the
+shims) or comes from the registry (`idf_component.yml`). `ws_server`,
+`remote_client`, `lua_engine` and `lua_cjson` moved here from
+zhac-net-core and zhac-main-core in November 2026, with their history;
+those two repos are archived, and nothing builds the components left in
+them.
 
 ### Layout
 

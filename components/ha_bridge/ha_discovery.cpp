@@ -20,7 +20,7 @@ namespace {
 constexpr unsigned kAccessState = 0b001;   // publishes (z2m access bits, as
 constexpr unsigned kAccessSet   = 0b010;   // zhc_adapter emits them)
 constexpr size_t   kPayloadCap  = 1536;   // a climate config is the longest
-constexpr const char* kSupportUrl = "https://github.com/zhac-project/zhac-platform";
+constexpr const char* kSupportUrl = "https://github.com/zhac-project/zhac-docs";   // issues + Discussions
 
 // Read-only numeric -> sensor device_class, only for the units Home Assistant
 // accepts with that class (a mismatch makes HA log a warning per update).

@@ -507,6 +507,15 @@ static void test_device_triggers() {
     CHECK(count_component("device_automation") == 0);
 }
 
+// Home Assistant shows origin.support_url as the integration's support link: it must lead to the repo that takes
+// ZHAC's issues (zhac-docs), not to an archived one.
+static void test_support_url() {
+    CHECK(build("hallway_motion", "Aqara", "RTCGQ11LM", R"([{"name":"occupancy","type":"binary","access":1}])") == 1);
+    const Entity* occ = get("zhac_00158d0007a1b2c3_occupancy");
+    const char* url = occ ? occ->cfg["origin"]["support_url"].as<const char*>() : nullptr;
+    CHECK(url && std::string(url) == "https://github.com/zhac-project/zhac-docs");
+}
+
 int main() {
     test_sensors_and_binary();
     test_climate();
@@ -518,6 +527,7 @@ int main() {
     test_topics_and_payloads();
     test_retain();
     test_device_triggers();
+    test_support_url();
     if (g_fail) { std::printf("%d check(s) failed\n", g_fail); return 1; }
     std::printf("ha_discovery: all checks passed\n");
     return 0;

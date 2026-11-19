@@ -22,6 +22,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme; zhac-wired-core's
 
 ### Changed
 
+- **Home Assistant's support link for ZHAC entities goes to zhac-docs** (`ha_bridge`, `origin.support_url` in every discovery payload): it named zhac-platform, which is archived and takes no issues.
 - **One log line per decoded frame** (`zhc_adapter`, research 2026-11-18 A13): "matched, 3 keys: temperature=21.5 humidity=40 battery=90", cut at 192 bytes. It was a line per key on the blocking 115200-baud console from TaskZigbee.
 
 ### Fixed
