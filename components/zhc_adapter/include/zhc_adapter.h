@@ -160,7 +160,8 @@ void zhac_adapter_register_seen(zhac_seen_fn_t fn);
 // sent nothing for 30 s after the ping: offline, once per silence; the frame
 // that ends it calls the seen callback above (research 2026-11-18 B7).
 void zhac_adapter_register_offline(zhac_seen_fn_t fn);
-// That device is offline now.
+// That device is offline now. Takes the meter lock, a leaf (nothing else is
+// locked under it), so a caller may hold the device pool lock.
 bool zhac_adapter_device_offline(uint64_t ieee);
 
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
