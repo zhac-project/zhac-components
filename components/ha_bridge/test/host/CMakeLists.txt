@@ -47,3 +47,16 @@ target_include_directories(ha_command_rx_host_test PRIVATE
 )
 target_compile_options(ha_command_rx_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME ha_command_rx COMMAND ha_command_rx_host_test)
+
+# The device availability topic's state machine (research 2026-11-18 B7): struct Published and the functions that
+# set it, cut out of ha_bridge.cpp at build time like the RX slice above.
+set(AV_SLICE ${CMAKE_CURRENT_BINARY_DIR}/availability.inc)
+add_custom_command(
+    OUTPUT ${AV_SLICE}
+    COMMAND sh -c "sed -n -e '/^struct Published {/,/^};/p' -e '/^void sync_availability(/,/^}/p' -e '/^void set_online(/,/^}/p' \"$0\" > \"$1\"" ${HA_BRIDGE_CPP} ${AV_SLICE}
+    DEPENDS ${HA_BRIDGE_CPP}
+    VERBATIM)
+add_executable(ha_availability_host_test test_availability.cpp ${AV_SLICE})
+target_include_directories(ha_availability_host_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_options(ha_availability_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME ha_availability COMMAND ha_availability_host_test)

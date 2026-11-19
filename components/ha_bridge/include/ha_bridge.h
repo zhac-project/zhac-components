@@ -25,8 +25,10 @@ struct HaDeviceSnapshot {
     const char* model;
     const char* exposes;   // JSON array, as zhac_adapter_build_exposes_json emits
     const char* attrs;     // JSON object of current values ({"temperature":21.4}), or null
-    bool        battery_powered;   // ZCL power source "battery"; such devices get their own
-                                   // availability topic and go "offline" after a day of silence
+    bool        battery_powered;   // ZCL power source "battery"; such devices go "offline"
+                                   // after a day of silence
+    bool        offline;           // mains: did not answer its availability ping
+                                   // (zhac_adapter_device_offline)
 };
 using HaDeviceCb = void (*)(const HaDeviceSnapshot& dev, void* ctx);
 
@@ -52,6 +54,9 @@ void        ha_bridge_configure(bool enabled, const char* prefix);
 // Device lifecycle, from the firmware's own event paths. Non-blocking.
 void ha_bridge_device_changed(uint64_t ieee);   // joined, renamed, re-interviewed
 void ha_bridge_device_removed(uint64_t ieee);
+// The availability ping's verdict for a mains device: false on DEVICE_OFFLINE,
+// true on DEVICE_SEEN. Sets <root>/devices/<IEEE>/availability.
+void ha_bridge_device_online(uint64_t ieee, bool online);
 
 // One attribute changed. `value_json` is a JSON scalar. Non-blocking; a
 // no-op while discovery is off or the broker is down.

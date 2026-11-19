@@ -39,11 +39,11 @@ constexpr int         kQueueDepth   = 24;
 constexpr uint32_t    kTaskStack    = 12288;
 // A battery device that has said nothing for this long is reported offline
 // (zigbee2mqtt's default for passive devices). Mains devices are never timed
-// out here: they only report on change, so silence proves nothing.
-// ponytail: a ZCL read "ping" would let mains devices go offline too.
+// out here: they only report on change, so silence proves nothing. The
+// availability ping decides for them (set_online).
 constexpr uint32_t    kPassiveSilenceS = 25 * 3600;
 
-enum class Op : uint8_t { RepublishAll, Device, Removed, Command, RetractAll };
+enum class Op : uint8_t { RepublishAll, Device, Removed, Command, RetractAll, Online, Offline };
 struct Msg {
     Op       op;
     uint64_t ieee;
@@ -148,13 +148,11 @@ void retract_device(uint64_t ieee) {
     if (!s) return;
     retract_topics(s->topics);
     clear_secret_state(ieee);
-    if (s->passive) {
-        // Clear the retained availability too, or HA keeps a stale value
-        // should the device ever be re-added under this address.
-        char topic[96];
-        if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), s->ieee) >= 0)
-            publish(topic, "", 1, true);
-    }
+    // Clear the retained availability too, or HA keeps a stale value
+    // should the device ever be re-added under this address.
+    char topic[96];
+    if (ha::device_availability_topic(topic, sizeof(topic), mqtt_gw_get_root_topic(), s->ieee) >= 0)
+        publish(topic, "", 1, true);
     free(s->topics);
     *s = Published{};
 }
@@ -194,6 +192,35 @@ void publish_availability(uint64_t ieee, bool online) {
     publish(topic, online ? "online" : "offline", 1, true);
 }
 
+// What a (re)published device's own availability topic says. Battery devices: assume alive on (re)publish, the
+// silence clock starts now; a device already timed out stays offline until it reports. Mains devices: the
+// availability ping's verdict (research 2026-11-18 B7).
+void sync_availability(Published& s, bool passive, bool ping_offline) {
+    s.passive = passive;
+    if (passive) {
+        if (!s.last_seen_s) s.last_seen_s = now_s();
+        s.offline = (now_s() - s.last_seen_s) > kPassiveSilenceS;
+    } else {
+        s.offline = ping_offline;
+    }
+    publish_availability(s.ieee, !s.offline);
+}
+
+// The availability ping's verdict, from DEVICE_OFFLINE / DEVICE_SEEN (research 2026-11-18 B7). A battery device keeps
+// its day-of-silence rule; an answer only restarts that clock.
+void set_online(uint64_t ieee, bool online) {
+    Published* s = slot_for(ieee, false);
+    if (!s) return;
+    if (s->passive) {
+        if (online) s->last_seen_s = now_s();
+        return;
+    }
+    if (s->offline == !online) return;   // says so already
+    s->offline = !online;
+    publish_availability(ieee, online);
+    ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)ieee, online ? "answered again: online" : "ping unanswered: offline");
+}
+
 void publish_device(const HaDeviceSnapshot& d, void*) {
     if (!s_enabled || !d.ieee) return;
     char bid[kPrefixCap];
@@ -211,14 +238,7 @@ void publish_device(const HaDeviceSnapshot& d, void*) {
     if (Published* s = slot_for(d.ieee, true)) {
         free(s->topics);
         s->topics  = col->len ? dup_str(col->buf) : nullptr;
-        s->passive = passive;
-        if (passive) {
-            // Assume alive on (re)publish; the silence clock starts now. A
-            // device already timed out stays offline until it reports.
-            if (!s->last_seen_s) s->last_seen_s = now_s();
-            s->offline = (now_s() - s->last_seen_s) > kPassiveSilenceS;
-            publish_availability(d.ieee, !s->offline);
-        }
+        sync_availability(*s, passive, d.offline);
     }
     free(col);
     if (ha::names_secret(d.exposes)) clear_secret_state(d.ieee);
@@ -289,6 +309,8 @@ void task(void*) {
                 case Op::RetractAll:   retract_all(); break;
                 case Op::Removed:      retract_device(m.ieee); break;
                 case Op::Command:      handle_command(m); break;
+                case Op::Online:       set_online(m.ieee, true); break;
+                case Op::Offline:      set_online(m.ieee, false); break;
                 case Op::Device:
                     if (s_enabled && s_plat && mqtt_gw_is_connected())
                         s_plat->get_device(m.ieee, publish_device, nullptr);
@@ -421,6 +443,10 @@ void ha_bridge_device_changed(uint64_t ieee) {
 
 void ha_bridge_device_removed(uint64_t ieee) {
     post(Op::Removed, ieee);
+}
+
+void ha_bridge_device_online(uint64_t ieee, bool online) {
+    if (s_enabled) post(online ? Op::Online : Op::Offline, ieee);
 }
 
 void ha_bridge_publish_state(uint64_t ieee, const char* key, const char* value_json) {
