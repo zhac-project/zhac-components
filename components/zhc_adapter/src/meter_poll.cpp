@@ -118,8 +118,9 @@ bool Scheduler::polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t i
 bool Scheduler::heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms) {
     Slot* s = ieee ? find(ieee) : nullptr;
     if (!s || !s->awake) return false;
-    // Pinged already, or due and still waiting for its turn.
-    const bool silence = s->backoff_x2 > 2 || static_cast<std::int32_t>(now_ms - s->ping_due_ms) >= 0;
+    // Offline, pinged already, or due and still waiting for its turn. Offline counts on its own: at the longest
+    // interval the backoff cannot grow, and a device back from offline must be reported (research 2026-11-18 B7).
+    const bool silence = s->offline || s->backoff_x2 > 2 || static_cast<std::int32_t>(now_ms - s->ping_due_ms) >= 0;
     s->waiting = s->offline = false;
     s->backoff_x2 = 2;
     s->ping_due_ms = now_ms + ping_wait(ieee, interval_ms, 2);

@@ -288,6 +288,18 @@ static void test_unanswered_ping_marks_offline() {
     assert(!s.offline(kPlug));
 }
 
+// A device back from offline always reports the end of its silence, also at the longest ping interval, where the
+// backoff cannot grow -- else it would stay offline in Home Assistant and on the hub page (research 2026-11-18 B7).
+static void test_back_from_offline_is_reported_at_the_longest_interval() {
+    Scheduler s;
+    add_awake(s, kPlug);
+    std::uint64_t out[4];
+    s.pinged(kPlug, 1000, kPingMaxMs);
+    assert(s.take_offline(1000 + kOfflineMs, out, 4) == 1);
+    assert(s.heard(kPlug, 1000 + kOfflineMs + 5000, kPingMaxMs));
+    assert(!s.offline(kPlug));
+}
+
 // heard() says true for the frame that ends a silence of a ping interval or
 // more (in practice the answer to a ping), so the hub can tell the cloud the
 // device's last_seen moved although no state changed. Once per silence.
@@ -345,6 +357,7 @@ int main() {
     test_unanswered_ping_warns_once();
     test_heard_reports_the_end_of_a_silence();
     test_unanswered_ping_marks_offline();
+    test_back_from_offline_is_reported_at_the_longest_interval();
     test_pings_go_one_per_tick();
     test_ping_wraparound();
     std::puts("meter_poll: all passed");
