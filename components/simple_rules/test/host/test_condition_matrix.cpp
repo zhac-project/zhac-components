@@ -85,6 +85,16 @@ static Event make_mqtt_event(const char* topic, const char* payload) {
     return ev;
 }
 
+static Event make_offline_event(uint64_t ieee) {
+    Event ev{};
+    ev.type = EventType::DEVICE_OFFLINE;
+    std::memcpy(ev.data, &ieee, sizeof(ieee));
+    return ev;
+}
+
+extern void stub_pool_reset(void);
+extern void stub_pool_seed(const ZapDevice* dev);
+
 // ── Parse + match helpers ──────────────────────────────────────────────────
 static bool parse_and_match(const char* dsl, const Event& ev) {
     ParsedRule rule{};
@@ -202,6 +212,35 @@ int main() {
     CHECK( parse_and_match("ON Mqtt#home/sun DO log m ENDON", make_mqtt_event("home/sun", "up")) &&
           !parse_and_match("ON Mqtt#home/sun DO log m ENDON", make_mqtt_event("home/moon", "up")),
           "Mqtt#<topic> matches by topic");
+
+    // ── 10b. Offline#<device>: a mains device stopped answering its availability ping (research 2026-11-18 B7) ─
+    {
+        const uint64_t A = 0x00124B0000000A01ULL, B = 0x00124B0000000B02ULL;
+        const char* rule = "ON Offline#0x00124B0000000A01 DO log m ENDON";
+        CHECK( parse_and_match(rule, make_offline_event(A)) && !parse_and_match(rule, make_offline_event(B)),
+              "Offline#<ieee> matches that device going offline");
+        CHECK(!parse_and_match(rule, make_attr_event("state", VAL_INT, 1, nullptr, A)),
+              "  an attribute report is not an Offline");
+        CHECK(!parse_and_match("ON 0x00124B0000000A01#state DO log m ENDON", make_offline_event(A)),
+              "  a device-attribute rule does not fire on Offline");
+        ParsedRule r{};
+        CHECK(dsl_parse("ON Offline#kitchen plug DO log m ENDON", 1, &r) == ParseResult::OK &&
+              r.trigger.type == TriggerType::DEVICE_OFFLINE && std::strcmp(r.trigger.device_name, "kitchen plug") == 0 &&
+              r.trigger.ieee == 0, "Offline#<name> parses to a device name");
+        char buf[64];
+        CHECK(!simple_rules_match(r, make_offline_event(A), buf, sizeof buf), "  inert while the name is unresolved");
+        ZapDevice d{};
+        d.ieee_addr = A;
+        std::strcpy(d.friendly_name, "kitchen plug");
+        stub_pool_reset();
+        stub_pool_seed(&d);
+        simple_rules_resolve_names(&r, 1);
+        CHECK(r.trigger.ieee == A && simple_rules_match(r, make_offline_event(A), buf, sizeof buf),
+              "  resolved by name like a device rule");
+        stub_pool_reset();
+        CHECK(!parse_ok("ON Offline#kitchen plug#state DO log m ENDON"), "Offline# takes a device, no #attr");
+        CHECK(!parse_ok("ON Offline# DO log m ENDON"), "Offline# needs a device");
+    }
 
     // MQTT payload is captured into event_val for the action layer.
     {

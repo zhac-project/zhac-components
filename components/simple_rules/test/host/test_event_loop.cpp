@@ -102,6 +102,19 @@ int main() {
     CHECK(!stub_queue_runaway(), "legitimate chain terminates");
     CHECK(fired3 == 2, "two-rule chain fires exactly twice (a then b)");
 
+    // ── Scenario 4: an Offline# rule fires from DEVICE_OFFLINE on the bus (research 2026-11-18 B7) ──
+    uint16_t off_id = 0;
+    CHECK(simple_rules_add("gone", "ON Offline#0x00124B0000000A01 DO event gone ENDON", &off_id),
+          "install an Offline# rule");
+    Event off{};
+    off.type = EventType::DEVICE_OFFLINE;
+    const uint64_t gone_ieee = 0x00124B0000000A01ULL;
+    memcpy(off.data, &gone_ieee, sizeof(gone_ieee));
+    stub_queue_set_receive_budget(kRunawayBudget);
+    event_bus_publish(off);
+    CHECK(event_bus_drain(EventType::DEVICE_OFFLINE, 0) == 1, "DEVICE_OFFLINE reaches the rule engine");
+    CHECK(drain_until_quiet() == 1, "  and the Offline# rule fires its action");
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

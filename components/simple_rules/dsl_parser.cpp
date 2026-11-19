@@ -127,8 +127,16 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
     // that as "match any attribute change on this device" and the script
     // hook receives the full event table so a Lua handler can inspect
     // `ev.key` / `ev.value` itself.
+    // Offline#<ref>: a mains device stopped answering its availability ping (research 2026-11-18 B7). The ref
+    // reads as below; there is no #<key>.
+    const bool offline = strncmp(s, "Offline#", 8) == 0;
+    if (offline) s += 8;
     const char* hash = strchr(s, '#');
-    t->type = TriggerType::DEVICE_ATTR;
+    if (offline && hash) {
+        dsl_set_err("Offline# takes a device only, no #attribute");
+        return ParseResult::ERR_BAD_TRIGGER;
+    }
+    t->type = offline ? TriggerType::DEVICE_OFFLINE : TriggerType::DEVICE_ATTR;
     char ref[64]{};
     size_t ref_len = hash ? (size_t)(hash - s) : strlen(s);
     // Trim trailing whitespace from the device ref when there's no `#`.

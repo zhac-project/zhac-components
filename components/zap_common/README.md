@@ -123,7 +123,7 @@ src_len(2)+trigger_type(1)+rule_type(1)+name(24)+src(500)+crc32(4)`.
 ```cpp
 enum class RuleType    : uint8_t { SIMPLE=0, LEGACY_RESERVED_1=1 /* was BERRY */ };
 enum class TriggerType : uint8_t { DEVICE_ATTR=1, TIME_CRON=2, EVENT=3,
-                                   BOOT=4, TIMER=5, MQTT_TOPIC=6 };
+                                   BOOT=4, TIMER=5, MQTT_TOPIC=6, DEVICE_OFFLINE=7 };
 static_assert(sizeof(RuleSlot) == 536);
 ```
 

@@ -341,6 +341,12 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
         if (t.lit_x100 && ze.val_type != VAL_FLOAT) reading *= 100;
         return compare_int(t.op, reading, t.int_val);
     }
+    case EventType::DEVICE_OFFLINE: {
+        if (t.type != TriggerType::DEVICE_OFFLINE) return false;
+        uint64_t ieee = 0;
+        std::memcpy(&ieee, ev.data, sizeof(ieee));
+        return t.ieee != 0 && t.ieee == ieee;   // an unresolved name is inert, as for DEVICE_ATTR (CODEX H-03)
+    }
     case EventType::CTRL_BOOT:
         return t.type == TriggerType::BOOT;
 
@@ -759,6 +765,10 @@ static void log_fire(const ParsedRule& r, const char* val, const Event* ev, bool
     const RuleTrigger& t = r.trigger;
     char what[112] = "";
     switch (t.type) {
+    case TriggerType::DEVICE_OFFLINE:
+        if (t.device_name[0]) snprintf(what, sizeof(what), "Offline#%s", t.device_name);
+        else snprintf(what, sizeof(what), "Offline#0x%016" PRIX64, t.ieee);
+        break;
     case TriggerType::DEVICE_ATTR: {
         char dev[sizeof(t.device_name) + 4];
         if (t.device_name[0]) snprintf(dev, sizeof(dev), "%s", t.device_name);
@@ -1018,6 +1028,7 @@ void simple_rules_init() {
     event_bus_subscribe(EventType::RULE_EVENT,      dispatch_event);
     event_bus_subscribe(EventType::RULE_TIMER_FIRE, dispatch_event, nullptr, sizeof s_timers / sizeof s_timers[0]);
     event_bus_subscribe(EventType::MQTT_MSG,        dispatch_event);
+    event_bus_subscribe(EventType::DEVICE_OFFLINE,  dispatch_event, nullptr, 4);   // at most 4 per ping tick
     // CODEX H-03: re-resolve friendly-name triggers when the device pool changes. The handler re-scans every rule
     // and reads nothing from the event, so one queued event covers any number of joins and leaves.
     event_bus_subscribe(EventType::DEVICE_JOIN,     on_pool_change, nullptr, 1);
@@ -1342,7 +1353,7 @@ void simple_rules_resolve_names(ParsedRule* rules, uint16_t count) {
     uint16_t   cnt  = pool_count();
     for (uint16_t i = 0; i < count; i++) {
         RuleTrigger& t = rules[i].trigger;
-        if (t.type != TriggerType::DEVICE_ATTR) continue;
+        if (t.type != TriggerType::DEVICE_ATTR && t.type != TriggerType::DEVICE_OFFLINE) continue;
         if (t.device_name[0] == '\0') continue;   // ieee literal — nothing to resolve
         // CODEX H-03: re-resolve by name on EVERY pass — do not skip an already
         // non-zero ieee. A device that was removed or re-paired with a new

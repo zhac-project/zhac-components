@@ -147,6 +147,7 @@ enum class TriggerType : uint8_t {
     BOOT        = 4,
     TIMER       = 5,
     MQTT_TOPIC  = 6,
+    DEVICE_OFFLINE = 7,   // Offline#<device>: a mains device stopped answering its availability ping
 };
 
 // Rule slot (536 bytes; bumped 2026-04-22 to add `name`).
