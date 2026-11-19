@@ -863,6 +863,8 @@ void fire_shadow_updates(std::uint64_t ieee,
             v.type == zhc::ValueType::Bool  ? v.b : false,
             v.type == zhc::ValueType::StringRef ? v.str : nullptr);
     }
+    // The keys above are one report: the bridge hands them to the shadow in one call (review 2026-11-19 P3 #1).
+    g_shadow_update(ieee, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);
 }
 
 // While a Tuya datapoint is unmapped, dispatch surfaces it as a raw `dp_<id>`

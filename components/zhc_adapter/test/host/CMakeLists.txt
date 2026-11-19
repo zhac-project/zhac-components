@@ -38,23 +38,31 @@ target_include_directories(tuya_mcu_host_test PRIVATE
 target_compile_options(tuya_mcu_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME tuya_mcu COMMAND tuya_mcu_host_test)
 
-# The availability ping's glue (research 2026-11-18 B7, review 2026-11-19 P3): zhac_adapter_try_decode, MeterLock,
-# ping_heard and ping_quiet_device cut out of zhc_adapter.cpp at build time, against the real meter_poll.cpp.
+# zhc_adapter.cpp's glue, cut out at build time against the real meter_poll.cpp: fire_shadow_updates (the shadow
+# bridge's report, review 2026-11-19 P3 #1) and the availability ping's zhac_adapter_try_decode, MeterLock,
+# ping_heard and ping_quiet_device (research 2026-11-18 B7, review P3 #3/#4). The DispatchResult type comes from
+# embedded-zhc ($EMBEDDED_ZHC_PATH, else the sibling checkout).
 set(ZHC_ADAPTER_CPP ${CMAKE_CURRENT_SOURCE_DIR}/../../src/zhc_adapter.cpp)
-set(PING_SLICE ${CMAKE_CURRENT_BINARY_DIR}/ping_glue.inc)
+if(DEFINED ENV{EMBEDDED_ZHC_PATH})
+    set(EZHC_INCLUDE $ENV{EMBEDDED_ZHC_PATH}/include)
+else()
+    set(EZHC_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../embedded-zhc/include)
+endif()
+set(GLUE_SLICE ${CMAKE_CURRENT_BINARY_DIR}/adapter_glue.inc)
 add_custom_command(
-    OUTPUT ${PING_SLICE}
-    COMMAND sh -c "sed -n -e '/^extern \"C\" bool zhac_adapter_try_decode(/,/^}/p' -e '/^struct MeterLock {/,/^};/p' -e '/^void ping_heard(uint64_t ieee) {/,/^}/p' -e '/^void ping_quiet_device(/,/^}/p' \"$0\" > \"$1\"" ${ZHC_ADAPTER_CPP} ${PING_SLICE}
+    OUTPUT ${GLUE_SLICE}
+    COMMAND sh -c "sed -n -e '/^void fire_shadow_updates(/,/^}/p' -e '/^extern \"C\" bool zhac_adapter_try_decode(/,/^}/p' -e '/^struct MeterLock {/,/^};/p' -e '/^void ping_heard(uint64_t ieee) {/,/^}/p' -e '/^void ping_quiet_device(/,/^}/p' \"$0\" > \"$1\"" ${ZHC_ADAPTER_CPP} ${GLUE_SLICE}
     DEPENDS ${ZHC_ADAPTER_CPP}
     VERBATIM)
-add_executable(ping_glue_host_test
-    test_ping_glue.cpp
-    ${PING_SLICE}
+add_executable(adapter_glue_host_test
+    test_adapter_glue.cpp
+    ${GLUE_SLICE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/meter_poll.cpp
 )
-target_include_directories(ping_glue_host_test PRIVATE
+target_include_directories(adapter_glue_host_test PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
-target_compile_options(ping_glue_host_test PRIVATE -Wall -Wextra -Werror)
-add_test(NAME ping_glue COMMAND ping_glue_host_test)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${EZHC_INCLUDE})
+target_compile_options(adapter_glue_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME adapter_glue COMMAND adapter_glue_host_test)

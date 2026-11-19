@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The availability ping's glue in zhc_adapter.cpp, cut out at build time (see CMakeLists.txt) and run against the
-// real scheduler (meter_poll.cpp): what counts as an answer, and when a ping is booked (research 2026-11-18 B7,
-// review 2026-11-19 P3 #3 and #4).
+// zhc_adapter.cpp's glue, cut out at build time (see CMakeLists.txt): how a decoded report reaches the shadow
+// bridge (review 2026-11-19 P3 #1), and, against the real scheduler (meter_poll.cpp), what answers the
+// availability ping and when a ping is booked (research 2026-11-18 B7, review P3 #3 and #4).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "meter_poll.hpp"
 #include "zhc_adapter.h"
+#include "zhc/runtime/dispatch.hpp"
 
 template <class... A> static void log_sink(const char*, A&&...) {}
 #define ESP_LOGW(tag, ...) log_sink(tag, __VA_ARGS__)
@@ -30,6 +33,7 @@ static std::uint32_t wake_now_ms() { return g_now; }
 static zhac_meter::Scheduler    g_meter;
 static zhac_seen_fn_t           g_seen_cb  = nullptr;
 static zhac_configure_read_fn_t g_cfg_read = nullptr;
+static zhac_shadow_update_fn_t  g_shadow_update = nullptr;
 
 // What the definition checks make of a frame from a device the hub has no definition for: nothing.
 static int  g_decoded = 0;
@@ -40,7 +44,7 @@ static bool decode_frame(uint64_t, const char*, const char*, uint16_t, uint16_t,
 }
 void ping_heard(uint64_t ieee);
 
-#include "ping_glue.inc"
+#include "adapter_glue.inc"
 
 static int g_fail = 0;
 static void expect(const char* what, bool ok) {
@@ -72,6 +76,13 @@ static bool answers_at_once(uint64_t ieee, uint16_t, uint8_t, uint16_t, const ui
     return true;
 }
 
+// The shadow bridge, for fire_shadow_updates.
+struct ShadowCall { std::uint64_t ieee; std::string key; std::uint8_t kind; };
+static std::vector<ShadowCall> g_shadow_calls;
+static void shadow_bridge(uint64_t ieee, const char* key, uint8_t kind, int64_t, uint64_t, float, bool, const char*) {
+    g_shadow_calls.push_back({ieee, key ? key : "", kind});
+}
+
 static std::uint64_t g_seen = 0;
 static void seen(uint64_t ieee) { g_seen = ieee; }
 
@@ -93,6 +104,20 @@ static std::size_t offline_after_wait(std::uint32_t ping_at) {
 
 int main() {
     g_seen_cb = seen;
+
+    // Review P3 #1: the bridge hands a report's keys to the shadow in one call at the report's end.
+    g_shadow_update = shadow_bridge;
+    zhc::DispatchResult r{};
+    zhc::Value v{};
+    v.type = zhc::ValueType::Uint;
+    v.u = 230;
+    r.merged.put("voltage", v);
+    v.u = 115;
+    r.merged.put("power", v);
+    fire_shadow_updates(kPlug, r);
+    expect("a report's keys go to the shadow bridge one per call, then the report's end",
+           g_shadow_calls.size() == 3 && g_shadow_calls[0].key == "voltage" && g_shadow_calls[1].key == "power" &&
+               g_shadow_calls[2].kind == ZHAC_SHADOW_KIND_REPORT_END && g_shadow_calls[2].ieee == kPlug);
 
     std::uint32_t at = pinged_with(nobody_answers);
     expect("a quiet mains device is pinged", g_sent == 1);

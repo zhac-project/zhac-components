@@ -176,9 +176,12 @@ void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk);
 // ── Shadow bridge ────────────────────────────────────────────────────
 //
 // After a successful decode the adapter invokes this hook once per
-// key/value in the output payload. Platform code (zigbee_mgr) resolves
-// the string key verbatim into a ZclAttribute, and feeds it into
-// device_shadow_process.
+// key/value in the output payload, then once with ZHAC_SHADOW_KIND_REPORT_END
+// (key null, value fields unused). The keys before an end are one report,
+// which the platform hands the shadow in one call, so the shadow's consumers
+// see one report (ZclAttrEvent.more) instead of one per key (review
+// 2026-11-19 P3 #1). Platform code (zigbee_mgr) resolves the string key
+// verbatim into a ZclAttribute, and feeds it into device_shadow_process.
 //
 // value_kind encoding mirrors zhc::ValueType — adapter users don't need
 // to pull in the C++ enum; values are: 1=Bool, 2=Uint, 3=Int, 4=Float,
@@ -186,6 +189,7 @@ void zhac_adapter_set_runtime_addr(uint64_t ieee, uint16_t nwk);
 // not applicable. ZHAC_SHADOW_KIND_REMOVE asks to forget `key` instead (a
 // raw `dp_<id>` the definition now decodes); the value fields are unused.
 #define ZHAC_SHADOW_KIND_REMOVE 0xFF
+#define ZHAC_SHADOW_KIND_REPORT_END 0xFE
 typedef void (*zhac_shadow_update_fn_t)(uint64_t ieee,
                                           const char* key,
                                           uint8_t value_kind,

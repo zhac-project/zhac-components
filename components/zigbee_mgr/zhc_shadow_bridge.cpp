@@ -15,6 +15,7 @@
 #include "zigbee_pool.h"
 #include "event_bus.h"
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include <cmath>
 #include <cstdint>
@@ -75,6 +76,27 @@ __attribute__((noinline)) void mirror_battery_pct(uint64_t ieee, const ZclAttrib
     if (ctx.changed) zap_store_mark_dirty(&ctx.snap, ZAP_PERSIST_LOW);
 }
 
+// One decoded report's keys, handed to the shadow in one call at the report's
+// end (ZHAC_SHADOW_KIND_REPORT_END), so the shadow publishes them as one report
+// (ZclAttrEvent.more) and mqtt_glue sends the device's full state once per
+// report, not once per value (review 2026-11-19 P3 #1). Only the radio task
+// decodes, so one buffer serves; a key for another device, a removal or a full
+// buffer first hands over what is held. PSRAM, like the shadow's own staging:
+// 32 x 84 B is too much for the radio task's stack (ZR-04). A report has at
+// most ZHC_FIXED_PAYLOAD_CAP (24) keys.
+namespace {
+constexpr uint8_t kReportMax = 32;
+struct PendingReport { uint64_t ieee; uint8_t count; ZclAttribute attrs[kReportMax]; };
+EXT_RAM_BSS_ATTR PendingReport s_report;
+
+void hand_over_report() {
+    if (s_report.count == 0) return;
+    const uint8_t n = s_report.count;
+    s_report.count = 0;
+    device_shadow_process_ieee(s_report.ieee, s_report.attrs, n);
+}
+}  // namespace
+
 extern "C" void zhc_shadow_update_cb(uint64_t ieee,
                                       const char* key,
                                       uint8_t value_kind,
@@ -83,10 +105,15 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
                                       float float_val,
                                       bool bool_val,
                                       const char* str_val) {
+    if (value_kind == ZHAC_SHADOW_KIND_REPORT_END) {
+        hand_over_report();
+        return;
+    }
     if (!key) return;
 
     // A raw `dp_<id>` the definition now decodes: forget the saved value.
     if (value_kind == ZHAC_SHADOW_KIND_REMOVE) {
+        hand_over_report();   // the keys before it first, in order
         device_shadow_remove_attr(ieee, key);
         return;
     }
@@ -159,7 +186,9 @@ extern "C" void zhc_shadow_update_cb(uint64_t ieee,
         device_shadow_set_occupancy_default(
             ieee, zhac_adapter_occupancy_timeout_default(id.model, id.manuf));
     }
-    device_shadow_process_ieee(ieee, &attr, 1);
+    if (s_report.count != 0 && (s_report.ieee != ieee || s_report.count == kReportMax)) hand_over_report();
+    s_report.ieee = ieee;
+    s_report.attrs[s_report.count++] = attr;
     if (std::strcmp(attr.key, "battery") == 0) mirror_battery_pct(ieee, attr);
 }
 

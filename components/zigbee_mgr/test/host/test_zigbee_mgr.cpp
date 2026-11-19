@@ -53,6 +53,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                              \
@@ -663,6 +664,12 @@ int main() {
         device_shadow_init();
         zhc_shadow_bridge_register();
         CHECK(g_stub_shadow_fn != nullptr, "shadow bridge registers its callback");
+        // zhc_adapter's contract: each decoded report ends with REPORT_END.
+        auto report = [](uint64_t ieee, const char* key, uint8_t kind, int64_t i, uint64_t u, float f, bool b,
+                         const char* str) {
+            g_stub_shadow_fn(ieee, key, kind, i, u, f, b, str);
+            g_stub_shadow_fn(ieee, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);
+        };
 
         const uint64_t kBatIeee = 0x2222000000000009ULL;
         ZapDevice* d = pool_add();
@@ -671,28 +678,28 @@ int main() {
         d->battery_pct = 0;
 
         // Uint decode: percent lands verbatim.
-        g_stub_shadow_fn(kBatIeee, "battery", 2 /*Uint*/, 0, 87, 0.0f, false, nullptr);
+        report(kBatIeee, "battery", 2 /*Uint*/, 0, 87, 0.0f, false, nullptr);
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 87,
               "uint battery=87 mirrors to battery_pct");
 
         // Float decode: the bridge stores value × 100, so it must divide back.
-        g_stub_shadow_fn(kBatIeee, "battery", 4 /*Float*/, 0, 0, 42.0f, false, nullptr);
+        report(kBatIeee, "battery", 4 /*Float*/, 0, 0, 42.0f, false, nullptr);
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 42,
               "float battery=42.0 unscales (NOT 4200)");
 
         // An unrelated key must not touch it.
-        g_stub_shadow_fn(kBatIeee, "voltage", 2 /*Uint*/, 0, 3000, 0.0f, false, nullptr);
+        report(kBatIeee, "voltage", 2 /*Uint*/, 0, 3000, 0.0f, false, nullptr);
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 42,
               "unrelated key leaves battery_pct alone");
 
         // Out-of-range input clamps rather than wrapping the uint16.
-        g_stub_shadow_fn(kBatIeee, "battery", 2 /*Uint*/, 0, 250, 0.0f, false, nullptr);
+        report(kBatIeee, "battery", 2 /*Uint*/, 0, 250, 0.0f, false, nullptr);
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
               "out-of-range battery clamps to 100");
 
         // Unknown device: must not crash or invent a pool entry.
         const uint16_t before = pool_count();
-        g_stub_shadow_fn(0xFEEDFACEULL, "battery", 2 /*Uint*/, 0, 50, 0.0f, false, nullptr);
+        report(0xFEEDFACEULL, "battery", 2 /*Uint*/, 0, 50, 0.0f, false, nullptr);
         CHECK(pool_count() == before, "battery for an unknown device adds no pool entry");
 
         // "No motion" default: an occupancy report carries the matched def's
@@ -703,7 +710,7 @@ int main() {
         pir->ieee_addr = kPirIeee;
         pir->nwk_addr  = 0x2014;
         std::snprintf(pir->model_id, sizeof(pir->model_id), "%s", "lumi.sensor_motion.aq2");
-        g_stub_shadow_fn(kPirIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
+        report(kPirIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
         CHECK(device_shadow_get_occupancy_timeout(kPirIeee) == 90,
               "an occupancy report passes the def's 90 s default to the shadow");
         const uint64_t kPlainIeee = 0x2222000000000015ULL;
@@ -711,26 +718,26 @@ int main() {
         plain->ieee_addr = kPlainIeee;
         plain->nwk_addr  = 0x2015;
         std::snprintf(plain->model_id, sizeof(plain->model_id), "%s", "TS0202");
-        g_stub_shadow_fn(kPlainIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
+        report(kPlainIeee, "occupancy", 1 /*Bool*/, 0, 0, 0.0f, true, nullptr);
         CHECK(device_shadow_get_occupancy_timeout(kPlainIeee) == 0,
               "a def without the option gets no interval (reports no-motion itself)");
 
         // A raw `dp_<id>` the definition now decodes: zhc_adapter sends
         // ZHAC_SHADOW_KIND_REMOVE and the saved value goes.
-        g_stub_shadow_fn(kBatIeee, "dp_20", 3 /*Int*/, 5, 0, 0.0f, false, nullptr);
+        report(kBatIeee, "dp_20", 3 /*Int*/, 5, 0, 0.0f, false, nullptr);
         ShadowAttr sa{};
         CHECK(device_shadow_get_attr(kBatIeee, "dp_20", &sa) && sa.int_val == 5, "raw dp_20 saved");
-        g_stub_shadow_fn(kBatIeee, "dp_20", ZHAC_SHADOW_KIND_REMOVE, 0, 0, 0.0f, false, nullptr);
+        report(kBatIeee, "dp_20", ZHAC_SHADOW_KIND_REMOVE, 0, 0, 0.0f, false, nullptr);
         CHECK(!device_shadow_get_attr(kBatIeee, "dp_20", &sa), "REMOVE kind drops the saved dp_20");
         CHECK(zigbee_pool_snapshot(kBatIeee, &snap) && snap.battery_pct == 100,
               "and leaves the device alone");
 
         // A float is stored ×100 to the nearest hundredth: 20.05f is 20.0499…,
         // which truncation stored as 2004 (shown 20.04).
-        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, 20.05f, false, nullptr);
+        report(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, 20.05f, false, nullptr);
         CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == 2005,
               "float 20.05 is stored as 2005, not 2004");
-        g_stub_shadow_fn(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, -5.05f, false, nullptr);
+        report(kBatIeee, "local_temperature", 4 /*Float*/, 0, 0, -5.05f, false, nullptr);
         CHECK(device_shadow_get_attr(kBatIeee, "local_temperature", &sa) && sa.int_val == -505,
               "float -5.05 is stored as -505");
     }
@@ -802,6 +809,44 @@ int main() {
         event_bus_unsubscribe(h2);
     }
 
+    // ── G16: a decoded report reaches the bus as one report (review 2026-11-19 P3 #1) ──
+    // zhc_adapter hands the bridge one key per call and closes the report with
+    // REPORT_END. The shadow must get the keys in one call: then every ZCL_ATTR
+    // event but the report's last says `more`, and mqtt_glue sends the device's
+    // full state once per report instead of once per value.
+    {
+        printf("\nG16 a decoded report is published as one report\n");
+        const uint64_t kPlugIeee = 0x2222000000000020ULL;
+        ZapDevice* plug = pool_add();
+        plug->ieee_addr = kPlugIeee;
+        plug->nwk_addr  = 0x2016;
+        std::vector<uint8_t> more;
+        const EventSubHandle h = event_bus_subscribe(EventType::ZCL_ATTR, [](const Event&) {},
+            [&more, kPlugIeee](const Event& e) {
+                ZclAttrEvent z;
+                memcpy(&z, e.data, sizeof(z));
+                if (z.ieee == kPlugIeee) more.push_back(z.more);
+                return true;
+            });
+        CHECK(h != EVENT_SUB_INVALID, "subscribe ZCL_ATTR");
+        g_stub_shadow_fn(kPlugIeee, "voltage", 2 /*Uint*/, 0, 230, 0.0f, false, nullptr);
+        g_stub_shadow_fn(kPlugIeee, "current", 4 /*Float*/, 0, 0, 0.5f, false, nullptr);
+        g_stub_shadow_fn(kPlugIeee, "power", 2 /*Uint*/, 0, 115, 0.0f, false, nullptr);
+        CHECK(more.empty(), "nothing is published before the report ends");
+        g_stub_shadow_fn(kPlugIeee, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);
+        CHECK(more == (std::vector<uint8_t>{1, 1, 0}), "the end publishes the three keys as one report");
+        ShadowAttr sa{};
+        CHECK(device_shadow_get_attr(kPlugIeee, "power", &sa) && sa.int_val == 115, "  and the shadow holds them");
+        more.clear();
+        g_stub_shadow_fn(kPlugIeee, "power", 2 /*Uint*/, 0, 120, 0.0f, false, nullptr);
+        g_stub_shadow_fn(kPlugIeee, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);
+        CHECK(more == (std::vector<uint8_t>{0}), "a one-key report is its own last");
+        more.clear();
+        g_stub_shadow_fn(kPlugIeee, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);
+        CHECK(more.empty(), "an end with no keys publishes nothing");
+        event_bus_unsubscribe(h);
+    }
+
     // ── G14: radio text is stored JSON-safe (review 2026-10-24 ZR-03) ───
     // A control byte in a model or manufacturer string reached every JSON
     // the hub writes raw (ArduinoJson escapes only a few), and one such
@@ -863,12 +908,14 @@ int main() {
         ZapDevice* pad = pool_add();
         pad->ieee_addr = kPad;
         g_stub_shadow_fn(kPad, "mode", 5 /*String*/, 0, 0, 0.0f, false, "12\x01" "4");
+        g_stub_shadow_fn(kPad, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);   // the report ends
         ShadowAttr sa{};
         CHECK(device_shadow_get_attr(kPad, "mode", &sa) && strcmp(sa.str_val, "12?4") == 0,
               "a decoded string value is stored with '?' for the control byte");
         // The one such value seen so far, a keypad's action_code, is the PIN
         // typed on it: published with its press, never kept (review ZR-06).
         g_stub_shadow_fn(kPad, "action_code", 5 /*String*/, 0, 0, 0.0f, false, "1234");
+        g_stub_shadow_fn(kPad, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);   // the report ends
         CHECK(!device_shadow_get_attr(kPad, "action_code", &sa), "a keypad code is not kept in the shadow");
         pool_clear();
     }
@@ -887,6 +934,7 @@ int main() {
         ir->ieee_addr = kIr;
         g_stub_shadow_fn(kIr, "temperature_unit", 5 /*String*/, 0, 0, 0.0f, false, "fahrenheit");
         g_stub_shadow_fn(kIr, "humidity", 2 /*Uint*/, 0, 40, 0.0f, false, nullptr);
+        g_stub_shadow_fn(kIr, nullptr, ZHAC_SHADOW_KIND_REPORT_END, 0, 0, 0.0f, false, nullptr);   // the report ends
         char out[48] = "x";
         CHECK(g_stub_state_text_fn && g_stub_state_text_fn(kIr, "temperature_unit", out, sizeof(out)) &&
               strcmp(out, "fahrenheit") == 0, "a kept text value is handed back");
