@@ -9,6 +9,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
 
 ### Added
 
+- **`zhac_adapter_unreachable(ieee)`** (`zhc_adapter`, research 2026-11-18 B1): the radio backend reports a mains device that neither a command nor an address lookup reached; it is offline at the next ping tick (`DEVICE_OFFLINE`, once per silence), and its next frame brings it back. Sleepy and unknown devices are ignored.
 - **Mains devices go offline when their availability ping goes unanswered** (`zhc_adapter`, `zhc_shadow_bridge`, `event_bus`, research 2026-11-18 B7). No frame within 30 s of a ping: `EventType::DEVICE_OFFLINE` (ieee at `data[0]`), once per silence; the next frame brings the device back (`DEVICE_SEEN`). Every frame counts as an answer, also one no definition decodes; a ping the radio did not send does not count. `zhac_adapter_register_offline()`, `zhac_adapter_device_offline()`. `EventType::_COUNT` is now 15.
 - **`Offline#<device>` rule trigger** (`simple_rules`, `zap_common` `TriggerType::DEVICE_OFFLINE = 7`, research B7): an IEEE or a friendly name, resolved like a device-attribute trigger.
 - **Home Assistant shows mains devices unavailable** (`ha_bridge`, research B7). Every entity lists the hub's and the device's own availability topic; `ha_bridge_device_online()` and `HaDeviceSnapshot.offline` drive a mains device's topic from the ping, and the bridge checks it against `HaBridgePlatform.device_offline` every second, so a lost event or a publish the broker did not take is repaired. Battery devices keep their day-of-silence rule.
