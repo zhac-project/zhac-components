@@ -46,7 +46,8 @@ bool lua_script_cache_delete(const char* name);
 bool lua_script_cache_exists(const char* name);
 
 // Enqueue a fresh coroutine invocation of the named script with an
-// empty trigger context. Used by the S3-side UI "Run" button via HAP.
+// empty trigger context. Used by the web UI's Run button (WS `script.run`,
+// REST POST /api/scripts/<name>/run).
 // Returns false when the script isn't present or the scheduler queue
 // is saturated.
 bool lua_engine_run_script(const char* name);

@@ -1,4 +1,4 @@
-# ws_server — WebSocket server (S3 only)
+# ws_server — WebSocket server
 
 Thin wrapper around ESP-IDF's `esp_http_server` that owns the boot of the
 on-device HTTP daemon, registers the `/ws` endpoint, and exposes a small
@@ -13,7 +13,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 
 ## Where it sits
 
-- **Chip:** ESP32-S3 only (P4 has no IP stack).
+- **Used by:** zhac-wired-core, on the ESP32-P4 and the ESP32-S31.
 - **Owns:** the singleton `httpd_handle_t` — `server_port=80`,
   `max_open_sockets=9` (LWIP cap 10, one reserved for listen),
   `max_uri_handlers=48`, `stack_size=12288` (the worst observed chain —
@@ -43,7 +43,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 | Symbol | Contract |
 |--------|----------|
 | `ws_server_init()` | Creates the fd-table mutex, starts httpd on :80, registers `/ws`, installs `close_fn`. Call exactly once. On `httpd_start` failure logs and returns; all other calls are then no-ops (`s_server == nullptr`). |
-| `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. Callable from any task: the send runs under `s_tx_mutex`, so concurrent callers take turns. On the dual-chip net-core the ws_bridge TX worker is the only caller (producers enqueue through `ws_bridge_broadcast_enqueue()` / `ws_event_broadcast()`, `main/s3_internal.h`); the wired and single-chip builds call it directly from the event bus, the status tick and the log sink. Snapshots the fd list under `s_mutex` and releases it; then, holding `s_tx_mutex`, re-checks each fd and sends with `httpd_ws_send_frame_async`. Returns before the lock when there is no recipient. **Never logs under either lock.** A failed fd is evicted quietly while `s_tx_mutex` is still held; its session close and the log lines follow the release (log-sink recursion guard). |
+| `ws_server_broadcast(json, len)` | Fan-out of one TEXT frame to every **authed** fd. Callable from any task: the send runs under `s_tx_mutex`, so concurrent callers take turns. zhac-wired-core calls it directly from the event bus, the status tick and the log sink. Snapshots the fd list under `s_mutex` and releases it; then, holding `s_tx_mutex`, re-checks each fd and sends with `httpd_ws_send_frame_async`. Returns before the lock when there is no recipient. **Never logs under either lock.** A failed fd is evicted quietly while `s_tx_mutex` is still held; its session close and the log lines follow the release (log-sink recursion guard). |
 | `ws_server_reply(fd, json, len)` | Point reply for command responses correlated by envelope `id`. Sentinel-fd fast path: a registered reply hook is invoked instead of httpd send. On send failure the fd **is evicted and its session closed** (evicted under the TX lock, `httpd_sess_trigger_close` after the release if that call removed it, then logged — same rule as broadcast). The send takes `s_tx_mutex` and sets the `s_broadcast_task` marker like the broadcast loop (both go through `send_locked()`), so a reply never interleaves with a broadcast on the socket; if the lock cannot be taken the reply is dropped and the fd is kept. |
 | `ws_server_get_handle()` | Underlying daemon handle for registering additional URIs. `nullptr` before init. |
 | `ws_server_set_rx_callback(cb)` | Installs the inbound text-frame callback (single slot, latest wins, `nullptr` detaches). |
@@ -85,16 +85,9 @@ token drop back to the auth-only command set.
 
 ## Broadcast TX contract
 
-`ws_server_broadcast` is serialised by `s_tx_mutex`, so any task may call it; the
-builds differ in who does:
+`ws_server_broadcast` is serialised by `s_tx_mutex`, so any task may call it:
 
-- **Dual-chip net-core:** the ONLY caller is the ws_bridge TX worker
-  (`ws_bridge_tx_init`). Producers enqueue via
-  `ws_bridge_broadcast_enqueue(json, len)` — copies the frame, never blocks,
-  **never logs** (log-pipeline-safe; queue-full/OOM drops are counted in
-  `ws_bridge_tx_drops()` and surfaced in `status.get`). See the contract
-  block in `main/s3_internal.h`.
-- **Wired and single-chip builds** call it directly from several tasks (event
+- **zhac-wired-core** calls it directly from several tasks (event
   bus, status tick, log sink), so the send runs under `s_tx_mutex`: a second
   task waits its turn (it used to trip a `configASSERT` and reboot the hub).
   A call from inside the send on the same task returns at once.
@@ -133,7 +126,7 @@ Lua uploads) is gone.
 
 - `s_mutex` protects only the fd table (`s_fds`, `s_fd_authed`,
   `s_fd_count`); never held across an httpd send, and never across an
-  `ESP_LOG*`: the wired and single-chip WS log sinks call `ws_server_broadcast`
+  `ESP_LOG*`: the hub's WS log sink calls `ws_server_broadcast`
   from inside the log call, which takes `s_mutex` again (a self-deadlock on this
   non-recursive mutex). `add_fd` / `remove_fd` collect what to log, unlock, then log.
 - `httpd_ws_send_frame_async` writes from the CALLING task, as two `send()`s
@@ -141,9 +134,8 @@ Lua uploads) is gone.
   caller and holds `s_tx_mutex` for every frame, broadcast fan-out and
   `ws_server_reply` alike, so two tasks can never interleave on a socket (an
   unlocked reply once did: the browser failed the connection, close 1006).
-  On the dual-chip net-core the fan-out order is decided in the TX worker's
-  queue; on wired/single-chip the producers (event bus, status tick, log sink)
-  race for `s_tx_mutex`, so their order is the order they win it.
+  The producers (event bus, status tick, log sink) race for `s_tx_mutex`, so
+  their order is the order they win it.
 - Lock order is `s_tx_mutex`, then `s_mutex`, never the reverse. A broadcast
   re-checks every recipient under `s_mutex` once it holds the TX lock (still in
   the table, and signed in when sign-in is on) and skips any that fails: its fd

@@ -1,4 +1,4 @@
-# lua_engine — Sandboxed Lua VM (P4)
+# lua_engine — Sandboxed Lua VM
 
 The project's single scripting runtime. PUC-Lua 5.5 vendored via the
 `georgik/lua` ESP-IDF managed component, wrapped in a custom
@@ -29,8 +29,8 @@ TaskLua (priority 4)            ◄── lua_engine_event_bridge ─◄ event_b
    └── esp_timer pool (zhac.sleep) ──► MSG_RESUME on s_resume_q
 ```
 
-P4 only. The S3 proxies REST `/scripts/*` over HAP but never hosts
-the VM. All call paths into Lua go through `s_resume_q` —
+Runs in zhac-wired-core, on the ESP32-P4 and the ESP32-S31. All call
+paths into Lua go through `s_resume_q` —
 `TaskLua` is the only task that ever touches `g_L`.
 
 ### Dependencies (`CMakeLists.txt` REQUIRES)

@@ -59,9 +59,9 @@ idf.py build
 
 ## Building / testing this repo standalone
 
-Most components are ESP-IDF-flavoured and cannot be built on host.
-CI runs a matrix of compile-only builds against ESP-IDF v6.0 on both
-`esp32p4` and `esp32s3` targets. See `.github/workflows/ci.yml`.
+Most components are ESP-IDF-flavoured and cannot be built on host. They
+build as part of zhac-wired-core (`idf.py build` there), whose CI builds them
+at the commit its `release-manifest.json` pins; this repo has no CI of its own.
 
 The `zap_common` + `metrics` modules have host-side unit tests:
 
