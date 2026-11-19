@@ -121,6 +121,9 @@ public:
     // Devices pinged kOfflineMs ago or more that sent nothing since: now
     // offline, each said once per silence; heard() brings one back.
     std::size_t take_offline(std::uint32_t now_ms, std::uint64_t* out, std::size_t max);
+    // The ping pinged() booked never left the hub (the radio refused it): no offline for it. The backoff stays, so
+    // the next ping comes a little later.
+    void not_sent(std::uint64_t ieee);
     bool offline(std::uint64_t ieee) const;
 
 private:

@@ -163,6 +163,10 @@ std::size_t Scheduler::take_offline(std::uint32_t now_ms, std::uint64_t* out, st
     return n;
 }
 
+void Scheduler::not_sent(std::uint64_t ieee) {
+    if (Slot* s = find(ieee)) s->waiting = false;
+}
+
 bool Scheduler::offline(std::uint64_t ieee) const {
     for (const auto& s : slots_) {
         if (s.ieee == ieee) return ieee && s.offline;

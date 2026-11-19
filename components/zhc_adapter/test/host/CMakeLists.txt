@@ -37,3 +37,24 @@ target_include_directories(tuya_mcu_host_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../zap_common/include)
 target_compile_options(tuya_mcu_host_test PRIVATE -Wall -Wextra -Werror)
 add_test(NAME tuya_mcu COMMAND tuya_mcu_host_test)
+
+# The availability ping's glue (research 2026-11-18 B7, review 2026-11-19 P3): zhac_adapter_try_decode, MeterLock,
+# ping_heard and ping_quiet_device cut out of zhc_adapter.cpp at build time, against the real meter_poll.cpp.
+set(ZHC_ADAPTER_CPP ${CMAKE_CURRENT_SOURCE_DIR}/../../src/zhc_adapter.cpp)
+set(PING_SLICE ${CMAKE_CURRENT_BINARY_DIR}/ping_glue.inc)
+add_custom_command(
+    OUTPUT ${PING_SLICE}
+    COMMAND sh -c "sed -n -e '/^extern \"C\" bool zhac_adapter_try_decode(/,/^}/p' -e '/^struct MeterLock {/,/^};/p' -e '/^void ping_heard(uint64_t ieee) {/,/^}/p' -e '/^void ping_quiet_device(/,/^}/p' \"$0\" > \"$1\"" ${ZHC_ADAPTER_CPP} ${PING_SLICE}
+    DEPENDS ${ZHC_ADAPTER_CPP}
+    VERBATIM)
+add_executable(ping_glue_host_test
+    test_ping_glue.cpp
+    ${PING_SLICE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/meter_poll.cpp
+)
+target_include_directories(ping_glue_host_test PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_compile_options(ping_glue_host_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME ping_glue COMMAND ping_glue_host_test)

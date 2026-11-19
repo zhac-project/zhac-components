@@ -1442,15 +1442,15 @@ extern "C" size_t zhac_adapter_build_exposes_json(uint64_t ieee,
     return pos;
 }
 
-extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
-                                         const char* model_id,
-                                         const char* manufacturer_name,
-                                         uint16_t group_id,
-                                         uint16_t cluster_id,
-                                         uint8_t src_endpoint,
-                                         uint8_t linkquality,
-                                         const uint8_t* zcl,
-                                         size_t zcl_len) {
+static bool decode_frame(uint64_t ieee,
+                         const char* model_id,
+                         const char* manufacturer_name,
+                         uint16_t group_id,
+                         uint16_t cluster_id,
+                         uint8_t src_endpoint,
+                         uint8_t linkquality,
+                         const uint8_t* zcl,
+                         size_t zcl_len) {
     _METRIC_TIMER_SCOPE(METRIC_ZHC_DECODE);
     _METRIC_COUNTER_INC(METRIC_ZB_RX_FRAMES_TOTAL, 1);
 
@@ -1680,6 +1680,17 @@ extern "C" bool zhac_adapter_try_decode(uint64_t ieee,
     return result.any_matched;
 }
 
+// Every frame from the device answers the availability ping, also one no definition decodes: a device without a
+// definition, or one decoded by the fallback, which the interview restores only after a reboot (review 2026-11-19
+// P3 #3). Heard first, so DEVICE_SEEN goes out before the frame's state.
+extern "C" bool zhac_adapter_try_decode(uint64_t ieee, const char* model_id, const char* manufacturer_name,
+                                         uint16_t group_id, uint16_t cluster_id, uint8_t src_endpoint,
+                                         uint8_t linkquality, const uint8_t* zcl, size_t zcl_len) {
+    ping_heard(ieee);
+    return decode_frame(ieee, model_id, manufacturer_name, group_id, cluster_id, src_endpoint, linkquality, zcl,
+                        zcl_len);
+}
+
 // ── Send path ────────────────────────────────────────────────────────
 
 namespace {
@@ -1716,7 +1727,6 @@ void wake_hold(uint64_t ieee, const char* key, bool query, uint8_t ep,
 }
 
 void wake_seen(uint64_t ieee, uint16_t nwk, const zhc::DispatchResult* result) {
-    ping_heard(ieee);
     if (!g_wake_mtx || !g_wake_task) return;
     if (xSemaphoreTake(g_wake_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
     const std::size_t due = g_wake.on_wake(ieee, nwk, wake_now_ms(), [result](const char* k) {
@@ -1790,6 +1800,32 @@ std::uint8_t meter_flags_for(const zhac_poll_device_t& d) {
              static_cast<unsigned long long>(d.ieee), d.model_id, d.manufacturer_name,
              static_cast<unsigned>(CONFIG_ZHAC_METER_POLL_S));
     return def->meter_poll;
+}
+
+// Availability: one ping per tick to a quiet device that stays awake, as
+// herdsman's Device.ping() (Basic zclVersion). Its answer is a frame like any
+// other: zhac_adapter_try_decode hears it (ping_heard) before decoding.
+void ping_quiet_device(std::uint32_t now) {
+    zhac_meter::Due p{};
+    bool missed = false;
+    {
+        MeterLock l;
+        if (!l.ok || g_meter.take_ping_due(now, &p, 1) == 0) return;
+        // Booked before it goes out: the answer can be handled before this task runs again (review 2026-11-19 P3 #4).
+        missed = g_meter.pinged(p.ieee, now, kPingIntervalMs);
+    }
+    static const std::uint8_t kZclVersion[2] = {0x00, 0x00};
+    const bool sent = g_cfg_read(p.ieee, p.nwk, p.ep, 0x0000, kZclVersion, 1, 0);
+    if (!sent) {
+        MeterLock l;   // the hub's miss, not the device's: no offline for it
+        if (l.ok) g_meter.not_sent(p.ieee);
+    }
+    if (missed) {
+        ESP_LOGW(TAG, "[ping] 0x%016llx did not answer its last ping -- pinging less often until it is heard",
+                 static_cast<unsigned long long>(p.ieee));
+    }
+    ESP_LOGD(TAG, "[ping] 0x%016llx quiet -- pinged ep %u%s", static_cast<unsigned long long>(p.ieee),
+             static_cast<unsigned>(p.ep), sent ? "" : " (not sent)");
 }
 
 void meter_tick() {
@@ -1875,27 +1911,7 @@ void meter_tick() {
         if (g_offline_cb) g_offline_cb(gone[i]);
     }
 
-    // Availability: one ping per tick to a quiet device that stays awake, as
-    // herdsman's Device.ping() (Basic zclVersion). Its answer decodes like any
-    // frame, which refreshes last_seen and, through wake_seen, ping_heard.
-    zhac_meter::Due p{};
-    {
-        MeterLock l;
-        if (!l.ok || g_meter.take_ping_due(now, &p, 1) == 0) return;
-    }
-    static const std::uint8_t kZclVersion[2] = {0x00, 0x00};
-    const bool sent = g_cfg_read(p.ieee, p.nwk, p.ep, 0x0000, kZclVersion, 1, 0);
-    bool missed = false;
-    {
-        MeterLock l;
-        if (l.ok) missed = g_meter.pinged(p.ieee, now, kPingIntervalMs);
-    }
-    if (missed) {
-        ESP_LOGW(TAG, "[ping] 0x%016llx did not answer its last ping -- pinging less often until it is heard",
-                 static_cast<unsigned long long>(p.ieee));
-    }
-    ESP_LOGD(TAG, "[ping] 0x%016llx quiet -- pinged ep %u%s", static_cast<unsigned long long>(p.ieee),
-             static_cast<unsigned>(p.ep), sent ? "" : " (not sent)");
+    ping_quiet_device(now);
 }
 
 void wake_task(void*) {
