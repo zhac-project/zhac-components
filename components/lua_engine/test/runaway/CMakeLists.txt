@@ -15,9 +15,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../lua_limits.cmake)   # LUAI_MAXCCALLS / MAXCCALLS
-set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../managed_components/georgik__lua CACHE PATH "georgik__lua")
+set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-wired-core/managed_components/georgik__lua CACHE PATH "georgik__lua")
 if(NOT EXISTS ${LUA_DIR}/lua/lapi.c)
-    message(FATAL_ERROR "Lua 5.5 sources not found at ${LUA_DIR}: configure zhac-main-core with IDF once "
+    message(FATAL_ERROR "Lua 5.5 sources not found at ${LUA_DIR}: configure zhac-wired-core with IDF once "
                         "(it downloads managed_components), or pass -DLUA_DIR=<georgik__lua>")
 endif()
 file(GLOB LUA_SRCS ${LUA_DIR}/lua/*.c)
@@ -27,7 +27,7 @@ target_include_directories(host_lua PUBLIC ${LUA_DIR}/include ${LUA_DIR}/lua)
 target_compile_definitions(host_lua PUBLIC CONFIG_LUA_MAXSTACK=1000000 PRIVATE LUA_USE_POSIX ${ZHAC_LUA_LIMIT_DEFS})
 target_compile_options(host_lua PRIVATE -w -O2)   # vendored code, as upstream ships it
 
-set(ZC ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components/components)
+set(ZC ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 # LU-02: link the REAL sandbox so the actual sandboxed_pcall/xpcall run.
 add_executable(lua_runaway_tests test_runaway.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/lua_sandbox.c)

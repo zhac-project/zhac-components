@@ -1,0 +1,4 @@
+## IDF Component Manager Manifest File
+# `lua` (PRIV_REQUIRES) comes from the registry, as for lua_engine.
+dependencies:
+  georgik/lua: "^5.5.0~7"

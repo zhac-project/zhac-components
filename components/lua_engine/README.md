@@ -214,5 +214,4 @@ end)
 - `components/simple_rules/README.md` — script hook caller
 - `components/event_bus/README.md` — events bridged into Lua
 - `components/cron_parser/README.md` — `zhac.on_cron` evaluator
-- `firmware/zhac-main-core/main/idf_component.yml` — `georgik/lua`
-  managed-component pin
+- `idf_component.yml` (here) — `georgik/lua` managed-component pin

@@ -1,11 +1,11 @@
 # zhac-components
 
-Shared ESP-IDF components consumed by both ZHAC firmware cores
-([zhac-main-core] on ESP32-P4, [zhac-net-core] on ESP32-S3). Ten
-first-party components plus one vendored third-party dependency.
+Shared ESP-IDF components of the ZHAC hub firmware, [zhac-wired-core]
+(ESP32-S31, or ESP32-P4 with an ESP32-C6 radio). `ws_server`, `remote_client`,
+`lua_engine` and `lua_cjson` came here, with their history, from the archived
+two-chip repos (zhac-net-core, zhac-main-core) in November 2026.
 
-[zhac-main-core]: https://github.com/zhac-project/zhac-main-core
-[zhac-net-core]:  https://github.com/zhac-project/zhac-net-core
+[zhac-wired-core]: https://github.com/zhac-project/zhac-wired-core
 
 Per-component `LICENSE` files and SPDX headers are authoritative.
 
@@ -26,6 +26,10 @@ Per-component `LICENSE` files and SPDX headers are authoritative.
 | `ntp_cfg`       | The hub's time server: the configured host (NVS `sys_cfg/ntp_server`) or the public default, and starting or restarting SNTP with it. | AGPL-3.0-or-later |
 | `device_cmd`    | The one device-command path (set attribute, rename, permit join, remove): pool snapshot under the lock, bool / integer / decimal / string to the converter, optimistic shadow mirror, one set of result words. Every transport calls it. | AGPL-3.0-or-later |
 | `ha_bridge`     | Home Assistant MQTT discovery: discovery configs from device exposes, per-attribute state topics, `…/set` commands. Pure builder host-tested. | AGPL-3.0-or-later |
+| `ws_server`     | The web server's WebSocket endpoint: auth, per-client send queue, broadcast to authed clients. Host-tested. | AGPL-3.0-or-later |
+| `remote_client` | The hub's outbound link to zhac-cloud: auth frame, reconnect backoff, the allow-list of commands the cloud may send. Host-tested. | AGPL-3.0-or-later |
+| `lua_engine`    | Lua 5.5 scripting: sandbox, allocator caps, scheduler, `zhac.*` module, script store. Needs `georgik/lua` (declared in its `idf_component.yml`). Host-tested. | AGPL-3.0-or-later |
+| `lua_cjson`     | Vendored openresty/lua-cjson 2.1.0.14 for Lua's `require "cjson"`. | MIT (vendored) |
 | `arduinojson`   | Vendored MIT header-only JSON library — upstream bblanchon/ArduinoJson. Used by `hap_json`. | MIT (vendored) |
 
 ## Consuming these components
@@ -43,11 +47,10 @@ dependencies:
   # ... repeat for each component you need
 ```
 
-### Via local path (for meta-repo builds)
+### Via local path
 
-If you're building from `zhac-platform`, its `justfile` sets
-`IDF_COMPONENT_OVERRIDE_PATH` so the manager uses the local checkout
-instead of fetching:
+zhac-wired-core finds a sibling checkout by itself (`../zhac-components/components`);
+`IDF_COMPONENT_OVERRIDE_PATH` points it anywhere else:
 
 ```sh
 export IDF_COMPONENT_OVERRIDE_PATH=$PWD/../zhac-components/components
@@ -85,8 +88,8 @@ third-party attribution.
 
 ## Versioning
 
-Releases tagged `vYYYYMMDDVV`. See `zhac-platform` README for the
-scheme.
+Releases tagged `vYYYYMMDDVV` (date + two-digit revision). zhac-wired-core's
+`release-manifest.json` pins the commit each firmware release builds against.
 
 ## Contributing
 

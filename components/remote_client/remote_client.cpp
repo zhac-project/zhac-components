@@ -42,7 +42,7 @@
 #include "ws_server.h"  // ws_server_register_reply_hook
 
 // Forward decl for the dispatcher exported by ws_bridge.cpp.
-// Defined in zhac-net-core/main/ws_bridge.cpp; the linker resolves the
+// Defined in the firmware's main/ws_bridge.cpp (zhac-wired-core); the linker resolves the
 // symbol because the main component (which links ws_bridge.cpp) is part
 // of the firmware image that pulls in remote_client. This decl avoids
 // a cross-component header reach into `main/` (components in IDF don't

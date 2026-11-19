@@ -15,7 +15,7 @@ project(lua_require_test C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../managed_components/georgik__lua CACHE PATH "georgik__lua")
+set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-wired-core/managed_components/georgik__lua CACHE PATH "georgik__lua")
 if(NOT EXISTS ${LUA_DIR}/lua/lapi.c)
     message(FATAL_ERROR "Lua sources not found at ${LUA_DIR}; pass -DLUA_DIR=<georgik__lua>")
 endif()

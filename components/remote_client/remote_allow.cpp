@@ -3,8 +3,8 @@
 //
 // Single source of truth for what the remote channel may touch.
 //
-// MAINTENANCE: when a new row is added to
-// zhac-net-core/main/api_routes.def, decide whether the remote
+// MAINTENANCE: when a command is added to the firmware's dispatcher
+// (zhac-wired-core main/ws_bridge.cpp), decide whether the remote
 // channel should expose it. If yes, add the cmd name to
 // kRemoteAllowedCmds[] below. If no, no change here — the cmd is
 // implicitly denied.

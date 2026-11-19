@@ -5,13 +5,13 @@
 #
 #   cmake -B build -S . [-DLUA_DIR=<georgik__lua>] && cmake --build build && ctest --test-dir build
 #
-# Lua from managed_components/georgik__lua (configure zhac-main-core with IDF
-# once, or point LUA_DIR at any checkout that has it). Run with PATH=/usr/bin
+# Lua from the sibling zhac-wired-core's managed_components/georgik__lua
+# (configure it with IDF once, or point LUA_DIR at any checkout that has it). Run with PATH=/usr/bin
 # first if ESP-IDF is active (its `as` breaks g++).
 cmake_minimum_required(VERSION 3.16)
 project(lua_cjson_cap_test C CXX)
 set(CMAKE_CXX_STANDARD 20)
-set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../managed_components/georgik__lua CACHE PATH "georgik__lua")
+set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-wired-core/managed_components/georgik__lua CACHE PATH "georgik__lua")
 if(NOT EXISTS ${LUA_DIR}/lua/lapi.c)
     message(FATAL_ERROR "Lua sources not found at ${LUA_DIR}; pass -DLUA_DIR=<georgik__lua>")
 endif()

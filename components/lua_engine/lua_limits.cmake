@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# The Lua C-stack limits (remote rules and scripts, final fix wave I-2(a), Option A). Every build that runs Lua
-# includes this after its idf_component_register(): zhac-main-core's lua_engine and the overrides that build its
-# sources (zhac-wired-core, zhac-mono-core). test/host includes it for the same values.
+# The Lua C-stack limits (remote rules and scripts, final fix wave I-2(a), Option A). lua_engine's CMakeLists
+# includes this after its idf_component_register(); test/host includes it for the same values.
 #
 # Lua bounds C recursion with one counter, so the limit has to fit the deepest frames a script can stack up.
 # Measured with -fstack-usage on the S31 / P4 builds (esp-15.2.0, -O2, stack protector): a counted level costs at

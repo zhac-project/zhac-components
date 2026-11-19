@@ -2,13 +2,14 @@
 
 All notable changes to `zhac-components` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versions follow the platform-wide `vYYYYMMDDVV` scheme tagged from
-`zhac-platform`.
+versions follow the platform-wide `vYYYYMMDDVV` scheme; zhac-wired-core's
+`release-manifest.json` pins the commit each firmware release uses.
 
 ## [Unreleased]
 
 ### Added
 
+- **`ws_server`, `remote_client`, `lua_engine`, `lua_cjson`** moved here from zhac-net-core (master a9a115c) and zhac-main-core (fw/p3-ha-mqtt 8777c00) with their history; those two repos are archived. `lua_engine` and `lua_cjson` now build on every target (they were P4-only) and declare `georgik/lua` in their own `idf_component.yml`. Their host tests find Lua in the sibling zhac-wired-core's `managed_components/` (or `-DLUA_DIR`).
 - **`zhac_adapter_unreachable(ieee)`** (`zhc_adapter`, research 2026-11-18 B1): the radio backend reports a mains device that neither a command nor an address lookup reached; it is offline at the next ping tick (`DEVICE_OFFLINE`, once per silence), and its next frame brings it back. Sleepy and unknown devices are ignored.
 - **Mains devices go offline when their availability ping goes unanswered** (`zhc_adapter`, `zhc_shadow_bridge`, `event_bus`, research 2026-11-18 B7). No frame within 30 s of a ping: `EventType::DEVICE_OFFLINE` (ieee at `data[0]`), once per silence; the next frame brings the device back (`DEVICE_SEEN`). Every frame counts as an answer, also one no definition decodes; a ping the radio did not send does not count. `zhac_adapter_register_offline()`, `zhac_adapter_device_offline()`. `EventType::_COUNT` is now 15.
 - **`Offline#<device>` rule trigger** (`simple_rules`, `zap_common` `TriggerType::DEVICE_OFFLINE = 7`, research B7): an IEEE or a friendly name, resolved like a device-attribute trigger.

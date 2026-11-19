@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# `lua` (REQUIRES above) comes from the registry. Declared here, not only in a firmware's main, because ESP-IDF resolves
+# the requirements of every component it discovers: any project that scans zhac-components needs it.
+dependencies:
+  georgik/lua: "^5.5.0~7"

@@ -6,9 +6,9 @@
 #
 #   cmake -B build -S . [-DLUA_DIR=<georgik__lua>] && cmake --build build && ctest --test-dir build
 #
-# Lua comes from managed_components/georgik__lua (configure zhac-main-core
-# with IDF once, or point LUA_DIR at any checkout that has it, e.g.
-# zhac-wired-core's). zcl_attribute.h comes from the sibling zhac-components.
+# Lua comes from the sibling zhac-wired-core's managed_components/georgik__lua
+# (configure it with IDF once, or point LUA_DIR at any checkout that has it).
+# zcl_attribute.h comes from zap_common next door.
 # Run with PATH=/usr/bin first if ESP-IDF is active (its `as` breaks g++).
 cmake_minimum_required(VERSION 3.16)
 project(lua_attr_value_test C CXX)
@@ -16,7 +16,7 @@ project(lua_attr_value_test C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../managed_components/georgik__lua CACHE PATH "georgik__lua")
+set(LUA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-wired-core/managed_components/georgik__lua CACHE PATH "georgik__lua")
 if(NOT EXISTS ${LUA_DIR}/lua/lapi.c)
     message(FATAL_ERROR "Lua sources not found at ${LUA_DIR}; pass -DLUA_DIR=<georgik__lua>")
 endif()
@@ -32,6 +32,6 @@ add_executable(attr_value_tests test_attr_value.cpp)
 target_compile_options(attr_value_tests PRIVATE -Wall -Wextra -Werror -fsanitize=address,undefined)
 target_link_options(attr_value_tests PRIVATE -fsanitize=address,undefined)
 target_include_directories(attr_value_tests PRIVATE ../../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../zhac-components/components/zap_common/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../zap_common/include)
 target_link_libraries(attr_value_tests PRIVATE host_lua m)
 add_test(NAME attr_value COMMAND attr_value_tests)
