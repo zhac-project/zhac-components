@@ -51,7 +51,7 @@ endif()
 set(GLUE_SLICE ${CMAKE_CURRENT_BINARY_DIR}/adapter_glue.inc)
 add_custom_command(
     OUTPUT ${GLUE_SLICE}
-    COMMAND sh -c "sed -n -e '/^void fire_shadow_updates(/,/^}/p' -e '/^extern \"C\" bool zhac_adapter_try_decode(/,/^}/p' -e '/^struct MeterLock {/,/^};/p' -e '/^void ping_heard(uint64_t ieee) {/,/^}/p' -e '/^void ping_quiet_device(/,/^}/p' \"$0\" > \"$1\"" ${ZHC_ADAPTER_CPP} ${GLUE_SLICE}
+    COMMAND sh -c "sed -n -e '/^void fire_shadow_updates(/,/^}/p' -e '/^extern \"C\" bool zhac_adapter_try_decode(/,/^}/p' -e '/^struct MeterLock {/,/^};/p' -e '/^void ping_heard(uint64_t ieee) {/,/^}/p' -e '/^void ping_quiet_device(/,/^}/p' -e '/^extern \"C\" void zhac_adapter_unreachable(/,/^}/p' \"$0\" > \"$1\"" ${ZHC_ADAPTER_CPP} ${GLUE_SLICE}
     DEPENDS ${ZHC_ADAPTER_CPP}
     VERBATIM)
 add_executable(adapter_glue_host_test

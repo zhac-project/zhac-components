@@ -164,6 +164,12 @@ void zhac_adapter_register_offline(zhac_seen_fn_t fn);
 // locked under it), so a caller may hold the device pool lock.
 bool zhac_adapter_device_offline(uint64_t ieee);
 
+// The backend could not deliver a frame to `ieee`, and nobody answered the
+// address lookup that followed (research 2026-11-18 B1): offline at the next
+// ping tick, as after an unanswered ping. Pinged (mains) devices only; safe to
+// call from the radio task (a short wait, a miss only delays the verdict).
+void zhac_adapter_unreachable(uint64_t ieee);
+
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame
 // before invoking `zhac_adapter_try_decode`. Required so fz

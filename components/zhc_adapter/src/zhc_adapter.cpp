@@ -2122,6 +2122,14 @@ extern "C" bool zhac_adapter_device_offline(uint64_t ieee) {
     return l.ok && g_meter.offline(ieee);
 }
 
+// From the radio task (the backend's address-lookup callback): a short wait, as ping_heard's.
+extern "C" void zhac_adapter_unreachable(uint64_t ieee) {
+    if (kPingIntervalMs == 0 || !g_meter_mtx) return;
+    if (xSemaphoreTake(g_meter_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    g_meter.unreachable(ieee, wake_now_ms());
+    xSemaphoreGive(g_meter_mtx);
+}
+
 extern "C" void zhac_adapter_register_seen(zhac_seen_fn_t fn) {
     g_seen_cb = fn;
 }

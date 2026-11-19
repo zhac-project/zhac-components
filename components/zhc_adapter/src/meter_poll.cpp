@@ -167,6 +167,13 @@ void Scheduler::not_sent(std::uint64_t ieee) {
     if (Slot* s = find(ieee)) s->waiting = false;
 }
 
+void Scheduler::unreachable(std::uint64_t ieee, std::uint32_t now_ms) {
+    Slot* s = ieee ? find(ieee) : nullptr;
+    if (!s || !s->awake || s->offline) return;
+    s->waiting = true;
+    s->ping_sent_ms = now_ms - kOfflineMs;   // as if pinged long enough ago
+}
+
 bool Scheduler::offline(std::uint64_t ieee) const {
     for (const auto& s : slots_) {
         if (s.ieee == ieee) return ieee && s.offline;

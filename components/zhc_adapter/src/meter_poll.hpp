@@ -124,6 +124,11 @@ public:
     // The ping pinged() booked never left the hub (the radio refused it): no offline for it. The backoff stays, so
     // the next ping comes a little later.
     void not_sent(std::uint64_t ieee);
+    // A frame the device took neither at its address nor after the address was
+    // looked up again, and nobody answered the lookup: as good as an unanswered
+    // ping, so offline at the next take_offline (once per silence). Pinged
+    // devices only, as for the ping.
+    void unreachable(std::uint64_t ieee, std::uint32_t now_ms);
     bool offline(std::uint64_t ieee) const;
 
 private:

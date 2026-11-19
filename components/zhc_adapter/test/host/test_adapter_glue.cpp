@@ -3,7 +3,8 @@
 //
 // zhc_adapter.cpp's glue, cut out at build time (see CMakeLists.txt): how a decoded report reaches the shadow
 // bridge (review 2026-11-19 P3 #1), and, against the real scheduler (meter_poll.cpp), what answers the
-// availability ping and when a ping is booked (research 2026-11-18 B7, review P3 #3 and #4).
+// availability ping and when a ping is booked (research 2026-11-18 B7, review P3 #3 and #4), and what a send nobody
+// took does to it (B1).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -141,6 +142,15 @@ int main() {
     expect("an answer handled before the ping is booked still counts", offline_after_wait(at) == 0);
     at = pinged_with(not_sent);
     expect("a ping the radio did not send does not count against the device", g_sent == 1 && offline_after_wait(at) == 0);
+
+    // Research B1: a frame nobody took, not even after the hub looked the address up again, and no answer to the lookup.
+    g_meter.forget(kPlug);
+    g_meter.add(kPlug, 0x1234, 0, 0, 60u * 1000u, true, 1, kPingIntervalMs);
+    g_now = 5000;
+    zhac_adapter_unreachable(kPlug);
+    std::uint64_t gone[4];
+    expect("a device nothing reaches, not even its address lookup, is offline at the next tick",
+           g_meter.take_offline(g_now, gone, 4) == 1 && gone[0] == kPlug);
 
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "passed", g_fail);
     return g_fail;
