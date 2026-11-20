@@ -2239,3 +2239,13 @@ extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t ieee, const char* model
     }
     return -1;
 }
+
+extern "C" bool zhac_adapter_key_is_state(uint64_t ieee, const char* model_id,
+                                          const char* manufacturer_name, const char* key) {
+    const zhc::PreparedDefinition* def = resolve_definition(ieee, model_id, manufacturer_name);
+    if (!def || !def->exposes || !key) return false;
+    for (std::uint8_t i = 0; i < def->exposes_count; ++i)
+        if (std::strcmp(def->exposes[i].name, key) == 0)
+            return def->exposes[i].access != zhc::Access::Set;
+    return false;
+}

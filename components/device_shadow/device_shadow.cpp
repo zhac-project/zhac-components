@@ -1145,8 +1145,10 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key,
 // The string twin of the above: same lock order (s_emit_mutex outermost, held
 // across stage + publish; s_mutex released before publish_staged), same
 // SHADOW_OPTIMISTIC emit, same find-only rule (an unknown device is a no-op).
-// only_reported_text: store only over a key the device itself reported as text.
-static void optimistic_str(uint64_t ieee, const char* key, const char* str_val, bool only_reported_text)
+// only_reported_text: store only over a key the device itself reported as
+// text, or over no key at all when `create`.
+static void optimistic_str(uint64_t ieee, const char* key, const char* str_val, bool only_reported_text,
+                           bool create)
 {
     if (!key || !str_val) return;
     xSemaphoreTake(s_emit_mutex, portMAX_DELAY);
@@ -1154,7 +1156,7 @@ static void optimistic_str(uint64_t ieee, const char* key, const char* str_val, 
     DeviceShadowEntry* e = find_entry(ieee);
     bool store = e != nullptr;
     if (e && only_reported_text) {
-        store = false;
+        store = create;
         for (uint8_t j = 0; j < e->attr_count; j++) {
             if (strncmp(e->attrs[j].key, key, ATTR_KEY_MAX) != 0) continue;
             store = e->attrs[j].val_type == VAL_STR;
@@ -1173,11 +1175,11 @@ static void optimistic_str(uint64_t ieee, const char* key, const char* str_val, 
 }
 
 void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* str_val) {
-    optimistic_str(ieee, key, str_val, false);
+    optimistic_str(ieee, key, str_val, false, true);
 }
 
-void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value) {
-    optimistic_str(ieee, key, value, true);
+void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value, bool create) {
+    optimistic_str(ieee, key, value, true, create);
 }
 
 uint8_t device_shadow_get_attrs(uint64_t ieee, ShadowAttr* out, uint8_t max_count) {

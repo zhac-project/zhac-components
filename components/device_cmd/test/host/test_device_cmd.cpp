@@ -64,6 +64,15 @@ int main() {
     CHECK(g_shadow.writes == 0 && g_shadow.str_writes == 0 && g_shadow.text_writes == 1 &&
           std::strcmp(g_shadow.text_val, "restore") == 0 && std::strcmp(g_shadow.text_key, "power_outage_memory") == 0,
           "string offered to the shadow as text");
+    CHECK(!g_shadow.text_create && std::strcmp(g_state_key_asked, "power_outage_memory") == 0,
+          "a key the definition does not expose as state is not created");
+
+    // a setting the light never reports (z2m STATE_SET, convertSet returns it as
+    // state): the shadow may create it, so the UI shows what was set
+    arm(); v = device_cmd_str("previous"); g_state_key = true;
+    CHECK(device_cmd_set_attr(IEEE, 0, "color_power_on_behavior", &v) == DEVCMD_OK &&
+          g_shadow.text_writes == 1 && g_shadow.text_create &&
+          std::strcmp(g_shadow.text_val, "previous") == 0, "a state setting is created in the shadow");
 
     // color_hex: refused before any send when it is not #rrggbb, or is black
     arm(); v = device_cmd_str("orange");

@@ -974,15 +974,20 @@ int main() {
         zcl_attr_set_int(&ta[1], "state", 1, VAL_BOOL);
         device_shadow_process(&td, ta, 2);
 
-        device_shadow_update_optimistic_text(T, "keep_time", "60");
+        device_shadow_update_optimistic_text(T, "keep_time", "60", false);
         ShadowAttr o{};
         CHECK(device_shadow_get_attr(T, "keep_time", &o) && o.val_type == VAL_STR &&
               strcmp(o.str_val, "60") == 0, "a text value the device reported takes the new text");
-        device_shadow_update_optimistic_text(T, "state", "ON");
+        device_shadow_update_optimistic_text(T, "state", "ON", true);
         CHECK(device_shadow_get_attr(T, "state", &o) && o.val_type == VAL_BOOL && o.int_val == 1,
-              "a non-text value is left alone");
-        device_shadow_update_optimistic_text(T, "mode", "auto");
+              "a non-text value is left alone, even for a state key");
+        device_shadow_update_optimistic_text(T, "mode", "auto", false);
         CHECK(!device_shadow_get_attr(T, "mode", &o), "a key the device never reported is not created");
+        // A setting the device keeps but never reports (a Tuya light's
+        // color_power_on_behavior): created when the definition says it is state.
+        device_shadow_update_optimistic_text(T, "color_power_on_behavior", "previous", true);
+        CHECK(device_shadow_get_attr(T, "color_power_on_behavior", &o) && o.val_type == VAL_STR &&
+              strcmp(o.str_val, "previous") == 0, "a state key never reported is created");
     }
 
     // ── G21 the saved blob holds what a restore needs, and only rewrites when it changed ──

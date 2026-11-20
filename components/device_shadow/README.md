@@ -45,7 +45,7 @@ frames and reads via REST/WS — it never imports this header.
 |---|---|
 | `void device_shadow_process(const ZapDevice* dev, const ZclAttribute* attrs, uint8_t count)` | Pipeline entry. Looks up / creates the `DeviceShadowEntry`, runs filter → debounce/throttle/occupancy → cache upsert → EventBus emit → NVS persist. Caller may pass any `count` ≤ 32; excess truncated. |
 | `void device_shadow_update_optimistic(uint64_t ieee, const char* key, uint8_t val_type, int32_t int_val)` | Cache update path used after a successful command send when `DeviceConfig.optimistic == true`. Bypasses the pipeline so the UI sees the new value before the device reports it. |
-| `void device_shadow_update_optimistic_str(uint64_t ieee, const char* key, const char* value)` | The text form, for a key the device already reported as text (an enum such as `keep_time`); otherwise a no-op, so UI text never replaces a number or creates a key. Publishes `SHADOW_OPTIMISTIC`. |
+| `void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value, bool create)` | The text form, for a key the device already reported as text (an enum such as `keep_time`), or a new key when `create` (a setting the definition exposes as state that the device never reports, such as a Tuya light's `color_power_on_behavior`); otherwise a no-op, so UI text never replaces a number. Publishes `SHADOW_OPTIMISTIC`. |
 
 ### Cache read
 

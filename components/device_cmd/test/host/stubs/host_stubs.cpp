@@ -30,6 +30,8 @@ const char* g_state_mode = "xy";
 int g_state_calls = 0;
 int32_t g_ct_sent = -1;
 double g_ct_asked = 0;
+bool g_state_key = false;
+char g_state_key_asked[32] = {};
 int64_t g_fake_time_us = 0;
 
 void stub_pool_set(uint64_t ieee, uint16_t nwk, uint8_t ep0, const char* model, const char* manu) {
@@ -47,6 +49,7 @@ void stub_reset() {
     g_send_result = true; g_radio_result = true; g_have_backend = false;
     g_colour_light = true; g_state_hex = "#45ff74"; g_state_mode = "xy"; g_state_calls = 0;
     g_ct_sent = -1; g_ct_asked = 0;
+    g_state_key = false; g_state_key_asked[0] = '\0';
 }
 bool stub_pool_removed_flag() { return s_have_dev && zap_dev_is_removed(&s_dev); }
 bool stub_pool_has_device()   { return s_have_dev; }
@@ -85,8 +88,8 @@ void device_shadow_update_optimistic(uint64_t ieee, const char* key, uint8_t val
     g_shadow.writes++; g_shadow.ieee = ieee; g_shadow.vt = val_type; g_shadow.val = val;
     std::snprintf(g_shadow.key, sizeof(g_shadow.key), "%s", key);
 }
-void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value) {
-    g_shadow.text_writes++; g_shadow.ieee = ieee;
+void device_shadow_update_optimistic_text(uint64_t ieee, const char* key, const char* value, bool create) {
+    g_shadow.text_writes++; g_shadow.ieee = ieee; g_shadow.text_create = create;
     std::snprintf(g_shadow.text_key, sizeof(g_shadow.text_key), "%s", key);
     std::snprintf(g_shadow.text_val, sizeof(g_shadow.text_val), "%s", value);
 }
@@ -107,6 +110,10 @@ extern "C" bool zhac_adapter_color_state(uint64_t, const char*, const char*, cha
 extern "C" int32_t zhac_adapter_color_temp_sent(uint64_t, const char*, const char*, double mireds) {
     g_ct_asked = mireds;
     return g_ct_sent;
+}
+extern "C" bool zhac_adapter_key_is_state(uint64_t, const char*, const char*, const char* key) {
+    std::snprintf(g_state_key_asked, sizeof(g_state_key_asked), "%s", key ? key : "");
+    return g_state_key;
 }
 
 // ── cut two: rename / permit join / remove ──────────────────────────────

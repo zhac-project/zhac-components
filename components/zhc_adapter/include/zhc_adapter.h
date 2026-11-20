@@ -394,6 +394,14 @@ int32_t zhac_adapter_color_temp_sent(uint64_t ieee,
                                      const char* manufacturer_name,
                                      double mireds);
 
+// True when the device's definition exposes `key` with a state (z2m STATE or
+// STATE_SET): the value is shown as the device's state, not as a write-only
+// command. device_cmd lets a text write create such a key in the shadow.
+bool zhac_adapter_key_is_state(uint64_t ieee,
+                               const char* model_id,
+                               const char* manufacturer_name,
+                               const char* key);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

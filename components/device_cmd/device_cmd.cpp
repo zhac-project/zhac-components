@@ -151,10 +151,14 @@ DevCmdResult device_cmd_set_attr(uint64_t ieee, uint8_t ep, const char* key, con
             else device_shadow_update_optimistic(ieee_cp, key, VAL_FLOAT, static_cast<int32_t>(std::lround(v->f * 100.0)));
             break;
         case DEVCMD_STR:
-            // Kept only for a key the device reported as text (an enum such
-            // as keep_time); other text waits for the device's report. A
-            // colour is mirrored below, as the light will report it.
-            if (!colour_suffix(key)) device_shadow_update_optimistic_text(ieee_cp, key, v->s);
+            // Kept for a key the device reported as text (an enum such as
+            // keep_time), and created for a setting its definition exposes as
+            // state (z2m STATE_SET: convertSet returns it as state), which a
+            // Tuya light never reports; other text waits for the device's
+            // report. A colour is mirrored below, as the light will report it.
+            if (!colour_suffix(key))
+                device_shadow_update_optimistic_text(ieee_cp, key, v->s,
+                    zhac_adapter_key_is_state(ieee_cp, model_cp, manu_cp, key));
             break;
     }
     if (white) mirror_str(ieee_cp, "color_mode", ct_sfx, "color_temp");
