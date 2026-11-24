@@ -43,6 +43,8 @@
 #include "zcl_attribute.h"
 #include "nvs.h"            // seed / read NVS blobs directly (in-memory stub)
 #include "esp_rom_crc.h"    // build valid on-disk CRCs (same fn device_shadow uses)
+#include "freertos/queue.h" // stub: g_stub_queue_receives ends a sweep
+#include "freertos/task.h"  // stub: g_stub_pinned_task is task_shadow
 
 #include <cstdio>
 #include <cstring>
@@ -200,6 +202,15 @@ static ShadowAttr make_attr(const char* key, uint8_t val_type, int32_t int_val, 
     a.int_val  = int_val;
     a.ts       = ts;
     return a;
+}
+
+// One pass of the REAL task_shadow sweep (device_shadow_init handed its entry to the task stub): its loop starts over
+// with a queue receive, which the stub then ends. The tick stays 0, so the sweep's wait never runs out: only a device
+// marked to be written now is written.
+static void run_one_sweep() {
+    g_stub_queue_receives = 1;
+    try { g_stub_pinned_task(nullptr); } catch (const StubStop&) {}
+    g_stub_queue_receives = -1;
 }
 
 int main() {
@@ -1094,6 +1105,31 @@ int main() {
         device_shadow_flush_now();
         CHECK(read_attr_blob(L, "action", &o) && !read_attr_blob(L, "action_code", &o),
               "and its blob is written again without it");
+    }
+
+    // ── G23 persist_soon: the next sweep writes the device, without the sweep's wait ──
+    // A value-only change waits up to NVS_VALUE_INTERVAL_S (30 min) for the sweep. The alarm panel seeds a door or a
+    // leak sensor from flash at boot, so a power cut in that time restored an "open" that had closed (review F1).
+    {
+        printf("\nG23 persist_soon\n");
+        nvs_stub_reset();
+        const uint64_t S = 0x0FC0ULL;
+        ZapDevice sd{};
+        sd.ieee_addr = S;
+        ZclAttribute sa[1]{};
+        zcl_attr_set_int(&sa[0], "contact", 0, VAL_BOOL);   // open
+        device_shadow_process(&sd, sa, 1);
+        device_shadow_flush_now();
+        zcl_attr_set_int(&sa[0], "contact", 1, VAL_BOOL);   // closed: a value-only change
+        device_shadow_process(&sd, sa, 1);
+        ShadowAttr o{};
+        run_one_sweep();
+        CHECK(read_attr_blob(S, "contact", &o) && o.int_val == 0, "a sweep keeps its wait: flash still says open");
+        device_shadow_persist_soon(S);
+        run_one_sweep();
+        CHECK(read_attr_blob(S, "contact", &o) && o.int_val == 1, "after persist_soon, the next sweep writes it");
+        device_shadow_persist_soon(0x0DEADULL);   // an unknown device: nothing to do
+        CHECK(!device_shadow_get_attr(0x0DEADULL, "contact", &o), "an unknown device is not created");
     }
 
     printf("\n%s — %d failure(s)\n", s_failures ? "FAILED" : "ALL PASS", s_failures);

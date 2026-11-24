@@ -11,13 +11,17 @@ static inline void xTaskNotifyGive(TaskHandle_t) {}
 static inline uint32_t ulTaskNotifyTake(BaseType_t, TickType_t) { return 0; }
 
 // device_shadow spawns task_shadow via xTaskCreatePinnedToCore. Like the
-// zap_store flush task, the shadow housekeeping task NEVER runs on the host —
-// its debounce/occupancy sweep and deferred NVS writes are timer/queue driven
-// and would loop forever. Returning pdPASS WITHOUT invoking the entry function
-// keeps the harness single-threaded and deterministic.
-static inline BaseType_t xTaskCreatePinnedToCore(void (*)(void*), const char*,
+// zap_store flush task, the shadow housekeeping task does not run on its own
+// on the host — its debounce/occupancy sweep and deferred NVS writes are
+// timer/queue driven and would loop forever. Returning pdPASS WITHOUT invoking
+// the entry function keeps the harness single-threaded and deterministic; the
+// entry function is kept, so a test can run one sweep of it (queue.h
+// g_stub_queue_receives ends the loop).
+inline void (*g_stub_pinned_task)(void*) = nullptr;
+static inline BaseType_t xTaskCreatePinnedToCore(void (*fn)(void*), const char*,
                                                  uint32_t, void*, UBaseType_t,
                                                  TaskHandle_t*, BaseType_t) {
+    g_stub_pinned_task = fn;
     return pdPASS;
 }
 

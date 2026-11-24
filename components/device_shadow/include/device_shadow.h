@@ -127,6 +127,13 @@ uint16_t device_shadow_restore_from_pool(ZapDevice* pool, uint16_t count);
 // context only.
 void device_shadow_flush_now();
 
+// Write this device's unsaved attrs at the next sweep (within SWEEP_PERIOD_MS),
+// without the wait above: for a value a restart must find as it is, such as a
+// door contact or a leak the alarm panel takes as its last known value. The
+// flag set_config uses (nvs_force); nothing unsaved or an unknown device: no-op.
+// Takes the shadow lock briefly; never waits on flash.
+void device_shadow_persist_soon(uint64_t ieee);
+
 // Called by zigbee_mgr / zhc_adapter_shadow_bridge to register a decoded
 // attribute against a device.
 void device_shadow_process(const ZapDevice* dev,

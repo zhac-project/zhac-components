@@ -33,6 +33,8 @@
 // nothing bigger: on wired and single-chip hubs it checks a long script over
 // REST, and on the dual-chip hub it does not check it as it is typed.
 #define WS_RX_MAX (32 * 1024)
+// The largest frame read into internal RAM when PSRAM is short (the cap before the 32 KB one).
+#define WS_RX_INTERNAL_MAX (8 * 1024)
 
 static const char*       TAG      = "ws_server";
 static httpd_handle_t    s_server = nullptr;
@@ -405,7 +407,10 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     if (pkt.len == 0) return ESP_OK;
     uint8_t* buf = static_cast<uint8_t*>(
         heap_caps_malloc(pkt.len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!buf) buf = static_cast<uint8_t*>(malloc(pkt.len + 1));
+    // PSRAM short: internal RAM stands in only for a frame of up to WS_RX_INTERNAL_MAX, the cap before the 32 KB
+    // one. A few frames of 32 KB from internal RAM would starve the radio and lwIP; a larger one fails its session.
+    if (!buf && pkt.len <= WS_RX_INTERNAL_MAX)
+        buf = static_cast<uint8_t*>(heap_caps_malloc(pkt.len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!buf) return ESP_ERR_NO_MEM;
     pkt.payload = buf;
     ret = httpd_ws_recv_frame(req, &pkt, pkt.len);
@@ -476,8 +481,9 @@ static ReqClock* clock_of(int fd, bool add) {
 
 // Review 2026-10-28 R-04: a WebSocket frame gets the same deadline, from the
 // start of its read in ws_handler to its end. The exemption above let a client
-// trickle a byte per receive timeout through a whole 8 KB frame (about 7 h) with
-// the httpd task held, and the sign-in sweep's close only queued behind it.
+// trickle a byte per receive timeout through a whole frame (8 KB then, about
+// 7 h; WS_RX_MAX, 32 KB, would be more than a day) with the httpd task held,
+// and the sign-in sweep's close only queued behind it.
 static void ws_frame_clock(int fd, bool start) {
     if (ReqClock* c = clock_of(fd, start)) c->frame_us = start ? esp_timer_get_time() : 0;
 }

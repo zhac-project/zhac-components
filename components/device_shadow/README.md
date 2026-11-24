@@ -70,6 +70,7 @@ frames and reads via REST/WS — it never imports this header.
 | Symbol | Notes |
 |---|---|
 | `void device_shadow_clear_attrs(uint64_t ieee)` | Wipes the cached attrs **and** the NVS blob — used when a device rejoins. |
+| `void device_shadow_persist_soon(uint64_t ieee)` | The device's unsaved attrs go to flash at the next sweep (within `SWEEP_PERIOD_MS`) instead of after the sweep's wait (5 min after a new key, 30 min when only values changed): sets `nvs_force` on a dirty entry, as `set_config` does. For a value a restart must find as it is: the wired hub's alarm panel calls it when a door contact or a hazard of one of its sensors changes, because it takes those last values as its start after a power cut. No-op when nothing is unsaved or the device is unknown; never waits on flash. |
 
 ### Pipeline internals (extern "C" for tests)
 

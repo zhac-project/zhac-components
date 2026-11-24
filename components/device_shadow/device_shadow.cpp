@@ -1073,6 +1073,14 @@ void device_shadow_flush_now() {
     if (written) ESP_LOGI(TAG, "flush_now: %u device(s) written", written);
 }
 
+void device_shadow_persist_soon(uint64_t ieee) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    // As set_config does: the next sweep writes a dirty entry regardless of its wait.
+    if (DeviceShadowEntry* e = find_entry(ieee); e && e->nvs_dirty) e->nvs_force = true;
+    xSemaphoreGive(s_mutex);
+}
+
 void device_shadow_process(const ZapDevice* dev,
                            const ZclAttribute* attrs, uint8_t count)
 {

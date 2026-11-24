@@ -8,6 +8,7 @@
 //     and a full table closes the oldest unsigned socket to admit a new one.
 // A fresh process, so the client table starts empty.
 #include "ws_server.h"
+#include "esp_heap_caps.h"     // g_psram_full, g_internal_allocs
 #include "esp_timer.h"
 #include "freertos/semphr.h"   // t_nheld: the locks this thread holds
 
@@ -119,6 +120,26 @@ int main() {
           "a frame over 32 KB fails its session (httpd closes it) and leaves the client table");
     g_ws_frame_len = 0;
     g_close_fn(nullptr, 110);
+    // A frame's buffer comes from PSRAM. With PSRAM short, internal RAM stands in only for a frame of at most
+    // 8 KB, the cap before the 32 KB one: four 32 KB frames would take what the radio and lwIP need (review F11, C1).
+    add_client(112);
+    httpd_req_t f112{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(112))};
+    g_psram_full = true;
+    g_internal_allocs = 0;
+    s_rx_len = 0;
+    g_ws_frame_len = 32 * 1024;
+    CHECK(g_ws_uri->handler(&f112) == ESP_ERR_NO_MEM && s_rx_len == 0 && g_internal_allocs == 0,
+          "PSRAM full: a 32 KB frame is refused, and takes no internal RAM");
+    g_ws_frame_len = 8 * 1024;   // the refused frame's payload was never read; httpd ends that session
+    CHECK(g_ws_uri->handler(&f112) == ESP_OK && s_rx_len == 8 * 1024 && g_internal_allocs == 1,
+          "PSRAM full: a frame of 8 KB still falls back to internal RAM");
+    g_ws_frame_len = 8 * 1024 + 1;
+    s_rx_len = 0;
+    CHECK(g_ws_uri->handler(&f112) == ESP_ERR_NO_MEM && s_rx_len == 0 && g_internal_allocs == 1,
+          "PSRAM full: one byte more is refused");
+    g_ws_frame_len = 0;
+    g_psram_full = false;
+    g_close_fn(nullptr, 112);
     // Every frame that reaches the handler is read to its end: binary frames,
     // continuations and (IDF 6.1) PONGs too. Only text is handed on.
     add_client(111);

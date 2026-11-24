@@ -118,7 +118,8 @@ token drop back to the auth-only command set.
 
 Text frames only. The handler probes the frame length (`max_len=0`),
 enforces `WS_RX_MAX`, then reads into a right-sized **PSRAM** buffer
-(`MALLOC_CAP_SPIRAM`, internal-heap fallback), NUL-terminates and invokes
+(`MALLOC_CAP_SPIRAM`; internal RAM stands in only for a frame of at most
+`WS_RX_INTERNAL_MAX`, 8 KB, when PSRAM is short), NUL-terminates and invokes
 the RX callback. The old fixed 256-byte stack buffer (truncated rule DSL /
 Lua uploads) is gone.
 
@@ -172,7 +173,7 @@ Lua uploads) is gone.
 | Send failure (reply) | Same order: evicted under the TX lock, then closed (only if this call removed it), then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
 | Send lock not taken | The frame is dropped; the fd is healthy, so it is neither evicted nor closed. |
 | Inbound frame > 32 KB | `ws frame %u B exceeds cap %u — closing the session`; httpd closes that session. |
-| Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd. |
+| Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd, which ends the session: PSRAM full and the frame over 8 KB (no internal fallback), or no RAM at all. |
 | `httpd_ws_recv_frame` error | fd removed, error returned to httpd (session torn down → `close_fn`). |
 | `httpd_start` failure | logged; component stays inert. |
 
