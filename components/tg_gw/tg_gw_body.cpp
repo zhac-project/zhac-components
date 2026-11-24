@@ -93,3 +93,7 @@ int tg_build_body(const char* text, const char* chat, const char* pm, char* out,
     if (m < 0 || static_cast<size_t>(m) >= cap - n) return -1;
     return n + m;
 }
+
+bool tg_send_retry(bool answered, int status) {
+    return !answered || status == 429 || status >= 500;
+}

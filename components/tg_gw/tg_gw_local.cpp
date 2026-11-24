@@ -34,6 +34,8 @@ constexpr const char* kNs = "zhac";
 constexpr const char* kKeyToken = "tg_token";
 constexpr const char* kKeyChat = "tg_chat";
 constexpr size_t kBodyMax = 3500;
+constexpr int kRetries = 20;          // a send that got no answer, 429 or 5xx: 10 minutes in all
+constexpr uint32_t kRetryMs = 30000;
 constexpr UBaseType_t kQueueDepth = 4;
 
 struct Job {
@@ -74,7 +76,8 @@ const char* why(int status) {
     }
 }
 
-void post(const Job& j) {
+// True when the send is worth trying again (tg_send_retry).
+bool post(const Job& j) {
     char url[48 + TG_TOKEN_MAX];
     xSemaphoreTake(s_mu, portMAX_DELAY);
     std::snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", s_token);
@@ -89,7 +92,7 @@ void post(const Job& j) {
     cfg.buffer_size = 1024;
     cfg.buffer_size_tx = 1024;
     esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-    if (!cl) { ESP_LOGW(TAG, "send: no memory for the HTTPS client"); return; }
+    if (!cl) { ESP_LOGW(TAG, "send: no memory for the HTTPS client"); return false; }
     esp_http_client_set_header(cl, "Content-Type", "application/json");
     esp_http_client_set_post_field(cl, j.body, j.len);
     const esp_err_t e = esp_http_client_perform(cl);
@@ -98,13 +101,16 @@ void post(const Job& j) {
     if (e != ESP_OK) ESP_LOGW(TAG, "send failed: %s", esp_err_to_name(e));
     else if (status / 100 != 2) ESP_LOGW(TAG, "send: HTTP %d, %s", status, why(status));
     else ESP_LOGI(TAG, "sent (%d B)", j.len);
+    return status / 100 != 2 && tg_send_retry(e == ESP_OK, status);
 }
 
 void worker(void*) {
     for (;;) {
         Job* j = nullptr;
         if (xQueueReceive(s_q, &j, portMAX_DELAY) != pdTRUE) continue;
-        post(*j);
+        // A message the network could not take yet (no link, a router still booting after a power
+        // cut) is tried again every 30 s for 10 minutes; later messages wait behind it.
+        for (int i = 0; post(*j) && i < kRetries; i++) vTaskDelay(pdMS_TO_TICKS(kRetryMs));
         heap_caps_free(j);
     }
 }

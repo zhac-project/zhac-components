@@ -21,3 +21,8 @@ bool tg_chat_ok(const char* chat);
 // chat is not valid, parse_mode is not Markdown / MarkdownV2 / HTML (null or "" = none), or
 // the body does not fit. Text over TG_TEXT_ESC_MAX escaped bytes is cut on a UTF-8 boundary.
 int tg_build_body(const char* text, const char* chat, const char* parse_mode, char* out, size_t cap);
+
+// Is a failed send worth trying again? `answered` is false when the request got no HTTP answer (no
+// network, DNS, TLS, a timeout); then `status` is ignored. 429 and 5xx are tried again too; any other
+// answer is final (a bad token or chat stays bad).
+bool tg_send_retry(bool answered, int status);

@@ -74,6 +74,17 @@ int main() {
         CHECK(b.substr(b.size() - 2) == "\"}");
     }
 
+    // A send that got no answer (no network, DNS, TLS, a timeout), 429 and 5xx are tried again;
+    // any other answer is final (a bad token or chat stays bad).
+    CHECK(tg_send_retry(false, 0));
+    CHECK(tg_send_retry(true, 429));
+    CHECK(tg_send_retry(true, 500));
+    CHECK(tg_send_retry(true, 502));
+    CHECK(!tg_send_retry(true, 200));
+    CHECK(!tg_send_retry(true, 400));
+    CHECK(!tg_send_retry(true, 401));
+    CHECK(!tg_send_retry(true, 403));
+
     if (s_failures) { std::printf("test_tg_gw_body: %d failure(s)\n", s_failures); return 1; }
     std::printf("test_tg_gw_body: all passed\n");
     return 0;
