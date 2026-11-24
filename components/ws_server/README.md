@@ -60,7 +60,7 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 |--------|-------|-----|
 | `MAX_WS_CLIENTS` | 3 | Hard cap on concurrent WS sockets. **Table full → `httpd_sess_trigger_close(fd)`** — a slot-less socket would be a half-functional zombie (accepts commands, never sees a broadcast). |
 | `WS_SEND_TIMEOUT_S` | 3 s | `SO_SNDTIMEO` set on every WS socket when it is registered (handshake, or first data frame). httpd's own `send_wait_timeout` (10 s) stays for the plain HTTP part. A WS frame is two `send()`s, so a dead peer stalls a sender for this long while it holds `s_tx_mutex`; a LAN client drains the send buffer in milliseconds. |
-| `WS_RX_MAX` | 8 KB | DS10: cap on an inbound text frame (covers rule DSL + `script.check` Lua source). Larger frames are logged and dropped — no huge forced allocation. |
+| `WS_RX_MAX` | 32 KB | DS10: cap on an inbound frame, so that no client can force a huge allocation. 32 KB because the hub page saves the whole Safety config in one frame (`alarm.config.set`): about 22 KB for the largest config its limits allow (8 KB until 2026-11; rule DSL and a `script.check` Lua source are far below). A larger frame is logged and its session is closed. |
 | Token length | exactly 32 chars | Constant-time XOR-accumulate compare, no short-circuit. |
 
 ## Auth (F18 — first-message auth)
@@ -171,7 +171,7 @@ Lua uploads) is gone.
 | Send failure (broadcast) | fd evicted while `s_tx_mutex` is still held (so a waiting broadcaster's re-check no longer finds it), then — after the release — its session closed (`httpd_sess_trigger_close`), `WS client removed`, and `ws_broadcast: send failed fd=%d err=%d (removed)`. The close is requested only by the call that actually removed the fd: a second failure for an fd that is already gone (a sender with an older fd snapshot) closes nothing, because httpd queues closes by session pointer. |
 | Send failure (reply) | Same order: evicted under the TX lock, then closed (only if this call removed it), then `ws_reply: send failed fd=%d err=%d (removed)`. Without the close the socket stayed open and the browser's next frame re-adopted it unauthenticated (`ensure_fd`): every command answered `auth required` until reload. Now the page reconnects and signs in again. |
 | Send lock not taken | The frame is dropped; the fd is healthy, so it is neither evicted nor closed. |
-| Inbound frame > 8 KB | `ws frame %u B exceeds cap %u — dropped`; connection stays up. |
+| Inbound frame > 32 KB | `ws frame %u B exceeds cap %u — closing the session`; httpd closes that session. |
 | Frame buffer OOM | `ESP_ERR_NO_MEM` returned to httpd. |
 | `httpd_ws_recv_frame` error | fd removed, error returned to httpd (session torn down → `close_fn`). |
 | `httpd_start` failure | logged; component stays inert. |

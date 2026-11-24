@@ -110,13 +110,13 @@ int main() {
     ws_server_set_rx_callback([](int, const char*, size_t len) { s_rx_len = len; });
     add_client(110);
     httpd_req_t f110{HTTP_DELETE, reinterpret_cast<void*>(static_cast<intptr_t>(110))};
-    g_ws_frame_len = 8 * 1024;
-    CHECK(g_ws_uri->handler(&f110) == ESP_OK && s_rx_len == 8 * 1024, "a frame of 8 KB is read and handed on");
+    g_ws_frame_len = 32 * 1024;
+    CHECK(g_ws_uri->handler(&f110) == ESP_OK && s_rx_len == 32 * 1024, "a frame of 32 KB is read and handed on");
     const int before = ws_server_client_count();
     s_rx_len = 0;
-    g_ws_frame_len = 8 * 1024 + 1;
+    g_ws_frame_len = 32 * 1024 + 1;
     CHECK(g_ws_uri->handler(&f110) == ESP_FAIL && s_rx_len == 0 && ws_server_client_count() == before - 1,
-          "a frame over 8 KB fails its session (httpd closes it) and leaves the client table");
+          "a frame over 32 KB fails its session (httpd closes it) and leaves the client table");
     g_ws_frame_len = 0;
     g_close_fn(nullptr, 110);
     // Every frame that reaches the handler is read to its end: binary frames,
@@ -131,16 +131,16 @@ int main() {
               "a binary, continuation or PONG frame is read away, not handed on");
     }
     g_ws_frame_type = HTTPD_WS_TYPE_BINARY;
-    g_ws_frame_len = 8 * 1024 + 1;
-    CHECK(g_ws_uri->handler(&f111) == ESP_FAIL, "a binary frame over 8 KB fails its session too");
+    g_ws_frame_len = 32 * 1024 + 1;
+    CHECK(g_ws_uri->handler(&f111) == ESP_FAIL, "a binary frame over 32 KB fails its session too");
     g_ws_frame_len = 0;
     g_ws_frame_type = HTTPD_WS_TYPE_TEXT;
     g_close_fn(nullptr, 111);
 
     // ── R-04 (review 2026-10-28): a trickled frame ends its session ────────
     // Each byte arrives just inside the 3 s receive timeout; only a deadline on
-    // the whole frame stops one frame holding the httpd task (an 8 KB frame:
-    // about 7 h). Two sockets: one trickles past 8 s, one sends two frames of
+    // the whole frame stops one frame holding the httpd task (a 32 KB frame:
+    // about 27 h). Two sockets: one trickles past 8 s, one sends two frames of
     // 5 s each (the deadline is per frame, not per session).
     {
         char bytes[200];

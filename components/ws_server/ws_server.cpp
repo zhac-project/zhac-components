@@ -25,12 +25,14 @@
 #error "ws_server needs CONFIG_HTTPD_QUEUE_WORK_BLOCKING=n: it queues httpd work from the httpd task, so a full queue would deadlock it"
 #endif
 
-// DS10 (DS_FINDINGS): cap on an inbound WS frame. Covers rule DSL and a
-// short script.check source; a frame beyond this closes its session (a
-// misbehaving/hostile client can't force a huge per-frame allocation). The SPA
-// sends nothing bigger: on wired and single-chip hubs it checks a long script
-// over REST, and on the dual-chip hub it does not check it as it is typed.
-#define WS_RX_MAX (8 * 1024)
+// DS10 (DS_FINDINGS): cap on an inbound WS frame; a frame beyond this closes
+// its session (a misbehaving/hostile client can't force a huge per-frame
+// allocation). 32 KB: the hub page saves the whole Safety config in one frame
+// (alarm.config.set), about 22 KB for the largest config its limits allow;
+// rule DSL and a short script.check source are far below. The SPA sends
+// nothing bigger: on wired and single-chip hubs it checks a long script over
+// REST, and on the dual-chip hub it does not check it as it is typed.
+#define WS_RX_MAX (32 * 1024)
 
 static const char*       TAG      = "ws_server";
 static httpd_handle_t    s_server = nullptr;

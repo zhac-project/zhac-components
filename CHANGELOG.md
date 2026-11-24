@@ -22,6 +22,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme; zhac-wired-core's
 
 ### Changed
 
+- **`ws_server` takes inbound frames up to 32 KB** (`WS_RX_MAX`, was 8 KB). The hub page saves the whole Safety config in one frame (`alarm.config.set`): about 22 KB for the largest config its limits allow, and the largest config carried over from security mode stage 1 (48 sensors in three modes, 8 sirens: 9 KB) was already over the old cap, so its save closed the session. The buffer is sized per frame and taken from PSRAM, so the higher cap costs memory only while such a frame is read. A larger frame still closes its session.
 - **`lua_engine` defaults to a 32 KB TaskLua stack** (`Kconfig`): `lua_limits.cmake`, on every
   build, is sized for it; zhac-wired-core already set 32768, another consumer got 8192.
 - **The `lua_engine`, `ws_server` and top-level READMEs describe the one-board hub**: no "P4 only" /
