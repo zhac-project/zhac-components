@@ -137,9 +137,12 @@ extern "C" bool remote_client_is_running(void) {
 extern "C" void remote_client_publish_event(const char* name,
                                             const char* payload_json,
                                             size_t payload_len) {
-    if (!s_running.load(std::memory_order_relaxed)) return;
-    if (!remote_event_allowed(name)) return;
-    if (s_state.load(std::memory_order_acquire) != REMOTE_STATE_READY) return;
+    const RemoteState st = s_state.load(std::memory_order_acquire);
+    const bool ready = s_running.load(std::memory_order_relaxed) && st == REMOTE_STATE_READY;
+    // While a linked hub's link is down an alert waits in the queue, which is sent on READY (an
+    // alarm that goes off during an outage or right after a power cut still reaches the app).
+    if (!ready && (st == REMOTE_STATE_DISABLED || !remote_event_held_offline(name))) return;
+    if (!remote_event_allowed(name) || !s_tx_queue) return;
 
     // Format the full envelope into a PSRAM blob — transfer ownership
     // to the queue. Bound: 8 KB matches inbound RX cap.

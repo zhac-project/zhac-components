@@ -101,10 +101,11 @@ bool remote_client_is_running(void);
 
 // Hot path. Called from ws_event_broadcast AFTER ws_server_broadcast.
 // Behaviour:
-//   - if !is_running()         : return immediately.
-//   - if !remote_event_allowed : return immediately.
 //   - if state != READY        : return immediately (event dropped — the
-//                                next reconnect bootstrap supersedes).
+//                                next reconnect bootstrap supersedes), except
+//                                an `alert` while the hub is linked (state
+//                                not DISABLED): it is queued, sent on READY.
+//   - if !remote_event_allowed : return immediately.
 //   - else                     : enqueue a PSRAM-allocated copy of the
 //                                full envelope onto s_tx_queue; the
 //                                task_remote loop drains and sends.

@@ -39,6 +39,11 @@ bool remote_scripts_allowed(void);
 // True iff the event name should be mirrored to the remote sink.
 bool remote_event_allowed(const char* name);
 
+// True iff the event waits in the send queue while the link is down (sent once it is READY): an
+// `alert`, the alarm panel's notification. Every other event is dropped then, because the next
+// reconnect's bootstrap supersedes it.
+bool remote_event_held_offline(const char* name);
+
 // The hub-log line for a change the cloud relays (§3.7), e.g.
 //   "script.write by 00000000-0000-4000-8000-000000000001 name=heating"
 // `by` is printed when it looks like an account id (1-40 of [0-9a-f-]), else "-"; ` id=<id>` (rules,

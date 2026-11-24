@@ -178,6 +178,10 @@ extern "C" bool remote_event_allowed(const char* name) {
     return name && *name && listed(kRemoteAllowedEvents, name);
 }
 
+extern "C" bool remote_event_held_offline(const char* name) {
+    return name && std::strcmp(name, "alert") == 0;
+}
+
 extern "C" bool remote_is_local_only_key(const char* key) {
     return key && *key && listed(kRemoteLocalOnlyKeys, key);
 }

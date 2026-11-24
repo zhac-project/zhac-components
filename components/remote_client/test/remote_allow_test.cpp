@@ -95,6 +95,14 @@ int main() {
         assert(!remote_event_allowed(e));
     }
 
+    // An alert (the alarm panel's) waits for the link; every other event is superseded by the next
+    // reconnect's bootstrap and is dropped while the link is down.
+    assert(remote_event_held_offline("alert"));
+    for (const char* e : {"attr.changed", "attr.bulk", "device.added", "alarm.changed", "", "alerts"}) {
+        assert(!remote_event_held_offline(e));
+    }
+    assert(!remote_event_held_offline(nullptr));
+
     // Script names: [A-Za-z0-9_-]{1,24}.
     assert(remote_script_name_ok("heating"));
     assert(remote_script_name_ok("Door_log-2"));
