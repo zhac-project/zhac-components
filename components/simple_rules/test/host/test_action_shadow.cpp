@@ -148,6 +148,24 @@ int main() {
     drain();
     CHECK(stub_adapter_str_sends() == 1, "a negative number is still a number, not text");
 
+    // ── on/off/true/false, any case, are 1/0 (as the cloud's rule compiler
+    //    writes them): `state off` worked as 0 before values went out as text ──
+    static const struct { const char* word; int32_t want; } kWords[] = {
+        {"off", 0}, {"on", 1}, {"True", 1}, {"FALSE", 0}};
+    int32_t trig = 10;
+    for (const auto& w : kWords) {
+        char rule[96], name[16];
+        snprintf(name, sizeof(name), "r_w%d", (int)trig);
+        snprintf(rule, sizeof(rule), "ON lamp#illuminance=%d DO zigbee.set lamp state %s ENDON", (int)trig, w.word);
+        CHECK(simple_rules_add(name, rule, &id), "install on/off word rule");
+        stub_shadow_opt_reset();
+        publish_attr("illuminance", VAL_INT, trig++);
+        drain();
+        CHECK(stub_adapter_str_sends() == 1 && stub_shadow_opt_count() == 1 &&
+              strcmp(stub_shadow_opt_key(), "state") == 0 && stub_shadow_opt_val() == w.want,
+              "zigbee.set lamp state <on/off/true/false> goes out as 1/0, not text");
+    }
+
     // ── failed send → NO shadow write (never lie about a command that
     //    didn't go out) ───────────────────────────────────────────────────
     stub_shadow_opt_reset();

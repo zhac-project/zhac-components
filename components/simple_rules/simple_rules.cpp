@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "zhac_task.h"
 #include <cstring>
+#include <strings.h>   // strcasecmp: on/off/true/false in a zigbee.set value
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
@@ -535,8 +536,11 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
             // `21.5` is a decimal write (the converter scales it), `128` an
             // integer, and anything that is not a number goes out as text: an
             // enum or a mode (`effect colorloop`, `alarm_state armed_away`),
-            // which used to go out as 0. device_cmd does the send and the
-            // optimistic shadow mirror, the same as every other transport.
+            // which used to go out as 0. on/off/true/false in any case are 1/0,
+            // as the cloud's rule compiler writes them. device_cmd does the send
+            // and the optimistic shadow mirror, the same as every other transport.
+            if (!strcasecmp(val_buf, "on") || !strcasecmp(val_buf, "true")) strcpy(val_buf, "1");
+            else if (!strcasecmp(val_buf, "off") || !strcasecmp(val_buf, "false")) strcpy(val_buf, "0");
             const bool decimal = strchr(val_buf, '.') != nullptr;
             char* num_end = nullptr;
             const double num = strtod(val_buf, &num_end);
