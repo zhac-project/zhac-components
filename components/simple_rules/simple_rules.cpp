@@ -532,12 +532,19 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
                 fail();
                 break;
             }
-            // `21.5` is a decimal write (the converter scales it); anything
-            // else is the integer it always was. device_cmd does the send and
-            // the optimistic shadow mirror, the same as every other transport.
+            // `21.5` is a decimal write (the converter scales it), `128` an
+            // integer, and anything that is not a number goes out as text: an
+            // enum or a mode (`effect colorloop`, `alarm_state armed_away`),
+            // which used to go out as 0. device_cmd does the send and the
+            // optimistic shadow mirror, the same as every other transport.
             const bool decimal = strchr(val_buf, '.') != nullptr;
-            const DevCmdValue val = decimal ? device_cmd_float(strtod(val_buf, nullptr))
-                                            : device_cmd_int((int32_t)strtol(val_buf, nullptr, 10));
+            char* num_end = nullptr;
+            const double num = strtod(val_buf, &num_end);
+            const long whole = strtol(val_buf, decimal ? nullptr : &num_end, 10);
+            const bool number = num_end != val_buf && *num_end == '\0';
+            const DevCmdValue val = !number ? device_cmd_str(val_buf)
+                                  : decimal ? device_cmd_float(num)
+                                            : device_cmd_int((int32_t)whole);
             const DevCmdResult r = device_cmd_set_attr(snap.ieee_addr, 0, a.arg1, &val);
             if (r != DEVCMD_OK) {
                 ESP_LOGW(TAG, "zigbee.set: %s for '%s' key='%s'",

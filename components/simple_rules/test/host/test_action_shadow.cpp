@@ -29,6 +29,9 @@ extern const char* stub_shadow_opt_key(void);
 extern uint8_t     stub_shadow_opt_vt(void);
 extern int32_t     stub_shadow_opt_val(void);
 extern void        stub_adapter_send_set_result(bool r);
+extern const char* stub_adapter_last_str_key(void);
+extern const char* stub_adapter_last_str(void);
+extern int         stub_adapter_str_sends(void);
 
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                         \
@@ -128,6 +131,22 @@ int main() {
           stub_shadow_opt_vt() == VAL_FLOAT &&
           stub_shadow_opt_val() == 2150,
           "zigbee.set ... 21.5 writes (current_heating_setpoint, VAL_FLOAT, 2150)");
+
+    // ── a value that is not a number → a text send (an enum, a mode) ────
+    CHECK(simple_rules_add("r_mode",
+            "ON lamp#illuminance=3 DO zigbee.set lamp effect colorloop ENDON", &id),
+          "install text-value rule");
+    publish_attr("illuminance", VAL_INT, 3);
+    drain();
+    CHECK(stub_adapter_str_sends() == 1 && strcmp(stub_adapter_last_str_key(), "effect") == 0 &&
+          strcmp(stub_adapter_last_str(), "colorloop") == 0,
+          "zigbee.set lamp effect colorloop goes out as the text \"colorloop\", not 0");
+    CHECK(simple_rules_add("r_neg",
+            "ON lamp#illuminance=4 DO zigbee.set lamp offset -5 ENDON", &id),
+          "install negative-number rule");
+    publish_attr("illuminance", VAL_INT, 4);
+    drain();
+    CHECK(stub_adapter_str_sends() == 1, "a negative number is still a number, not text");
 
     // ── failed send → NO shadow write (never lie about a command that
     //    didn't go out) ───────────────────────────────────────────────────
