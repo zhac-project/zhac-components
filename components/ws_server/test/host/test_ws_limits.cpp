@@ -118,7 +118,9 @@ int main() {
     g_ws_frame_len = 32 * 1024 + 1;
     CHECK(g_ws_uri->handler(&f110) == ESP_FAIL && s_rx_len == 0 && ws_server_client_count() == before - 1,
           "a frame over 32 KB fails its session (httpd closes it) and leaves the client table");
-    g_ws_frame_len = 0;
+    CHECK(g_ws_frame_len == 32 * 1024 + 1,
+          "... without reading its payload away (that would hold the httpd task as long as the client trickles it)");
+    g_ws_frame_len = 0;   // the stub's pending payload: httpd drops it with the session
     g_close_fn(nullptr, 110);
     // A frame's buffer comes from PSRAM. With PSRAM short, internal RAM stands in only for a frame of at most
     // 8 KB, the cap before the 32 KB one: four 32 KB frames would take what the radio and lwIP need (review F11, C1).
