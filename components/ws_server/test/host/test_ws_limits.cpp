@@ -8,7 +8,7 @@
 //     and a full table closes the oldest unsigned socket to admit a new one.
 // A fresh process, so the client table starts empty.
 #include "ws_server.h"
-#include "esp_heap_caps.h"     // g_psram_full, g_internal_allocs
+#include "esp_heap_caps.h"     // g_psram_full, g_internal_allocs, g_internal_caps
 #include "esp_timer.h"
 #include "freertos/semphr.h"   // t_nheld: the locks this thread holds
 
@@ -133,6 +133,8 @@ int main() {
     g_ws_frame_len = 8 * 1024;   // the refused frame's payload was never read; httpd ends that session
     CHECK(g_ws_uri->handler(&f112) == ESP_OK && s_rx_len == 8 * 1024 && g_internal_allocs == 1,
           "PSRAM full: a frame of 8 KB still falls back to internal RAM");
+    CHECK(g_internal_caps == (MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL),
+          "... to the RAM malloc takes, not to the driver reserve (MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL)");
     g_ws_frame_len = 8 * 1024 + 1;
     s_rx_len = 0;
     CHECK(g_ws_uri->handler(&f112) == ESP_ERR_NO_MEM && s_rx_len == 0 && g_internal_allocs == 1,

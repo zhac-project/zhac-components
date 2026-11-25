@@ -409,8 +409,9 @@ static esp_err_t ws_handler(httpd_req_t* req) {
         heap_caps_malloc(pkt.len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     // PSRAM short: internal RAM stands in only for a frame of up to WS_RX_INTERNAL_MAX, the cap before the 32 KB
     // one. A few frames of 32 KB from internal RAM would starve the radio and lwIP; a larger one fails its session.
+    // MALLOC_CAP_DEFAULT, as malloc asks: without it the driver reserve (SPIRAM_MALLOC_RESERVE_INTERNAL) could serve it.
     if (!buf && pkt.len <= WS_RX_INTERNAL_MAX)
-        buf = static_cast<uint8_t*>(heap_caps_malloc(pkt.len + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        buf = static_cast<uint8_t*>(heap_caps_malloc(pkt.len + 1, MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
     if (!buf) return ESP_ERR_NO_MEM;
     pkt.payload = buf;
     ret = httpd_ws_recv_frame(req, &pkt, pkt.len);

@@ -119,7 +119,9 @@ token drop back to the auth-only command set.
 Text frames only. The handler probes the frame length (`max_len=0`),
 enforces `WS_RX_MAX`, then reads into a right-sized **PSRAM** buffer
 (`MALLOC_CAP_SPIRAM`; internal RAM stands in only for a frame of at most
-`WS_RX_INTERNAL_MAX`, 8 KB, when PSRAM is short), NUL-terminates and invokes
+`WS_RX_INTERNAL_MAX`, 8 KB, when PSRAM is short, and only the RAM `malloc`
+takes: `MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL`, never the driver reserve
+of `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`), NUL-terminates and invokes
 the RX callback. The old fixed 256-byte stack buffer (truncated rule DSL /
 Lua uploads) is gone.
 
