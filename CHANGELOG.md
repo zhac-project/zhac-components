@@ -31,6 +31,7 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme; zhac-wired-core's
   "S3 only", no dual-chip TX worker, and no CI this repo does not have.
 - **Home Assistant's support link for ZHAC entities goes to zhac-docs** (`ha_bridge`, `origin.support_url` in every discovery payload): it named zhac-platform, which is archived and takes no issues.
 - **One log line per decoded frame** (`zhc_adapter`, research 2026-11-18 A13): "matched, 3 keys: temperature=21.5 humidity=40 battery=90", cut at 192 bytes. It was a line per key on the blocking 115200-baud console from TaskZigbee.
+- **`ws_server` has room for 64 URI handlers** (`WS_SERVER_MAX_URI_HANDLERS`, was 56): zhac-wired-core registers 58 with the 4 `/api/sound` routes (54 before), and a full table would have left the SPA catch-all, registered last, without a slot: the whole web UI 404s.
 
 ### Fixed
 
