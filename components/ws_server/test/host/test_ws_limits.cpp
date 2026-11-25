@@ -15,6 +15,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -32,7 +33,8 @@ esp_err_t httpd_ws_send_frame_async(httpd_handle_t, int, httpd_ws_frame_t* f) {
     g_sent_under_lock = t_nheld > 0;
     return ESP_OK;
 }
-void host_log(const char*, const char*, ...) {}
+static int g_logs = 0;                    // lines ws_server logged
+void host_log(const char*, const char*, ...) { g_logs++; }
 
 static void add_client(int fd) {            // the handshake registers fd as a client
     httpd_req_t req{HTTP_GET, reinterpret_cast<void*>(static_cast<intptr_t>(fd))};
@@ -144,6 +146,31 @@ int main() {
     g_ws_frame_len = 0;
     g_psram_full = false;
     g_close_fn(nullptr, 112);
+    // An outbound frame that is not UTF-8 goes out from a scrubbed copy (M45, review 2026-11-25). With PSRAM short, internal
+    // RAM stands in for that copy only up to the same 8 KB, and only the RAM malloc takes; a larger frame is dropped with
+    // a log line, since a few copies of 32 KB from internal RAM would starve the radio and lwIP.
+    {
+        const std::string small(8 * 1024, '\xff'), big(8 * 1024 + 1, '\xff');
+        g_psram_full = true;
+        g_internal_allocs = 0;
+        g_sent_frames = 0;
+        int logs = g_logs;
+        ws_server_reply(113, big.data(), big.size());
+        CHECK(g_sent_frames == 0 && g_internal_allocs == 0 && g_logs == logs + 1,
+              "PSRAM full: a non-UTF-8 frame over 8 KB is dropped with a log line, and takes no internal RAM");
+        ws_server_reply(113, small.data(), small.size());
+        CHECK(g_sent_frames == 1 && g_sent_frame.len == small.size() && g_sent_frame.first == '?',
+              "PSRAM full: a non-UTF-8 frame of 8 KB still goes out, scrubbed");
+        CHECK(g_internal_allocs == 1 && g_internal_caps == (MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL),
+              "... from the RAM malloc takes (MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL), not the driver reserve");
+        g_psram_full = false;
+        g_internal_allocs = 0;
+        g_sent_frames = 0;
+        logs = g_logs;
+        ws_server_reply(113, big.data(), big.size());
+        CHECK(g_sent_frames == 1 && g_sent_frame.len == big.size() && g_internal_allocs == 0 && g_logs == logs,
+              "PSRAM available: the same frame goes out from PSRAM");
+    }
     // Every frame that reaches the handler is read to its end: binary frames,
     // continuations and (IDF 6.1) PONGs too. Only text is handed on.
     add_client(111);
