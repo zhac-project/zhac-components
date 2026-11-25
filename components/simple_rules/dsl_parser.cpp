@@ -433,13 +433,20 @@ static ParseResult parse_strip(const char* s, RuleAction* a, bool set) {
     return ParseResult::OK;
 }
 
-// The firmware's sound check, its words kept. noinline: its 192-byte buffer stays off parse_action's
-// frame, which the boot reload runs on a small stack (and the reload never calls it).
-__attribute__((noinline)) static ParseResult check_sound(const char* name, bool loop) {
+// Calls the firmware's sound check and keeps its words. The only function with the 192-byte buffer,
+// and noinline so it stays out of its callers' frames: it is entered only when a check is set, which
+// the boot reload (on a small stack) never does.
+__attribute__((noinline)) static ParseResult run_sound_check(const char* name, bool loop) {
     char err[192] = {};
-    if (!s_sound_check || s_sound_check(name, loop, err, sizeof(err))) return ParseResult::OK;
+    if (s_sound_check(name, loop, err, sizeof(err))) return ParseResult::OK;
     dsl_set_err("%s", err[0] ? err : "unknown sound");
     return ParseResult::ERR_BAD_ACTION;
+}
+
+// The reload parses every stored sound rule through here with no check set: it returns before any buffer.
+static ParseResult check_sound(const char* name, bool loop) {
+    if (!s_sound_check) return ParseResult::OK;
+    return run_sound_check(name, loop);
 }
 
 // sound.play <name> [<0-100>] [loop] / sound.stop [<name>]. Stored: arg0 name ("" for a bare stop),
