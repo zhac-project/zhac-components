@@ -25,6 +25,8 @@
 extern void        stub_pool_seed(const ZapDevice* dev);
 extern void        stub_shadow_opt_reset(void);
 extern int         stub_shadow_opt_count(void);
+extern uint64_t    stub_shadow_opt_ieee(void);
+extern void        stub_shadow_set(uint64_t ieee, const char* key, uint8_t vt, int32_t iv, const char* sv);
 
 static int s_failures = 0;
 #define CHECK(cond, msg) do {                                         \
@@ -212,6 +214,37 @@ int main() {
         // One longer can never match a device, so it is an error, not a dead rule.
         CHECK(pr(("ON " + std::string(30, 'n') + "#state=1 DO log m ENDON").c_str()) != ParseResult::OK,
               "trigger friendly name longer than a device name (30) rejected");
+
+        // A removed device keeps its name and its pool slot (zap_dev_is_removed), and the hub page no longer lists
+        // it: a rule by name finds the live device of that name, also when the removed one comes first in the pool.
+        constexpr uint64_t kGone = 0x0101010101010101ULL, kLive = 0x0202020202020202ULL;
+        ZapDevice gone{};
+        gone.ieee_addr = kGone;
+        gone.nwk_addr  = 0x3301;
+        gone.endpoints[0] = 1; gone.endpoint_count = 1;
+        std::snprintf(gone.friendly_name, sizeof(gone.friendly_name), "%s", "twin");
+        ZapDevice live = gone;
+        live.ieee_addr = kLive;
+        live.nwk_addr  = 0x3302;
+        zap_dev_mark_removed(&gone);
+        stub_pool_seed(&gone);
+        stub_pool_seed(&live);
+        id = add("d4", "ON twin#state=1 DO zigbee.set lamp brightness 9 ENDON");
+        stub_shadow_opt_reset();
+        publish_attr_ieee(kLive, "state", VAL_INT, 1); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1, "a trigger by name resolves to the live device, not a removed one of that name");
+        simple_rules_delete(id);
+        id = add("d5", "ON lamp#state=1 DO zigbee.set twin brightness 9 ENDON");
+        stub_shadow_opt_reset();
+        publish_attr_ieee(kIeee, "state", VAL_INT, 1); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 && stub_shadow_opt_ieee() == kLive, "zigbee.set by name goes to the live device");
+        simple_rules_delete(id);
+        stub_shadow_set(kLive, "state", VAL_BOOL, 1, nullptr);
+        id = add("d6", "ON lamp#state=1 DO zigbee.toggle twin state ENDON");
+        stub_shadow_opt_reset();
+        publish_attr_ieee(kIeee, "state", VAL_INT, 1); drain_attr();
+        CHECK(stub_shadow_opt_count() == 1 && stub_shadow_opt_ieee() == kLive, "zigbee.toggle by name goes to the live device");
+        simple_rules_delete(id);
     }
 
     // ── E. Tier-2 value expressions (parse level) ─────────────────────────

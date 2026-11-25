@@ -520,8 +520,8 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
             } else {
                 ZapDevice* pool = pool_all();
                 uint16_t cnt = pool_count();
-                for (uint16_t j = 0; j < cnt; j++) {
-                    if (strcmp(pool[j].friendly_name, a.arg0) == 0) {
+                for (uint16_t j = 0; j < cnt; j++) {   // a removed device keeps its name: not that one
+                    if (!zap_dev_is_removed(&pool[j]) && strcmp(pool[j].friendly_name, a.arg0) == 0) {
                         snap = pool[j]; dev_found = true;
                         break;
                     }
@@ -568,8 +568,8 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
             } else {
                 ZapDevice* pool = pool_all();
                 uint16_t cnt = pool_count();
-                for (uint16_t j = 0; j < cnt; j++) {
-                    if (strcmp(pool[j].friendly_name, a.arg0) == 0) {
+                for (uint16_t j = 0; j < cnt; j++) {   // a removed device keeps its name: not that one
+                    if (!zap_dev_is_removed(&pool[j]) && strcmp(pool[j].friendly_name, a.arg0) == 0) {
                         snap = pool[j]; dev_found = true;
                         break;
                     }
@@ -1373,8 +1373,8 @@ void simple_rules_resolve_names(ParsedRule* rules, uint16_t count) {
         // `if (t.ieee != 0) continue`). A name that no longer matches resolves
         // back to 0, which the matcher treats as inert (never a wildcard).
         uint64_t resolved = 0;
-        for (uint16_t j = 0; j < cnt; j++) {
-            if (strcmp(pool[j].friendly_name, t.device_name) == 0) {
+        for (uint16_t j = 0; j < cnt; j++) {   // a removed device keeps its name: not that one
+            if (!zap_dev_is_removed(&pool[j]) && strcmp(pool[j].friendly_name, t.device_name) == 0) {
                 resolved = pool[j].ieee_addr;
                 break;
             }
