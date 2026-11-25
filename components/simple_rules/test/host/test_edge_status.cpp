@@ -427,6 +427,28 @@ int main() {
         CHECK(fires("off") == 1, "once enabled it fires on the next change");
     }
 
+    // ── 12. The burst before the pump starts (M48, 2026-11-25) ────────────
+    // At boot simple_rules subscribes at ~3.9 s, but TaskEventBus drains from ~6.25 s: ~20 attribute
+    // reports queue up meanwhile. A depth-16 queue lost the 14 oldest of 30.
+    {
+        static constexpr uint64_t kBurst = 0xA10000000000000BULL;
+        seed_device(kBurst, "burster");
+        add("burst", "ON burster#action=\"burst\" DO script.run burst ENDON");
+        Event ev{};
+        ev.type = EventType::ZCL_ATTR;
+        auto& ze = *reinterpret_cast<ZclAttrEvent*>(ev.data);
+        ze.ieee = kBurst;
+        ze.val_type = VAL_STR;
+        std::strncpy(ze.key, "action", ATTR_KEY_MAX - 1);
+        std::strncpy(ze.str_val, "burst", ATTR_STR_MAX - 1);
+        const int overflows = stub_log_count('W', "queue full");
+        for (int i = 0; i < 30; i++) event_bus_publish(ev);   // nothing drains yet
+        drain(EventType::ZCL_ATTR);
+        printf("burst: fired=%d of 30\n", fires("burst"));
+        CHECK(fires("burst") == 30, "30 attribute events queued before the first drain all reach the rules");
+        CHECK(stub_log_count('W', "queue full") == overflows, "and the bus logs no overflow");
+    }
+
     printf("%s (%d failure%s)\n", s_failures ? "FAILED" : "OK",
            s_failures, s_failures == 1 ? "" : "s");
     return s_failures ? 1 : 0;

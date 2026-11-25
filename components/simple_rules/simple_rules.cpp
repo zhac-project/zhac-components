@@ -1034,7 +1034,8 @@ void simple_rules_init() {
     s_mutex = xSemaphoreCreateRecursiveMutex();
 
     // Queue depths (research 2026-11-18 A8): boot comes once; a slot per timer, as all may fire before the pump runs.
-    event_bus_subscribe(EventType::ZCL_ATTR,       dispatch_event);
+    // ZCL_ATTR: depth 32 -- ~20 reports queue at boot between this subscribe (~3.9 s) and the pump start (~6.25 s).
+    event_bus_subscribe(EventType::ZCL_ATTR,       dispatch_event, nullptr, 32);
     event_bus_subscribe(EventType::CTRL_BOOT,       dispatch_event, nullptr, 1);
     event_bus_subscribe(EventType::RULE_EVENT,      dispatch_event);
     event_bus_subscribe(EventType::RULE_TIMER_FIRE, dispatch_event, nullptr, sizeof s_timers / sizeof s_timers[0]);

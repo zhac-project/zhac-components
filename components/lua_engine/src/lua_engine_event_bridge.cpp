@@ -46,7 +46,8 @@ void on_zcl_raw(const Event& e) {
 }  // namespace
 
 extern "C" void lua_engine_event_bridge_start(void) {
-    event_bus_subscribe(EventType::ATTR_CHANGE, on_attr_change);
+    // Depth 32: ~20 attribute reports queue at boot, between this subscribe (~4.0 s) and the pump start (~6.25 s).
+    event_bus_subscribe(EventType::ATTR_CHANGE, on_attr_change, nullptr, 32);
     event_bus_subscribe(EventType::MQTT_MSG,    on_mqtt_msg);
     event_bus_subscribe(EventType::CTRL_BOOT,   on_ctrl_boot, nullptr, 1);   // once per boot (research 2026-11-18 A8)
     event_bus_subscribe(EventType::ZCL_RAW,     on_zcl_raw);

@@ -47,3 +47,18 @@ foreach(th 512 0)
     target_compile_definitions(lua_alloc_tests_${th} PRIVATE CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD=${th})
     add_test(NAME lua_alloc_${th} COMMAND lua_alloc_tests_${th})
 endforeach()
+
+# The event bridge's queue depths (M48): the real bridge TU on the real event_bus, with the single-threaded
+# FreeRTOS/ESP shims shared with the simple_rules host harness. CONFIG_LUA_ENGINE_ENABLED is what Kconfig sets.
+set(ZC ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+set(SHARED_STUBS_DIR ${ZC}/simple_rules/test/host/stubs)
+add_executable(lua_event_bridge_tests lua_event_bridge_test.cpp ../../src/lua_engine_event_bridge.cpp
+    ${SHARED_STUBS_DIR}/host_stubs.cpp ${ZC}/event_bus/event_bus.cpp)
+target_include_directories(lua_event_bridge_tests PRIVATE ../../src ${SHARED_STUBS_DIR} ${ZC}/event_bus/include
+    ${ZC}/zap_common/include
+    # host_stubs.cpp stubs simple_rules' link-time dependencies and includes their headers
+    ${ZC}/simple_rules/include ${ZC}/rule_store/include ${ZC}/zigbee_mgr/include ${ZC}/device_shadow/include
+    ${ZC}/zhc_adapter/include ${ZC}/mqtt_gw/include ${ZC}/cron_parser/include)
+target_compile_definitions(lua_event_bridge_tests PRIVATE CONFIG_LUA_ENGINE_ENABLED=1)
+target_link_libraries(lua_event_bridge_tests PRIVATE host_lua)   # lua.h, which lua_scheduler.h includes
+add_test(NAME lua_event_bridge COMMAND lua_event_bridge_tests)
