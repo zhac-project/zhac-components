@@ -147,8 +147,9 @@ int main() {
     g_psram_full = false;
     g_close_fn(nullptr, 112);
     // An outbound frame that is not UTF-8 goes out from a scrubbed copy (M45, review 2026-11-25). With PSRAM short, internal
-    // RAM stands in for that copy only up to the same 8 KB, and only the RAM malloc takes; a larger frame is dropped with
-    // a log line, since a few copies of 32 KB from internal RAM would starve the radio and lwIP.
+    // RAM stands in for that copy only up to the same 8 KB, and only the RAM malloc takes; a larger frame is dropped,
+    // silently (a log line from send_locked would come back through the wired log sink), since a few copies of 32 KB
+    // from internal RAM would starve the radio and lwIP.
     {
         const std::string small(8 * 1024, '\xff'), big(8 * 1024 + 1, '\xff');
         g_psram_full = true;
@@ -156,8 +157,8 @@ int main() {
         g_sent_frames = 0;
         int logs = g_logs;
         ws_server_reply(113, big.data(), big.size());
-        CHECK(g_sent_frames == 0 && g_internal_allocs == 0 && g_logs == logs + 1,
-              "PSRAM full: a non-UTF-8 frame over 8 KB is dropped with a log line, and takes no internal RAM");
+        CHECK(g_sent_frames == 0 && g_internal_allocs == 0 && g_logs == logs,
+              "PSRAM full: a non-UTF-8 frame over 8 KB is dropped silently, and takes no internal RAM");
         ws_server_reply(113, small.data(), small.size());
         CHECK(g_sent_frames == 1 && g_sent_frame.len == small.size() && g_sent_frame.first == '?',
               "PSRAM full: a non-UTF-8 frame of 8 KB still goes out, scrubbed");

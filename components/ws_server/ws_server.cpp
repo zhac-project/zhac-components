@@ -745,9 +745,11 @@ static bool fd_may_receive(int fd) {
 // invalid byte in a text frame, so a frame with any is sent from a copy with '?'
 // for each such byte (same length; JSON's structural bytes are ASCII). The
 // caller's buffer is left alone, and a frame that cannot be copied is dropped
-// rather than sent invalid, with a warning that names only its length. The copy
-// is taken before any lock, so that warning may come back through the wired log
-// sink as a broadcast of its own.
+// rather than sent invalid. The copy comes from PSRAM; with PSRAM short, internal
+// RAM stands in only for a frame of up to WS_RX_INTERNAL_MAX, and only the RAM
+// malloc takes (MALLOC_CAP_DEFAULT): a few large frames would starve the radio and
+// lwIP. Silent on purpose: a log line from here would come back through the wired
+// log sink.
 static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool recheck, const char* who) {
     char* fixed = nullptr;
     if (!utf8_valid(reinterpret_cast<const char*>(pkt->payload), pkt->len)) {
@@ -756,12 +758,7 @@ static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool reche
         // RAM malloc takes (MALLOC_CAP_DEFAULT: not the driver reserve). A larger frame is dropped.
         if (!fixed && pkt->len <= WS_RX_INTERNAL_MAX)
             fixed = static_cast<char*>(heap_caps_malloc(pkt->len, MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
-        if (!fixed) {
-            // Before any lock is taken, so the line may come back through the wired log sink as an ordinary broadcast.
-            // It names the length only, never the frame, so it is valid UTF-8 and takes no copy.
-            ESP_LOGW(TAG, "%s: no memory to repair a non-UTF-8 frame of %u B -- dropped", who, (unsigned)pkt->len);
-            return;
-        }
+        if (!fixed) return;
         memcpy(fixed, pkt->payload, pkt->len);
         utf8_scrub(fixed, pkt->len);
         pkt->payload = reinterpret_cast<uint8_t*>(fixed);
