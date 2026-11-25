@@ -326,6 +326,33 @@ target_include_directories(simple_rules_gpio_actions_test PRIVATE
 
 target_compile_options(simple_rules_gpio_actions_test PRIVATE -Wall -Wextra -Werror)
 
+# strip.set / strip.off / sound.play / sound.stop: grammar, the check hooks, the run hooks.
+add_executable(simple_rules_sound_strip_actions_test
+    test_sound_strip_actions.cpp
+    stubs/host_stubs.cpp
+    ${COMPONENTS_DIR}/simple_rules/simple_rules.cpp
+    ${COMPONENTS_DIR}/simple_rules/dsl_parser.cpp
+    ${COMPONENTS_DIR}/simple_rules/expr_eval.cpp
+    ${COMPONENTS_DIR}/device_cmd/device_cmd.cpp
+    ${COMPONENTS_DIR}/event_bus/event_bus.cpp
+)
+
+target_include_directories(simple_rules_sound_strip_actions_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+    ${COMPONENTS_DIR}/simple_rules/include
+    ${COMPONENTS_DIR}/event_bus/include
+    ${COMPONENTS_DIR}/rule_store/include
+    ${COMPONENTS_DIR}/zap_common/include
+    ${COMPONENTS_DIR}/zigbee_mgr/include
+    ${COMPONENTS_DIR}/device_shadow/include
+    ${COMPONENTS_DIR}/zhc_adapter/include
+    ${COMPONENTS_DIR}/device_cmd/include
+    ${COMPONENTS_DIR}/mqtt_gw/include
+    ${COMPONENTS_DIR}/cron_parser/include
+)
+
+target_compile_options(simple_rules_sound_strip_actions_test PRIVATE -Wall -Wextra -Werror)
+
 add_test(NAME simple_rules_expr COMMAND simple_rules_expr_test)
 add_test(NAME simple_rules_event_loop  COMMAND simple_rules_event_loop_test)
 add_test(NAME simple_rules_integrity   COMMAND simple_rules_integrity_test)
@@ -338,3 +365,4 @@ add_test(NAME simple_rules_dsl_structure COMMAND simple_rules_dsl_structure_test
 add_test(NAME simple_rules_edge_status COMMAND simple_rules_edge_status_test)
 add_test(NAME simple_rules_check COMMAND simple_rules_check_test)
 add_test(NAME simple_rules_gpio_actions COMMAND simple_rules_gpio_actions_test)
+add_test(NAME simple_rules_sound_strip_actions COMMAND simple_rules_sound_strip_actions_test)

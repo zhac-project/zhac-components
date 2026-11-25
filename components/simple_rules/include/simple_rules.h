@@ -57,6 +57,10 @@ enum class ActionType : uint8_t {
     GPIO_SET      = 8,   // DO gpio.set <pin> on|off|...      (hub pins, through the IO hooks)
     GPIO_TOGGLE   = 9,   // DO gpio.toggle <pin>
     PWM_SET       = 10,  // DO pwm.set <pin> <0-100>
+    STRIP_SET     = 11,  // DO strip.set <pin> <#RRGGBB> [<0-100>]   (through the IO hooks, op STRIP)
+    STRIP_OFF     = 12,  // DO strip.off <pin>
+    SOUND_PLAY    = 13,  // DO sound.play <name> [<0-100>] [loop]    (through the sound hooks)
+    SOUND_STOP    = 14,  // DO sound.stop [<name>]
 };
 
 // Hub pins (gpio.set / gpio.toggle / pwm.set). The firmware owns them; these
@@ -66,10 +70,21 @@ enum class ActionType : uint8_t {
 // pin renamed or removed later fails at fire time instead of unloading the rule.
 // `run` runs at fire time with the resolved value ("on", "1", "42.5"; "" for
 // TOGGLE): false is an action error. Either may be null.
-enum class SimpleRulesIoOp : uint8_t { SET, TOGGLE, PWM };
+// STRIP (strip.set / strip.off): `run` gets "#RRGGBB" or "#RRGGBB <0-100>", the
+// tokens as typed and joined by one space (strip.set), or "#000000" (strip.off).
+enum class SimpleRulesIoOp : uint8_t { SET, TOGGLE, PWM, STRIP };
 typedef bool (*simple_rules_io_check_t)(SimpleRulesIoOp op, const char* pin, char* err, size_t cap);
 typedef bool (*simple_rules_io_run_t)(SimpleRulesIoOp op, const char* pin, const char* value);
 void simple_rules_set_io_hooks(simple_rules_io_check_t check, simple_rules_io_run_t run);
+
+// Hub sounds (sound.play / sound.stop), same split as the pins. `check` runs when a rule is
+// saved or checked: false refuses it with `err` (up to cap bytes, kept whole in
+// dsl_last_error()) as the reason; `name` is "" for a bare sound.stop. A reload skips it, so
+// a sound removed later fails at fire time. `run` runs at fire time: `play` false = stop,
+// `volume` -1 = the default; false is an action error. Either may be null.
+typedef bool (*simple_rules_sound_check_t)(const char* name, bool loop, char* err, size_t cap);
+typedef bool (*simple_rules_sound_run_t)(bool play, const char* name, int volume, bool loop);
+void simple_rules_set_sound_hooks(simple_rules_sound_check_t check, simple_rules_sound_run_t run);
 
 // Payload handed to the script hook when an ActionType::SCRIPT action
 // fires. Stringified `value` is always present; the raw fields below it
@@ -176,7 +191,8 @@ bool simple_rules_match(const ParsedRule& rule, const Event& ev,
 ParseResult dsl_parse(const char* dsl, uint16_t rule_id, ParsedRule* out);
 
 // Last human-readable parse error (set by dsl_parse on failure). Empty
-// string when the last call succeeded or no call has been made yet.
+// string when the last call succeeded or no call has been made yet. At most 191
+// characters: a hook's refusal (up to 191) is kept whole.
 // Used by HAP RULE_* handlers to propagate specific errors to the UI.
 const char* dsl_last_error();
 
@@ -188,6 +204,8 @@ void dsl_set_last_error(const char* msg);
 
 // The parser's half of simple_rules_set_io_hooks (the pin check at parse time).
 void dsl_set_io_check(simple_rules_io_check_t check);
+// ... and of simple_rules_set_sound_hooks (the sound check at parse time).
+void dsl_set_sound_check(simple_rules_sound_check_t check);
 
 // Resolve friendly names → IEEE for all DEVICE_ATTR triggers.
 // Call after device pool is populated. Sets trigger.ieee; leaves 0 if not found.

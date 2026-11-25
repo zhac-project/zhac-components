@@ -19,7 +19,8 @@ static const char* TAG = "dsl_parser";
 // by the HAP RULE_CREATE / RULE_UPDATE handlers to surface a specific reason
 // in the RULE_EXEC_RESULT err field — otherwise the UI gets the generic
 // "parse or store failed" placeholder.
-static char s_last_error[96] = "";
+// 192: a firmware hook's refusal (up to 191 characters) is kept whole.
+static char s_last_error[192] = "";
 static void dsl_set_err(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(s_last_error, sizeof(s_last_error), fmt, ap);
@@ -379,6 +380,95 @@ static ParseResult parse_pin_value(const char* s, RuleAction* a, SimpleRulesIoOp
     return ParseResult::OK;
 }
 
+// ── Strip and sound: strip.set / strip.off / sound.play / sound.stop ─────
+
+static simple_rules_sound_check_t s_sound_check = nullptr;
+void dsl_set_sound_check(simple_rules_sound_check_t check) { s_sound_check = check; }
+
+// Next space-delimited token of an action tail into `out`. False: none left. `*fit` false: it was
+// longer than `cap` - 1 (`out` holds its head).
+static bool next_token(const char*& s, char* out, size_t cap, bool* fit) {
+    s = copy_token(skip_ws(s), ' ', out, cap);
+    *fit = !token_overflowed(s);
+    return out[0] != '\0';
+}
+
+// '#' and six hex digits, any case.
+static bool is_colour(const char* v) {
+    if (v[0] != '#' || strlen(v) != 7) return false;
+    for (int i = 1; i < 7; i++) if (!isxdigit((unsigned char)v[i])) return false;
+    return true;
+}
+
+// 0..100 as one to three decimal digits: no sign, no decimals, no suffix.
+static bool is_percent(const char* v) {
+    const size_t n = strlen(v);
+    if (n == 0 || n > 3) return false;
+    for (size_t i = 0; i < n; i++) if (!isdigit((unsigned char)v[i])) return false;
+    return atoi(v) <= 100;
+}
+
+// strip.set <pin> <#RRGGBB> [<0-100>] / strip.off <pin>. Stored: arg0 pin, arg2 the colour, then the
+// brightness when given, joined by one space (what the run hook gets); strip.off stores "#000000".
+static ParseResult parse_strip(const char* s, RuleAction* a, bool set) {
+    const char* verb = set ? "strip.set" : "strip.off";
+    ParseResult r = parse_pin(s, a, SimpleRulesIoOp::STRIP, verb);
+    if (r != ParseResult::OK) return r;
+    if (!set) {
+        if (*skip_ws(s) != '\0') { dsl_set_err("strip.off takes one pin"); return ParseResult::ERR_BAD_ACTION; }
+        strcpy(a->arg2, "#000000");
+        return ParseResult::OK;
+    }
+    char col[24], t[24];
+    bool fit;
+    if (!next_token(s, col, sizeof(col), &fit)) { dsl_set_err("strip.set: colour missing"); return ParseResult::ERR_BAD_ACTION; }
+    if (!fit || !is_colour(col)) { dsl_set_err("strip.set: colour must be #RRGGBB"); return ParseResult::ERR_BAD_ACTION; }
+    if (next_token(s, t, sizeof(t), &fit)) {
+        if (!fit || !is_percent(t)) { dsl_set_err("strip.set: brightness must be 0-100"); return ParseResult::ERR_BAD_ACTION; }
+        snprintf(a->arg2, sizeof(a->arg2), "%.7s %.3s", col, t);   // both validated: 7 and 1-3 characters
+        if (next_token(s, t, sizeof(t), &fit)) { dsl_set_err("strip.set: unexpected '%s'", t); return ParseResult::ERR_BAD_ACTION; }
+    } else {
+        snprintf(a->arg2, sizeof(a->arg2), "%.7s", col);
+    }
+    return ParseResult::OK;
+}
+
+// The firmware's sound check, its words kept. noinline: its 192-byte buffer stays off parse_action's
+// frame, which the boot reload runs on a small stack (and the reload never calls it).
+__attribute__((noinline)) static ParseResult check_sound(const char* name, bool loop) {
+    char err[192] = {};
+    if (!s_sound_check || s_sound_check(name, loop, err, sizeof(err))) return ParseResult::OK;
+    dsl_set_err("%s", err[0] ? err : "unknown sound");
+    return ParseResult::ERR_BAD_ACTION;
+}
+
+// sound.play <name> [<0-100>] [loop] / sound.stop [<name>]. Stored: arg0 name ("" for a bare stop),
+// arg1 the volume text or "", arg2 "loop" or "".
+static ParseResult parse_sound(const char* s, RuleAction* a, bool play) {
+    const char* verb = play ? "sound.play" : "sound.stop";
+    char t[24];
+    bool fit;
+    const bool named = next_token(s, a->arg0, sizeof(a->arg0), &fit);
+    if (!fit) { dsl_set_err("%s: sound name too long (max %u)", verb, (unsigned)(sizeof(a->arg0) - 1)); return ParseResult::ERR_BAD_ACTION; }
+    if (!play) {
+        if (next_token(s, t, sizeof(t), &fit)) { dsl_set_err("sound.stop takes at most one name"); return ParseResult::ERR_BAD_ACTION; }
+        return check_sound(a->arg0, false);
+    }
+    if (!named) { dsl_set_err("sound.play: sound name missing"); return ParseResult::ERR_BAD_ACTION; }
+    bool more = next_token(s, t, sizeof(t), &fit);
+    if (more && (!fit || strcmp(t, "loop") != 0)) {   // a volume
+        if (!fit || !is_percent(t)) { dsl_set_err("sound.play: volume must be 0-100"); return ParseResult::ERR_BAD_ACTION; }
+        snprintf(a->arg1, sizeof(a->arg1), "%s", t);
+        more = next_token(s, t, sizeof(t), &fit);
+    }
+    if (more && fit && strcmp(t, "loop") == 0) {
+        strcpy(a->arg2, "loop");
+        more = next_token(s, t, sizeof(t), &fit);
+    }
+    if (more) { dsl_set_err("sound.play: unexpected '%s'", t); return ParseResult::ERR_BAD_ACTION; }
+    return check_sound(a->arg0, a->arg2[0] != '\0');
+}
+
 // ── Action parsing ────────────────────────────────────────────────────────
 
 static ParseResult parse_action(const char* s, RuleAction* a) {
@@ -398,6 +488,22 @@ static ParseResult parse_action(const char* s, RuleAction* a) {
         if (r != ParseResult::OK) return r;
         if (*skip_ws(s) != '\0') { dsl_set_err("gpio.toggle takes one pin"); return ParseResult::ERR_BAD_ACTION; }
         return ParseResult::OK;
+    }
+    if (strncmp(s, "strip.set", 9) == 0 && (s[9] == ' ' || s[9] == '\0')) {
+        a->type = ActionType::STRIP_SET;
+        return parse_strip(s + 9, a, true);
+    }
+    if (strncmp(s, "strip.off", 9) == 0 && (s[9] == ' ' || s[9] == '\0')) {
+        a->type = ActionType::STRIP_OFF;
+        return parse_strip(s + 9, a, false);
+    }
+    if (strncmp(s, "sound.play", 10) == 0 && (s[10] == ' ' || s[10] == '\0')) {
+        a->type = ActionType::SOUND_PLAY;
+        return parse_sound(s + 10, a, true);
+    }
+    if (strncmp(s, "sound.stop", 10) == 0 && (s[10] == ' ' || s[10] == '\0')) {
+        a->type = ActionType::SOUND_STOP;
+        return parse_sound(s + 10, a, false);
     }
     // Tail-arg note: actions are extracted as the substring between
     // `DO ` and `ENDON`, so the last action's last argument keeps the

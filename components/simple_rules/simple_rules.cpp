@@ -78,6 +78,14 @@ void simple_rules_set_io_hooks(simple_rules_io_check_t check, simple_rules_io_ru
     s_io_run   = run;
 }
 
+static simple_rules_sound_check_t s_sound_check = nullptr;
+static simple_rules_sound_run_t   s_sound_run   = nullptr;
+void simple_rules_set_sound_hooks(simple_rules_sound_check_t check, simple_rules_sound_run_t run) {
+    dsl_set_sound_check(check);
+    s_sound_check = check;
+    s_sound_run   = run;
+}
+
 void simple_rules_set_script_hook(simple_rules_script_hook_t hook) {
     s_script_hook = hook;
 }
@@ -157,6 +165,7 @@ static void reload_locked() {
     // the rule was saved fails at fire time (an action error in the rule status), rather
     // than the whole rule, with its other actions, vanishing at this reload (spec §3).
     dsl_set_io_check(nullptr);
+    dsl_set_sound_check(nullptr);   // same for a sound removed after the rule was saved
     for (uint16_t i = 0; i < cnt && n < MAX_CACHED_RULES; i++) {
         if (slots[i].rule_type != (uint8_t)RuleType::SIMPLE) continue;
         // Parse straight into the PSRAM pool slot. ParsedRule is ~0.9 KB — each
@@ -182,6 +191,7 @@ static void reload_locked() {
         n++;
     }
     dsl_set_io_check(s_io_check);
+    dsl_set_sound_check(s_sound_check);
     simple_rules_resolve_names(fresh, n);
     for (uint16_t i = 0; i < n; i++) {
         const ParsedRule* old = nullptr;
@@ -485,6 +495,10 @@ static const char* verb(ActionType t) {
     case ActionType::GPIO_SET:      return "gpio.set";
     case ActionType::GPIO_TOGGLE:   return "gpio.toggle";
     case ActionType::PWM_SET:       return "pwm.set";
+    case ActionType::STRIP_SET:     return "strip.set";
+    case ActionType::STRIP_OFF:     return "strip.off";
+    case ActionType::SOUND_PLAY:    return "sound.play";
+    case ActionType::SOUND_STOP:    return "sound.stop";
     }
     return "?";
 }
@@ -755,6 +769,25 @@ static uint8_t execute_rule(const ParsedRule& rule, const char* event_val,
             }
             break;
 
+        case ActionType::STRIP_SET:
+        case ActionType::STRIP_OFF:
+            if (!s_io_run || !s_io_run(SimpleRulesIoOp::STRIP, a.arg0, a.arg2)) {
+                ESP_LOGW(TAG, "%s %s %s: refused", verb(a.type), a.arg0, a.arg2);
+                fail();
+            }
+            break;
+
+        case ActionType::SOUND_PLAY:
+        case ActionType::SOUND_STOP: {
+            const bool play = a.type == ActionType::SOUND_PLAY;
+            if (!s_sound_run || !s_sound_run(play, a.arg0, play && a.arg1[0] ? atoi(a.arg1) : -1,
+                                             play && a.arg2[0] != '\0')) {
+                ESP_LOGW(TAG, "%s %s: refused", verb(a.type), a.arg0);
+                fail();
+            }
+            break;
+        }
+
         default:
             break;
         }
@@ -826,7 +859,8 @@ static bool can_feed_back(const ParsedRule& r) {
     for (uint8_t i = 0; i < r.action_count; i++) {
         const ActionType t = r.actions[i].type;
         if (t == ActionType::ZIGBEE_SET || t == ActionType::ZIGBEE_TOGGLE || t == ActionType::SCRIPT ||
-            t == ActionType::GPIO_SET || t == ActionType::GPIO_TOGGLE || t == ActionType::PWM_SET)   // Hub I/O reports back too
+            t == ActionType::GPIO_SET || t == ActionType::GPIO_TOGGLE || t == ActionType::PWM_SET ||   // Hub I/O reports back too
+            t == ActionType::STRIP_SET || t == ActionType::STRIP_OFF)
             return true;
     }
     return false;
