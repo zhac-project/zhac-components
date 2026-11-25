@@ -754,8 +754,7 @@ static void send_locked(const int* fds, int n, httpd_ws_frame_t* pkt, bool reche
     char* fixed = nullptr;
     if (!utf8_valid(reinterpret_cast<const char*>(pkt->payload), pkt->len)) {
         fixed = static_cast<char*>(heap_caps_malloc(pkt->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        // PSRAM short: internal RAM stands in only up to WS_RX_INTERNAL_MAX, as for an inbound frame, and only the
-        // RAM malloc takes (MALLOC_CAP_DEFAULT: not the driver reserve). A larger frame is dropped.
+        // PSRAM short: the capped internal-RAM fallback described above.
         if (!fixed && pkt->len <= WS_RX_INTERNAL_MAX)
             fixed = static_cast<char*>(heap_caps_malloc(pkt->len, MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
         if (!fixed) return;

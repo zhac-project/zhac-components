@@ -189,7 +189,8 @@ Lua uploads) is gone.
   dead-fd sends killed via the never-log-in-send-loop rule +
   `ws_server_in_broadcast()` guard; `close_fn` slot cleanup on every session
   end (incl. RST/LRU) with explicit `close(sockfd)`; `handle_ws_control_frames
-  = false` so httpd answers PING/PONG and CLOSE itself; 8 KB PSRAM inbound
+  = false` so httpd answers PING/PONG and CLOSE itself (since reversed: the
+  handler answers control frames, see Lifecycle); 8 KB PSRAM inbound
   cap; table-full now closes the socket; reply-path eviction; single-
   broadcaster `configASSERT`. **Hardware gate:** PING→PONG keepalive and
   client-table reclaim after a hard TCP RST need manual on-device

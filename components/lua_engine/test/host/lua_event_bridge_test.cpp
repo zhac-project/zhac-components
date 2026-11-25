@@ -14,11 +14,12 @@
 
 extern "C" void lua_engine_event_bridge_start(void);
 
+static constexpr uint8_t kLuaEvtAttr = 1;   // LUA_EVT_ATTR in lua_engine_event_bridge.cpp
 static int s_attr_pushed = 0;
 
 extern "C" bool lua_scheduler_push_event(uint8_t event_kind, const void* payload_96) {
     (void)payload_96;
-    if (event_kind == 1) s_attr_pushed++;   // LUA_EVT_ATTR
+    if (event_kind == kLuaEvtAttr) s_attr_pushed++;
     return true;
 }
 
