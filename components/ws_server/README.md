@@ -108,11 +108,14 @@ token drop back to the auth-only command set.
   server's own close, so skipping the `close()` would leak the socket.
   Without this hook, abnormal disconnects only freed a table slot when a
   later send happened to fail.
-- `handle_ws_control_frames = false`: httpd itself answers PING with PONG
-  and replies to CLOSE (RFC 6455), then tears the session down through
-  `close_fn`. (The old `true` setting swallowed PING without a PONG, so
-  keepalive-probing clients timed out.) Control frames never reach
-  `ws_handler`.
+- `handle_ws_control_frames = true`: PING, PONG and CLOSE come to `ws_handler`,
+  which answers them itself, **not httpd** (RFC 6455 5.5): a PING with a PONG
+  carrying its payload, a CLOSE with an empty CLOSE (both written under the
+  send lock; httpd then ends the session through `close_fn`); a PONG is read
+  away; a control frame over 125 bytes fails its session. They come to the
+  handler so their reads run under the frame deadline: with `false`, httpd
+  read them outside it, and one trickled PING held the httpd task about 6
+  minutes (review 2026-10-28 R-04).
 
 ## Inbound path
 
