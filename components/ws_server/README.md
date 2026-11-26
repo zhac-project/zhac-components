@@ -16,7 +16,8 @@ documented in `zhac-docs/WS_API.md` (sibling repo).
 - **Used by:** zhac-wired-core, on the ESP32-P4 and the ESP32-S31.
 - **Owns:** the singleton `httpd_handle_t` — `server_port=80`,
   `max_open_sockets=9` (LWIP cap 10, one reserved for listen),
-  `max_uri_handlers=48`, `stack_size=12288` (the worst observed chain —
+  `max_uri_handlers=64` (`WS_SERVER_MAX_URI_HANDLERS` in `ws_server.h`, with
+  the count of handlers it must stay above), `stack_size=12288` (the worst observed chain —
   `api_rule_list → hap_roundtrip → SPI exchange → BULK callback →
   ws_event_broadcast → lwip_send` — tripped the canary at 8 K),
   `lru_purge_enable=true`, TCP keepalive `10/5/3`,
