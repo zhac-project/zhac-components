@@ -71,7 +71,7 @@ enum class ActionType : uint8_t {
 // `run` runs at fire time with the resolved value ("on", "1", "42.5"; "" for
 // TOGGLE): false is an action error. Either may be null.
 // STRIP (strip.set / strip.off): `run` gets "#RRGGBB" or "#RRGGBB <0-100>", the
-// tokens as typed and joined by one space (strip.set), or "#000000" (strip.off).
+// each token as typed, joined by one space (strip.set), or "#000000" (strip.off).
 enum class SimpleRulesIoOp : uint8_t { SET, TOGGLE, PWM, STRIP };
 typedef bool (*simple_rules_io_check_t)(SimpleRulesIoOp op, const char* pin, char* err, size_t cap);
 typedef bool (*simple_rules_io_run_t)(SimpleRulesIoOp op, const char* pin, const char* value);

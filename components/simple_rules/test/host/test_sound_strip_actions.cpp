@@ -158,6 +158,11 @@ int main() {
     CHECK(refused("sound.play westminster loop", "westminster cannot loop"), "sound.play: the firmware's loop refusal, as is");
     CHECK(!parses("sound.play nosuch") && std::strlen(dsl_last_error()) == kLongLen &&
           std::strcmp(dsl_last_error(), g_long) == 0, "sound.play: a 170-character refusal reaches dsl_last_error whole");
+    {
+        char err[256];
+        CHECK(!simple_rules_check("ON io#p DO sound.play nosuch ENDON", err, sizeof(err)) && std::strcmp(err, g_long) == 0,
+              "sound.play: the 170-character refusal reaches the caller's err[256] whole");
+    }
     CHECK(refused("sound.stop beep x", "sound.stop takes at most one name"), "sound.stop: two names");
     CHECK(!parses("sound.stop nosuch") && std::strcmp(dsl_last_error(), g_long) == 0, "sound.stop checks the name too");
 
@@ -240,6 +245,9 @@ int main() {
     simple_rules_set_sound_hooks(on_snd_check, nullptr);
     publish_attr("n", 1); drain();
     CHECK(g_snd.calls == 0 && last_skip_is(r5, "action_error:sound.stop"), "no sound run hook: action error, nothing runs");
+    const uint16_t r5p = add("ON io#nplay DO sound.play beep ENDON");
+    publish_attr("nplay", 1); drain();
+    CHECK(g_snd.calls == 0 && last_skip_is(r5p, "action_error:sound.play"), "no sound run hook: sound.play is an action error too");
 
     // ── run cap: a strip write is a feed-back action, a sound is not ──
     simple_rules_set_sound_hooks(on_snd_check, on_snd_run);
