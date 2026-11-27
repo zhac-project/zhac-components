@@ -306,7 +306,19 @@ static void send_auth_frame() {
 
 // ── RX dispatch ──────────────────────────────────────────────────────────
 
+// HL-02 (review 2026-11-26): while the relay dispatches a cloud write to the Alarm device, the start of the answer
+// to a change the dispatcher made ({"id":<id>,"ok":true), and whether that answer came. Only the task that set
+// s_alarm_watch_task (task_remote, in handle_rx_frame) touches the rest; a reply from any other task is not read.
+static char                      s_alarm_watch[32];
+static size_t                    s_alarm_watch_len = 0;
+static bool                      s_alarm_taken = false;
+static std::atomic<TaskHandle_t> s_alarm_watch_task{nullptr};
+
 extern "C" void remote_client_send_reply(const char* json, size_t len) {
+    // Before the link check: the hub took the change even when its answer cannot go out.
+    if (s_alarm_watch_task.load(std::memory_order_relaxed) == xTaskGetCurrentTaskHandle() && json &&
+        s_alarm_watch_len > 0 && len >= s_alarm_watch_len && std::memcmp(json, s_alarm_watch, s_alarm_watch_len) == 0)
+        s_alarm_taken = true;
     if (!s_ws || s_state.load(std::memory_order_acquire) != REMOTE_STATE_READY) return;
     // The cloud's UTF-8 guard (utf8_seq.h), as in publish_event. The caller's buffer is const and almost
     // always valid, so a copy is made only when a byte needs replacing; a reply that cannot be copied is
@@ -373,15 +385,34 @@ static void handle_rx_frame(const char* data, size_t len) {
         return;
     }
 
-    // Relay gate (spec 2026-10-05 §3.1): the allow-list, the hub's script switch, and the setting only
-    // the hub's own page may change. Each refusal has its own code, so the cloud can tell "turn the
-    // switch on" (scripts_off) from "not supported" (cmd_not_allowed).
-    bool local_only_key = false;   // remote_scripts, log_to_cloud: remote_allow.cpp kRemoteLocalOnlyKeys
+    // Relay gate (spec 2026-10-05 §3.1, review 2026-11-26 HL-03/HL-02): the allow-list, the hub's cloud-control
+    // level and its two switches, and the settings only the hub's own page may change. Each refusal has its own
+    // code, so the cloud can tell "raise the level" / "turn the switch on" (level_view, level_devices,
+    // scripts_off, alarm_off) from "not supported" (cmd_not_allowed). The settings are read for every command,
+    // so a change on the hub's page applies to the next one.
+    bool local_only_key = false;   // remote_scripts, log_to_cloud, remote_level, remote_alarm: kRemoteLocalOnlyKeys
     for (JsonPairConst kv : doc["args"].as<JsonObjectConst>())
         if (!kv.value().isNull() && remote_is_local_only_key(kv.key().c_str())) local_only_key = true;
-    const bool scripts_on = remote_scripts_allowed();
-    const char* refusal = remote_cmd_refusal(cmd, local_only_key, scripts_on);
-    if (!refusal) refusal = remote_rule_refusal(cmd, doc["args"]["dsl"] | (const char*)nullptr, scripts_on);   // LU-04
+    const remote_policy_t policy = {remote_level_now(), remote_scripts_allowed(), remote_alarm_allowed()};
+    const char* refusal = remote_cmd_refusal(cmd, local_only_key, &policy);
+    if (!refusal) refusal = remote_rule_refusal(cmd, doc["args"]["dsl"] | (const char*)nullptr, &policy);   // LU-04, HL-02
+    // HL-02 (ruling R19): a write to the Alarm device -- named by args.ieee, listed as a member of a group, or
+    // reached through a group.cmd to a group that holds it -- needs the alarm switch, but for an arm. A command the
+    // view level passes is a read. remote_ieee_arg reads an IEEE as the dispatcher does.
+    const uint64_t alarm = remote_alarm_ieee();
+    const bool group_cmd = std::strcmp(cmd, "group.cmd") == 0;
+    const char* key   = doc["args"]["key"] | (const char*)nullptr;
+    const char* value = doc["args"][group_cmd ? "val" : "value"] | (const char*)nullptr;
+    bool alarm_write = false;
+    if (!refusal && alarm) {
+        bool to_alarm = remote_ieee_arg(doc["args"]["ieee"] | (const char*)nullptr) == alarm;
+        for (JsonVariantConst m : doc["args"]["members"].as<JsonArrayConst>())
+            if (remote_ieee_arg(m["ieee"] | (const char*)nullptr) == alarm) to_alarm = true;
+        if (group_cmd && !to_alarm) to_alarm = remote_group_has(doc["args"]["id"] | (uint16_t)0, alarm);
+        const remote_policy_t view = {REMOTE_LEVEL_VIEW, false, false};
+        alarm_write = to_alarm && remote_cmd_refusal(cmd, false, &view) != nullptr;
+        if (to_alarm) refusal = remote_target_refusal(cmd, alarm, key, value, &policy);
+    }
     if (refusal) {
         char err_buf[96];
         int en = snprintf(err_buf, sizeof(err_buf),
@@ -398,8 +429,23 @@ static void handle_rx_frame(const char* data, size_t len) {
         ESP_LOGI("cloud", "%s", line);
     }
 
-    // Hand off to the shared ws_bridge dispatcher.
+    // R19: the hub tells its owner of every cloud write to the Alarm device it took. The dispatcher answers a change
+    // it made {"id":<id>,"ok":true...}, sent synchronously from this task (remote_client_send_reply notes it).
+    if (alarm_write) {
+        const int wn = snprintf(s_alarm_watch, sizeof(s_alarm_watch), "{\"id\":%lu,\"ok\":true",
+                                (unsigned long)(doc["id"] | (uint32_t)0));   // the id as dispatch_envelope reads it
+        s_alarm_watch_len = wn > 0 && (size_t)wn < sizeof(s_alarm_watch) ? (size_t)wn : 0;
+        s_alarm_taken = false;
+        s_alarm_watch_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_relaxed);
+    }
+
+    // Hand off to the shared ws_bridge dispatcher. It only reads `doc`, so cmd, key and value still point into it.
     dispatch_envelope_for_remote(REMOTE_VIRTUAL_FD, doc);
+    if (alarm_write) {
+        s_alarm_watch_task.store(nullptr, std::memory_order_relaxed);
+        const bool attr = group_cmd || std::strcmp(cmd, "device.attr.set") == 0;
+        if (s_alarm_taken) remote_alarm_changed(attr ? key : cmd, attr ? value : nullptr, doc["args"]["by"] | "");
+    }
     s_last_event_at.store((uint32_t)(esp_log_timestamp() / 1000));
 }
 

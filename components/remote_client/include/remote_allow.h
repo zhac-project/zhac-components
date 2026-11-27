@@ -2,39 +2,83 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// How much the hub lets the cloud do (review 2026-11-26 HL-03, ruling R18), set on the hub's own page only:
+// view = reads; devices = + device and group control; full = + rules, the join window, logs, script reads.
+typedef enum { REMOTE_LEVEL_VIEW = 0, REMOTE_LEVEL_DEVICES = 1, REMOTE_LEVEL_FULL = 2 } remote_level_t;
+
+// The hub's settings for one cloud command: its level, "Allow script changes from the cloud" and "Allow the cloud
+// to disarm the alarm" (HL-02, R19). The relay reads them for every command, so a change applies to the next one.
+typedef struct { remote_level_t level; bool scripts_on; bool alarm_on; } remote_policy_t;
+
 // The relay's answer to one cloud command: nullptr = pass it to the dispatcher, else the error code:
-//   "local_only"      settings.set carrying the key only the hub's own page may change
-//                     (remote_scripts), whatever the build trusts the cloud with;
-//   "scripts_off"     a switch-gated op while the hub's "Allow script changes from the cloud" switch is
-//                     off. The switch gates changing Lua and engine control (script.write, script.reload,
-//                     system.restart), a direct script.run, and a rule save that adds a script.run action
-//                     (remote_rule_refusal below);
-//   "cmd_not_allowed" anything else the relay does not pass.
-// `local_only_key`: the args carry a key `remote_is_local_only_key` accepts. `scripts_on`: the switch.
+//   "local_only"      settings.set carrying a key only the hub's own page may change (remote_is_local_only_key),
+//                     whatever the build trusts the cloud with;
+//   "cmd_not_allowed" a command the relay never passes (and every command when `p` is null);
+//   "level_view"      a command above the view level while the level is view (a level outside the enum counts
+//                     as view), "level_devices" one above devices while it is devices (HL-03);
+//   "scripts_off"     a switch-gated op at full while the script switch is off. The switch gates changing Lua
+//                     and engine control (script.write, script.reload, system.restart), a direct script.run, and
+//                     a rule save that adds a script.run action (remote_rule_refusal below).
+// `local_only_key`: the args carry a key `remote_is_local_only_key` accepts.
 // LINEAR SCANS over static arrays (~70 entries), once per cloud frame.
-const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on);
-// The relay's answer to a rule save (rule.create / rule.update) whose text is `dsl`: "scripts_off" when
-// the text runs a stored script (a `script.run` action) while the switch is off -- the cloud may not run
-// Lua on the hub by way of a new rule either (review 2026-10-24 LU-04) -- else nullptr. Rules already on
-// the hub keep running, rule.run included. Asked once remote_cmd_refusal passed.
-const char* remote_rule_refusal(const char* cmd, const char* dsl, bool scripts_on);
+const char* remote_cmd_refusal(const char* cmd, bool local_only_key, const remote_policy_t* p);
+
+// The relay's answer to a rule save (rule.create / rule.update) whose text is `dsl`, asked once remote_cmd_refusal
+// passed: "scripts_off" when the text runs a stored script (a `script.run` action) while the script switch is off --
+// the cloud may not run Lua on the hub by way of a new rule either (review 2026-10-24 LU-04); "alarm_off" when an
+// action writes to the Alarm device (a zigbee.* action naming it by its IEEE or its name) while the alarm switch is
+// off (HL-02); else nullptr. A trigger or condition that reads the Alarm device passes. Rules already on the hub keep
+// running, rule.run included. A null `p` counts as both switches off.
+const char* remote_rule_refusal(const char* cmd, const char* dsl, const remote_policy_t* p);
+
+// The relay's answer to a command aimed at device `ieee` (its args.ieee, a member it lists, a group that holds it):
+// "alarm_off" when `ieee` is the Alarm device (remote_alarm_ieee(), non-zero), the alarm switch is off and the
+// command writes to it, else nullptr (HL-02, R19). Reads pass, and so does the one write that arms: device.attr.set
+// of `alarm_state` to armed_<id> or of a profile's own key to armed (zhac-wired-core alarm.cpp local_cmd).
+// `key`, `str_value`: a device.attr.set's args (`str_value` null when the value is not a string). A null `p` counts
+// as the switch off.
+const char* remote_target_refusal(const char* cmd, uint64_t ieee, const char* key, const char* str_value,
+                                  const remote_policy_t* p);
+
+// An IEEE in a command's args read as the firmware's dispatcher reads it (zhac-wired-core ws_bridge.cpp
+// parse_ieee): an optional 0x/0X, then strtoull base 16, so every spelling the dispatcher takes for a device is
+// that device here too. 0 for null.
+uint64_t remote_ieee_arg(const char* s);
 
 // True for a settings.set key that only the hub's own page may change; the relay answers settings.set
 // carrying one of them (with any non-null value) with local_only. remote_scripts: spec 2026-10-05 §3.1;
-// log_to_cloud: spec 2026-10-06 §4.1.
+// log_to_cloud: spec 2026-10-06 §4.1; remote_level, remote_alarm: review 2026-11-26 HL-03, HL-02.
 bool remote_is_local_only_key(const char* key);
 
-// True iff `cmd` passes now: remote_cmd_refusal(cmd, false, remote_scripts_allowed()) == nullptr.
+// True iff `cmd` passes now: remote_cmd_refusal(cmd, false, <the policy the weak functions below give>) == nullptr.
 bool remote_cmd_allowed(const char* cmd);
 
-// "Allow script changes from the cloud" (spec 2026-10-05 §3.1). Weak default: false. Dual-chip and mono
-// define nothing, so script writes stay closed there; zhac-wired-core returns its NVS flag.
+// The firmware's settings and its Alarm device. Weak defaults: dual-chip and mono define nothing, so the cloud only
+// reads there; zhac-wired-core overrides them all (ws_bridge.cpp).
+// "Allow script changes from the cloud" (spec 2026-10-05 §3.1). Weak default: false.
 bool remote_scripts_allowed(void);
+// The cloud-control level (R18). Weak default: view.
+remote_level_t remote_level_now(void);
+// "Allow the cloud to disarm the alarm" (R19). Weak default: false.
+bool remote_alarm_allowed(void);
+// The Alarm device's IEEE. Weak default: 0, no Alarm device and nothing to guard.
+uint64_t remote_alarm_ieee(void);
+// The Alarm device's name, which a rule may use for it in place of its IEEE: into `out` (`cap` bytes, always
+// terminated); returns its length. Weak default: "".
+size_t remote_alarm_name(char* out, size_t cap);
+// True when group `id` lists device `ieee`, so a group.cmd reaches it. Weak default: true (fails closed: a build
+// that names an Alarm device but cannot look into its groups treats every group as holding it).
+bool remote_group_has(uint16_t id, uint64_t ieee);
+// Called on task_remote after the hub took a cloud write to the Alarm device: a device.attr.set's or group.cmd's
+// key and string value (null when not a string), else the command's name and null. `by`: the account id the cloud
+// sent, unchecked. Weak default: nothing; zhac-wired-core raises a hub alert.
+void remote_alarm_changed(const char* key, const char* value, const char* by);
 
 // True iff the event name should be mirrored to the remote sink.
 bool remote_event_allowed(const char* name);

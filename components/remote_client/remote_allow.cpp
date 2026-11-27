@@ -5,9 +5,11 @@
 //
 // MAINTENANCE: when a command is added to the firmware's dispatcher
 // (zhac-wired-core main/ws_bridge.cpp), decide whether the remote
-// channel should expose it. If yes, add the cmd name to
-// kRemoteAllowedCmds[] below. If no, no change here — the cmd is
-// implicitly denied.
+// channel should expose it. If yes, add the cmd name to the list of
+// the cloud-control level it needs (kViewCmds / kDevicesCmds /
+// kFullCmds below). If no, no change here — the cmd is implicitly
+// denied. A command that names a device in args.ieee is checked
+// against the Alarm device too (remote_target_refusal).
 //
 // PERMANENT EXCLUDES (security-driven, do not allow-list):
 //   - wifi.connect / wifi.disconnect : orphan-the-device risk.
@@ -16,6 +18,7 @@
 
 #include "remote_allow.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 // CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED. Nothing included sdkconfig.h here before, so the option never
 // took effect (fail-closed). Absent in the host tests.
@@ -25,37 +28,27 @@
 
 namespace {
 
-constexpr const char* kRemoteAllowedCmds[] = {
-    // Status / system (reads only)
-    "status.get", "alerts.get", "logs.get", "diagnostics.unhandled.get",
-    // WiFi reads only (mutators excluded — see comment above)
-    "wifi.status", "wifi.scan",
-    // Zigbee — open the join window + read; network reset is privileged
-    "zigbee.permit_join", "zigbee.permit_join.status",
-    // Devices — recoverable mutations; device.delete is privileged
-    "device.list", "device.get", "device.bind",
-    "device.rename", "device.attr.set", "device.options.set",
+// The relayed commands by the cloud-control level they need (review 2026-11-26 HL-03, ruling R18). Each level
+// passes its own list and the ones below it.
+//
+// view: the reads. WiFi mutators are excluded (see above); logs.get and script.* need full.
+constexpr const char* kViewCmds[] = {
+    "status.get", "alerts.get", "wifi.status", "wifi.scan", "zigbee.permit_join.status",
+    "device.list", "device.get", "device.groups.list",
+    "rule.list",
+    // Cloud automations: per-rule run counters.
+    "rules.status",
+    "group.list", "group.get",
+    "uplink.get", "rainmaker.status", "device.rainmaker.list",
+};
+
+// devices: device and group control, every one recoverable (device.delete is privileged).
+constexpr const char* kDevicesCmds[] = {
+    "device.bind", "device.rename", "device.attr.set", "device.options.set",
     "device.reinterview", "device.configure",
-    "device.groups.list", "device.groups.add", "device.groups.remove",
-    "device.groups.refresh",
-    // Rules
-    "rule.list", "rule.create", "rule.delete", "rule.enable", "rule.update",
-    // Cloud automations: per-rule run counters (a read) and "Run now", which
-    // runs one stored rule's own actions. A rule save that adds a `script.run`
-    // action is switch-gated (remote_rule_refusal, review LU-04); a rule already
-    // stored keeps running its script, Run now included. The cloud also limits
-    // rules with that action to owners and admins.
-    "rules.status", "rule.run",
-    // Remote editing (spec 2026-10-05 §3.1): a parse check stores nothing, and a
-    // staged part reaches flash only through script.write, which the switch gates.
-    "rule.check", "script.part",
-    // Scripts — reading, deleting (runs no code) and checking; changing them and a
-    // direct run are switch-gated below
-    "script.list", "script.read", "script.delete", "script.check",
-    // Groups
-    "group.list", "group.create", "group.get", "group.update",
-    "group.delete", "group.cmd",
-    // RainMaker bridge (Task 18) — reads + recoverable mutations, matching
+    "device.groups.add", "device.groups.remove", "device.groups.refresh",
+    "group.create", "group.update", "group.delete", "group.cmd",
+    // RainMaker bridge (Task 18) — recoverable mutations, matching
     // the group.*/device.bind bar: exposing/unexposing a device to
     // RainMaker (add/remove) and starting an association handshake
     // (assoc.set) are all reversible from the app/API with no orphan or
@@ -64,15 +57,35 @@ constexpr const char* kRemoteAllowedCmds[] = {
     // below: it is a fundamental cloud-uplink mode switch (can force a
     // reboot_required state) closer in kind to settings.set/wifi.connect
     // than to a routine device-management action.
-    "uplink.get", "rainmaker.status", "rainmaker.assoc.set",
-    "device.rainmaker.list", "device.rainmaker.add", "device.rainmaker.remove",
+    "rainmaker.assoc.set", "device.rainmaker.add", "device.rainmaker.remove",
+};
+
+// full: rules (a stored rule acts on its own, long after the cloud sent it), the join window, the hub log, and
+// script reads, deletes and checks.
+constexpr const char* kFullCmds[] = {
+    "rule.create", "rule.delete", "rule.enable", "rule.update",
+    // Cloud automations: "Run now" runs one stored rule's own actions. A rule
+    // save that adds a `script.run` action is switch-gated (remote_rule_refusal,
+    // review LU-04); a rule already stored keeps running its script, Run now
+    // included. The cloud also limits rules with that action to owners and admins.
+    "rule.run",
+    // Remote editing (spec 2026-10-05 §3.1): a parse check stores nothing, and a
+    // staged part reaches flash only through script.write, which the switch gates.
+    "rule.check", "script.part",
+    // Zigbee: the join window; network reset is privileged.
+    "zigbee.permit_join",
+    "logs.get", "diagnostics.unhandled.get",
+    // Scripts — reading, deleting (runs no code) and checking; changing them and a
+    // direct run are switch-gated below
+    "script.list", "script.read", "script.delete", "script.check",
 };
 
 // Switch-gated (spec 2026-10-05 §3.1): changing Lua and controlling the engine from
 // the cloud (script.write, script.reload, system.restart), and a direct script.run.
-// They pass only while the hub's own page has "Allow script changes from the cloud"
-// on (remote_scripts_allowed()); otherwise they are refused scripts_off, so the
-// cloud can say "turn it on" rather than "not supported". A rule save that adds a
+// They need the full level (HL-03), and then pass only while the hub's own page
+// has "Allow script changes from the cloud" on (remote_scripts_allowed());
+// otherwise they are refused scripts_off, so the cloud can say "turn it on"
+// rather than "not supported". A rule save that adds a
 // script.run action is refused the same way (remote_rule_refusal); a rule already
 // stored keeps running its script (see "Cloud automations" above).
 constexpr const char* kRemoteScriptCmds[] = {
@@ -84,7 +97,8 @@ constexpr const char* kRemoteScriptCmds[] = {
 // removal, and auth/config changes. A compromised or spoofed cloud peer (or
 // anyone holding the bearer token) would otherwise gain destructive control.
 // Exposed only when CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED is set, for operators
-// who explicitly trust the cloud endpoint. (Lua moved to the switch above.)
+// who explicitly trust the cloud endpoint, and then at the full level. (Lua moved
+// to the switch above.)
 constexpr const char* kRemotePrivilegedCmds[] = {
     "ota.s3", "ota.p4", "zigbee.reset",
     "device.delete", "settings.set", "system.token.rotate",
@@ -115,8 +129,9 @@ constexpr const char* kRemoteAllowedEvents[] = {
     "log.batch", "log.tail",
 };
 
-// settings.set keys only the hub's own page may change (the relay answers local_only).
-constexpr const char* kRemoteLocalOnlyKeys[] = { "remote_scripts", "log_to_cloud" };
+// settings.set keys only the hub's own page may change (the relay answers local_only): the level and the two
+// switches that set what the cloud may do (HL-03, HL-02), and whether the hub's log goes to it.
+constexpr const char* kRemoteLocalOnlyKeys[] = { "remote_scripts", "log_to_cloud", "remote_level", "remote_alarm" };
 
 // Changes the hub logs with the `cloud` tag (spec 2026-10-05 §3.7).
 constexpr const char* kLoggedCmds[] = {
@@ -142,36 +157,132 @@ bool account_id_ok(const char* by) {
     return n > 0;
 }
 
-} // namespace
-
-extern "C" __attribute__((weak)) bool remote_scripts_allowed(void) { return false; }
-
-extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, bool scripts_on) {
-    if (!cmd || !*cmd) return "cmd_not_allowed";
-    // Only the hub's own page turns the script switch on, whatever the build trusts the cloud with.
-    if (local_only_key && std::strcmp(cmd, "settings.set") == 0) return "local_only";
-    // The gated lists first, so an op added to kRemoteAllowedCmds by mistake stays gated (fails closed).
-    if (listed(kRemoteScriptCmds, cmd)) return scripts_on ? nullptr : "scripts_off";
+// The level `cmd` needs, or -1 when the relay never passes it. The gated lists first and the levels from the
+// top, so a command listed twice by mistake needs the most (fails closed).
+int level_needed(const char* cmd) {
+    if (listed(kRemoteScriptCmds, cmd)) return REMOTE_LEVEL_FULL;
     if (listed(kRemotePrivilegedCmds, cmd)) {
 #ifdef CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED
-        return nullptr;   // F9: only reachable when the operator explicitly trusts the cloud peer.
+        return REMOTE_LEVEL_FULL;   // F9: only reachable when the operator explicitly trusts the cloud peer.
 #else
-        return "cmd_not_allowed";
+        return -1;
 #endif
     }
-    return listed(kRemoteAllowedCmds, cmd) ? nullptr : "cmd_not_allowed";
+    if (listed(kFullCmds, cmd)) return REMOTE_LEVEL_FULL;
+    if (listed(kDevicesCmds, cmd)) return REMOTE_LEVEL_DEVICES;
+    if (listed(kViewCmds, cmd)) return REMOTE_LEVEL_VIEW;
+    return -1;
 }
 
-extern "C" const char* remote_rule_refusal(const char* cmd, const char* dsl, bool scripts_on) {
-    if (scripts_on || !cmd || !dsl) return nullptr;
+// simple_rules dsl_parser.cpp skip_ws: the blanks between the DSL's words.
+const char* skip_ws(const char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+// True when an action of rule text `dsl` writes to the Alarm device (HL-02, R19), read the way simple_rules reads
+// it (dsl_parser.cpp dsl_parse, simple_rules.cpp run_action): the actions are the text from the first " DO " after
+// "ON " to the next "ENDON", split at ';'; the first word after a zigbee.* verb is its device, an IEEE when it
+// starts 0x/0X (strtoull base 16, as the runtime reads it), else a friendly name. Triggers and conditions are not
+// read. A device word too long for the parser's 31 characters counts as the Alarm: the hub refuses that rule
+// anyway, and one that took longer words could reach the Alarm with leading zeros. Text that is no rule is the
+// parser's to refuse.
+bool rule_writes_alarm(const char* dsl, uint64_t alarm) {
+    const char* s = skip_ws(dsl);
+    if (std::strncmp(s, "ON ", 3) != 0) return false;
+    const char* act = std::strstr(skip_ws(s + 3), " DO ");
+    if (!act) return false;
+    act += 4;
+    const char* const end = std::strstr(act, "ENDON");
+    if (!end) return false;
+    char name[32];
+    name[0] = '\0';
+    remote_alarm_name(name, sizeof(name));
+    name[sizeof(name) - 1] = '\0';
+    for (const char* a = act; a < end;) {
+        const char* semi = static_cast<const char*>(std::memchr(a, ';', static_cast<size_t>(end - a)));
+        const char* const stop = semi ? semi : end;
+        const char* v = skip_ws(a);
+        if (std::strncmp(v, "zigbee.", 7) == 0) {   // no blank, ';' or 'E' in it: a match lies inside this action
+            while (v < stop && *v != ' ') v++;          // the verb; the parser wants one space after it
+            const char* w = v < stop ? skip_ws(v) : stop;
+            const char* we = w;
+            while (we < stop && *we != ' ') we++;       // copy_token: up to a space or the action's end
+            const size_t n = static_cast<size_t>(we - w);
+            if (n >= sizeof(name)) return true;
+            char ref[sizeof(name)];
+            std::memcpy(ref, w, n);
+            ref[n] = '\0';
+            const bool hex = ref[0] == '0' && (ref[1] == 'x' || ref[1] == 'X');
+            if (hex ? std::strtoull(ref, nullptr, 16) == alarm : std::strcmp(ref, name) == 0) return true;
+        }
+        a = semi ? semi + 1 : end;
+    }
+    return false;
+}
+
+} // namespace
+
+// The firmware's settings and its Alarm device (remote_allow.h). Weak: dual-chip and mono define none, so the cloud
+// only reads there.
+extern "C" __attribute__((weak)) bool remote_scripts_allowed(void) { return false; }
+extern "C" __attribute__((weak)) remote_level_t remote_level_now(void) { return REMOTE_LEVEL_VIEW; }
+extern "C" __attribute__((weak)) bool remote_alarm_allowed(void) { return false; }
+extern "C" __attribute__((weak)) uint64_t remote_alarm_ieee(void) { return 0; }
+extern "C" __attribute__((weak)) size_t remote_alarm_name(char* out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
+extern "C" __attribute__((weak)) bool remote_group_has(uint16_t, uint64_t) { return true; }
+extern "C" __attribute__((weak)) void remote_alarm_changed(const char*, const char*, const char*) {}
+
+extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, const remote_policy_t* p) {
+    if (!cmd || !*cmd || !p) return "cmd_not_allowed";
+    // Only the hub's own page changes these settings, whatever the build trusts the cloud with.
+    if (local_only_key && std::strcmp(cmd, "settings.set") == 0) return "local_only";
+    const int need = level_needed(cmd);
+    if (need < 0) return "cmd_not_allowed";
+    // HL-03: below the level the command needs. A level outside the enum (a damaged setting) counts as view.
+    const int level = p->level == REMOTE_LEVEL_DEVICES || p->level == REMOTE_LEVEL_FULL ? p->level : REMOTE_LEVEL_VIEW;
+    if (level < need) return level == REMOTE_LEVEL_VIEW ? "level_view" : "level_devices";
+    if (listed(kRemoteScriptCmds, cmd) && !p->scripts_on) return "scripts_off";
+    return nullptr;
+}
+
+extern "C" const char* remote_rule_refusal(const char* cmd, const char* dsl, const remote_policy_t* p) {
+    if (!cmd || !dsl) return nullptr;
     if (std::strcmp(cmd, "rule.create") != 0 && std::strcmp(cmd, "rule.update") != 0) return nullptr;
     // The rule DSL's only way to Lua is its `script.run <name>` action (simple_rules dsl_parser.cpp,
     // matched case-sensitively); the text anywhere else, say inside a log message, is refused too.
-    return std::strstr(dsl, "script.run") ? "scripts_off" : nullptr;
+    if (!(p && p->scripts_on) && std::strstr(dsl, "script.run")) return "scripts_off";
+    // HL-02: a stored rule acts on its own, so one that writes to the Alarm device needs the alarm switch.
+    const uint64_t alarm = remote_alarm_ieee();
+    if (alarm && !(p && p->alarm_on) && rule_writes_alarm(dsl, alarm)) return "alarm_off";
+    return nullptr;
+}
+
+extern "C" const char* remote_target_refusal(const char* cmd, uint64_t ieee, const char* key, const char* str_value,
+                                             const remote_policy_t* p) {
+    if (!cmd || ieee == 0 || ieee != remote_alarm_ieee() || (p && p->alarm_on)) return nullptr;
+    if (level_needed(cmd) == REMOTE_LEVEL_VIEW) return nullptr;   // a read
+    // R19: the cloud may arm the Alarm device. alarm.cpp local_cmd arms on alarm_state = armed_<id> and on a
+    // profile's own key = armed; everything else it takes disarms or changes it.
+    if (std::strcmp(cmd, "device.attr.set") == 0 && key && str_value &&
+        (std::strcmp(key, "alarm_state") == 0 ? std::strncmp(str_value, "armed_", 6) == 0
+                                              : std::strcmp(str_value, "armed") == 0))
+        return nullptr;
+    return "alarm_off";
+}
+
+extern "C" uint64_t remote_ieee_arg(const char* s) {
+    if (!s) return 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    return std::strtoull(s, nullptr, 16);
 }
 
 extern "C" bool remote_cmd_allowed(const char* cmd) {
-    return remote_cmd_refusal(cmd, false, remote_scripts_allowed()) == nullptr;
+    const remote_policy_t p = {remote_level_now(), remote_scripts_allowed(), remote_alarm_allowed()};
+    return remote_cmd_refusal(cmd, false, &p) == nullptr;
 }
 
 extern "C" bool remote_event_allowed(const char* name) {

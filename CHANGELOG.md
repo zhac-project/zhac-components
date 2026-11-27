@@ -7,6 +7,10 @@ versions follow the platform-wide `vYYYYMMDDVV` scheme; zhac-wired-core's
 
 ## [Unreleased]
 
+### Security
+
+- **The hub sets how far the cloud reaches** (`remote_client`, review 2026-11-26 HL-03, HL-02). Every cloud command needs the hub's cloud-control level, `remote_level_now()`: `view` (reads), `devices` (+ device and group control) or `full` (+ rules, the join window, the hub log, script reads and deletes); below it the answer is `level_view` or `level_devices`, and the script switch still gates script changes at `full`. While "Allow the cloud to disarm the alarm" (`remote_alarm_allowed()`) is off, a write to the Alarm device (`remote_alarm_ieee()`, named by its IEEE, listed as a group member, or reached by `group.cmd` through a group that holds it, `remote_group_has()`) is refused `alarm_off` unless it arms it, and so is a rule save whose action writes to it (by IEEE, or by its name, `remote_alarm_name()`); a trigger or condition on it passes. A cloud write to the Alarm device the hub takes calls `remote_alarm_changed()`. `remote_level` and `remote_alarm` are settings only the hub's page may change (`local_only`). The weak defaults are `view`, the switch off and no Alarm device; `remote_cmd_refusal` and `remote_rule_refusal` take a `remote_policy_t`, and `remote_target_refusal` and `remote_ieee_arg` are new.
+
 ### Added
 
 - **`device_shadow_persist_soon(ieee)`** (`device_shadow`, Safety profiles review F1): the device's unsaved attributes go to flash at the next sweep (within 100 ms) instead of after the sweep's wait (5 minutes after a new key, 30 when only values changed), through the `nvs_force` flag `set_config` uses. The wired hub's alarm panel calls it when a door contact or a hazard of one of its sensors changes: it seeds its sensors from those values at boot, so a power cut brought back an "open" or a "wet" that was over. Host test G23 runs one sweep of the real `task_shadow`.
