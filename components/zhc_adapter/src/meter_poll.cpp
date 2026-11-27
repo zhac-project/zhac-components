@@ -4,11 +4,9 @@
 
 namespace zhac_meter {
 
-bool mains_powered(std::uint8_t power_source) {
-    switch (power_source & 0x7F) {
-        case 0x01: case 0x02: case 0x04: case 0x05: case 0x06: return true;
-        default: return false;
-    }
+bool stays_awake(std::uint8_t power_source, std::uint8_t logical_type) {
+    const std::uint8_t ps = power_source & 0x7F;
+    return ps != 0x03 && (logical_type == 1 || ps == 0x01);
 }
 
 std::size_t reads_for(std::uint8_t flags, Read out[2]) {
@@ -57,10 +55,12 @@ bool Scheduler::add(std::uint64_t ieee, std::uint16_t nwk, std::uint8_t flags,
         s->due_ms      = now_ms + stagger(ieee, interval_ms);
         s->backoff_x2  = 2;
         s->ping_due_ms = now_ms + ping_wait(ieee, ping_interval_ms, 2);
+        s->heard_ms    = now_ms;
     }
     s->nwk = nwk;
     s->flags = flags;
-    s->awake = awake && ping_interval_ms != 0;
+    s->watched = ping_interval_ms != 0;
+    s->awake = awake && s->watched;
     s->ping_ep = ping_ep ? ping_ep : 1;
     s->seen = true;
     return true;
@@ -81,11 +81,17 @@ void Scheduler::begin_scan() {
     for (auto& s : slots_) s.seen = false;
 }
 
-bool Scheduler::refresh(std::uint64_t ieee, std::uint16_t nwk) {
+bool Scheduler::refresh(std::uint64_t ieee, std::uint16_t nwk, bool awake) {
     Slot* s = ieee ? find(ieee) : nullptr;
     if (!s) return false;
     s->nwk = nwk;
     s->seen = true;
+    awake = awake && s->watched;
+    if (s->awake != awake) {   // pinged from now on, or no longer: a new start for the ping
+        s->awake = awake;
+        s->waiting = false;
+        s->backoff_x2 = 2;
+    }
     return true;
 }
 
@@ -117,7 +123,13 @@ bool Scheduler::polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t i
 
 bool Scheduler::heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms) {
     Slot* s = ieee ? find(ieee) : nullptr;
-    if (!s || !s->awake) return false;
+    if (!s) return false;
+    s->heard_ms = now_ms;
+    if (!s->awake) {   // not pinged: only an offline verdict to take back
+        const bool back = s->offline;
+        s->offline = false;
+        return back;
+    }
     // Offline, pinged already, or due and still waiting for its turn. Offline counts on its own: at the longest
     // interval the backoff cannot grow, and a device back from offline must be reported (research 2026-11-18 B7).
     const bool silence = s->offline || s->backoff_x2 > 2 || static_cast<std::int32_t>(now_ms - s->ping_due_ms) >= 0;
@@ -155,8 +167,11 @@ std::size_t Scheduler::take_offline(std::uint32_t now_ms, std::uint64_t* out, st
     std::size_t n = 0;
     for (auto& s : slots_) {
         if (n >= max) break;
-        if (!s.ieee || !s.awake || !s.waiting || s.offline) continue;
-        if (now_ms - s.ping_sent_ms < kOfflineMs) continue;
+        if (!s.ieee || !s.watched || s.offline) continue;
+        const std::uint32_t quiet = now_ms - s.heard_ms;
+        const bool gone = s.awake ? s.waiting && now_ms - s.ping_sent_ms >= kOfflineMs && quiet >= kActiveOfflineMs
+                                  : quiet >= kPassiveOfflineMs;
+        if (!gone) continue;
         s.offline = true;
         out[n++] = s.ieee;
     }

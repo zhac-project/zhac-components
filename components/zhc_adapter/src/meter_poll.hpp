@@ -19,13 +19,19 @@
 // the device pool and the radio.
 //
 // The same table pings quiet devices, as zigbee2mqtt's availability does for
-// "active" ones (mains-powered, receiver always on): a device the hub has not
+// "active" ones (receiver always on, see stays_awake): a device the hub has not
 // heard from for the ping interval gets a genBasic zclVersion read, which is
 // herdsman's Device.ping(). So a light that never reports, driven only by its
 // own remote, still answers and keeps a fresh last_seen. An unanswered ping
 // backs off as z2m's does: 1.5x the interval, then twice as long each time
 // (10, 15, 30, 60, 120 min ... with the default 10 min), up to kPingMaxMs.
 // Anything heard from the device resets it.
+//
+// And it says when a device is offline: a pinged one once it has sent nothing
+// for kActiveOfflineMs (an hour) and left its last ping unanswered, one that is
+// not pinged (battery, asleep between its own reports) once it has sent
+// nothing for kPassiveOfflineMs (48 h) -- z2m's availability, with the hub
+// owner's timeouts (2026-11-27). Its next frame brings it back.
 #pragma once
 
 #include <cstddef>
@@ -47,12 +53,18 @@ constexpr std::size_t   kMaxPerTick = 2;
 
 constexpr std::uint32_t kPingJitterMs = 30u * 1000u;              // z2m max_jitter
 constexpr std::uint32_t kPingMaxMs    = 24u * 60u * 60u * 1000u;  // longest backoff
-constexpr std::uint32_t kOfflineMs    = 30u * 1000u;  // no frame this long after a ping: offline
+constexpr std::uint32_t kOfflineMs    = 30u * 1000u;  // no frame this long after a ping: unanswered
                                                       // (herdsman's read timeout + its retry ~25 s)
+constexpr std::uint32_t kActiveOfflineMs  = 60u * 60u * 1000u;        // pinged, silent this long: offline
+constexpr std::uint32_t kPassiveOfflineMs = 48u * 60u * 60u * 1000u;  // not pinged, silent this long: offline
 
-// ZCL Basic powerSource (bit 7 = backup battery): mains, 3-phase, DC,
-// emergency mains. 0x03 battery and 0x00 unknown are not.
-bool mains_powered(std::uint8_t power_source);
+// Keeps its receiver on, so it is pinged: z2m's "active" devices, a router
+// (node descriptor logical type 1) not on battery, or a device on single-phase
+// mains (ZCL Basic powerSource 0x01; bit 7 = backup battery). The rest --
+// battery, an end device on another or no known power source, an interview
+// that learnt neither -- sleep between their own reports: never pinged,
+// offline only after kPassiveOfflineMs.
+bool stays_awake(std::uint8_t power_source, std::uint8_t logical_type);
 
 struct Read {
     std::uint16_t cluster;
@@ -75,9 +87,10 @@ struct Due {
 
 class Scheduler {
 public:
-    // Track a device. `flags` 0 = never poll it. `awake` with a non-zero
-    // `ping_interval_ms` = ping it when quiet, on `ping_ep`. A known IEEE only
-    // gets its nwk, flags and ping settings updated (its schedules stay).
+    // Track a device. `flags` 0 = never poll it. A non-zero `ping_interval_ms`
+    // turns availability on (offline verdicts); with `awake` the device is also
+    // pinged when quiet, on `ping_ep`. A known IEEE only gets its nwk, flags
+    // and ping settings updated (its schedules and silence stay).
     // False if the table is full.
     bool add(std::uint64_t ieee, std::uint16_t nwk, std::uint8_t flags,
              std::uint32_t now_ms, std::uint32_t interval_ms,
@@ -87,9 +100,13 @@ public:
 
     // Mark-and-sweep against the platform's device pool: begin_scan, then
     // refresh() every device still there (false = unknown, add it), then
-    // end_scan drops the ones that were not.
+    // end_scan drops the ones that were not. refresh() takes the device's
+    // class again (`awake`), so a re-interview that learns it applies without
+    // a restart. ponytail: its meter flags stay as first looked up (polled
+    // plugs are mains routers from the start); look them up again on a class
+    // change if that ever matters.
     void begin_scan();
-    bool refresh(std::uint64_t ieee, std::uint16_t nwk);
+    bool refresh(std::uint64_t ieee, std::uint16_t nwk, bool awake);
     void end_scan();
 
     // Up to `max` polled devices due at `now_ms`. They stay due until
@@ -105,9 +122,10 @@ public:
     bool polled(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms,
                 bool ok = true);
 
-    // The device just sent something: its next ping is a full interval away
-    // and the backoff starts over. True when this ends a silence of at least
-    // the interval (in practice: the answer to a ping), once per silence.
+    // The device just sent something: its silence starts over, its next ping
+    // is a full interval away and the backoff starts over. True when this ends
+    // a silence of at least the interval (in practice: the answer to a ping),
+    // once per silence, or brings an offline device back.
     bool heard(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
 
     // Up to `max` devices to ping at `now_ms`. They stay due until pinged().
@@ -118,16 +136,18 @@ public:
     // this one went unanswered, once per silence -- the caller logs it.
     bool pinged(std::uint64_t ieee, std::uint32_t now_ms, std::uint32_t interval_ms);
 
-    // Devices pinged kOfflineMs ago or more that sent nothing since: now
-    // offline, each said once per silence; heard() brings one back.
+    // Devices offline now, each said once per silence; heard() brings one back.
+    // A pinged device: silent for kActiveOfflineMs, its last ping unanswered
+    // for kOfflineMs. One that is not pinged: silent for kPassiveOfflineMs.
+    // Only while availability is on (add() with a ping interval).
     std::size_t take_offline(std::uint32_t now_ms, std::uint64_t* out, std::size_t max);
     // The ping pinged() booked never left the hub (the radio refused it): no offline for it. The backoff stays, so
     // the next ping comes a little later.
     void not_sent(std::uint64_t ieee);
     // A frame the device took neither at its address nor after the address was
     // looked up again, and nobody answered the lookup: as good as an unanswered
-    // ping, so offline at the next take_offline (once per silence). Pinged
-    // devices only, as for the ping.
+    // ping, so offline at the first take_offline after kActiveOfflineMs of
+    // silence (once per silence). Pinged devices only, as for the ping.
     void unreachable(std::uint64_t ieee, std::uint32_t now_ms);
     bool offline(std::uint64_t ieee) const;
 
@@ -141,11 +161,13 @@ private:
         std::uint8_t  flags;
         std::uint8_t  ping_ep;
         bool          awake;        // pinged when quiet
+        bool          watched;      // availability on: offline verdicts at all
         bool          seen;
         bool          warned;       // already logged this failure streak
         bool          waiting;      // pinged, nothing heard since
         bool          offline;      // said so (take_offline); heard() clears it
         std::uint32_t ping_sent_ms; // the last ping
+        std::uint32_t heard_ms;     // the last frame, or when the slot was made
     };
     Slot* find(std::uint64_t ieee);
     Slot slots_[kSlots] = {};

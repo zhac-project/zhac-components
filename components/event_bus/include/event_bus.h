@@ -30,13 +30,15 @@ enum class EventType : uint8_t {
     // the "rule.*" pushes have one source instead of one per transport.
     RULE_CHANGED     = 12,
     // A device ended a silence of at least CONFIG_ZHAC_PING_S, usually by
-    // answering an availability ping, with a frame that may change no state.
-    // Payload: the ieee (uint64_t) at data[0], as DEVICE_LEAVE. Lets the hub
-    // push the new last_seen to its page and the cloud.
+    // answering an availability ping, with a frame that may change no state,
+    // or came back from offline. Payload: the ieee (uint64_t) at data[0], as
+    // DEVICE_LEAVE. Lets the hub push the new last_seen to its page and the
+    // cloud.
     DEVICE_SEEN      = 13,
-    // A pinged device that stays awake sent nothing for 30 s after the ping
-    // (research 2026-11-18 B7): offline until the frame that ends the silence
-    // (DEVICE_SEEN). Payload: the ieee (uint64_t) at data[0].
+    // A device was silent too long: one that stays awake for an hour, its
+    // last ping unanswered, one that sleeps (never pinged) for 48 h (research
+    // 2026-11-18 B7; owner 2026-11-27). Offline until the frame that ends the
+    // silence (DEVICE_SEEN). Payload: the ieee (uint64_t) at data[0].
     DEVICE_OFFLINE   = 14,
 
     // Sentinel — one past the highest valid type. Sizes the subscriber

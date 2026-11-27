@@ -49,7 +49,8 @@ ON room#temperature DO publish home/temp/c %value%/100 ENDON
 
 Full grammar in `zhac-docs/RULES_DSL.md`. Triggers: `DEVICE_ATTR`,
 `TIME_CRON`, `BOOT`, `EVENT`, `TIMER`, `MQTT_TOPIC`, `DEVICE_OFFLINE`
-(`Offline#<device>`: a mains device stopped answering its availability ping). Actions:
+(`Offline#<device>`: silent for an hour with its availability ping unanswered, or 48 h for a
+battery device). Actions:
 `ZIGBEE_SET`, `ZIGBEE_TOGGLE`, `PUBLISH`, `EVENT`, `TIMER`, `LOG`, `SCRIPT`.
 Comparison ops: `ANY` *(no operator)*, `=`, `!=`, `>`, `<`, `>=`, `<=`.
 A number with a decimal point is in real units: `temperature>25.5` is 25.5 °C

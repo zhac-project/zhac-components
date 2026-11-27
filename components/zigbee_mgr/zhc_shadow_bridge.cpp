@@ -204,6 +204,7 @@ bool zhc_poll_device_at(uint16_t index, zhac_poll_device_t* out) {
             out->ieee         = d.ieee_addr;
             out->nwk          = d.nwk_addr;
             out->power_source = d.power_source;
+            out->logical_type = d.device_type;
             static_assert(sizeof(out->model_id) == sizeof(d.model_id));
             static_assert(sizeof(out->manufacturer_name) == sizeof(d.manufacturer_name));
             memcpy(out->model_id, d.model_id, sizeof(out->model_id));
@@ -248,7 +249,8 @@ void zhc_device_seen(uint64_t ieee) {
     event_bus_publish(ev);
 }
 
-// A pinged device went silent (zhac_adapter_register_offline).
+// A device was silent too long: an hour with its ping unanswered, or 48 h when it is not pinged
+// (zhac_adapter_register_offline).
 void zhc_device_offline(uint64_t ieee) {
     Event ev{};
     ev.type = EventType::DEVICE_OFFLINE;

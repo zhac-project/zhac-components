@@ -1784,12 +1784,12 @@ void ping_heard(uint64_t ieee) {
     if (silence_ended && g_seen_cb) g_seen_cb(ieee);
 }
 
-// Keeps its receiver on: mains-powered, or an unknown power source (interview
-// missed Basic 0x0007) on a device the radio says does not sleep. z2m calls
-// these "active" devices.
+// Pinged or not: zhac_meter::stays_awake, z2m's rule. A battery sensor whose
+// power source the interview missed, parented by a router, used to count as
+// awake here, could not answer its ping and went offline within half an hour
+// (HOBEIAN ZG-102ZA, owner 2026-11-27).
 bool stays_awake(const zhac_poll_device_t& d) {
-    return zhac_meter::mains_powered(d.power_source) ||
-           (d.power_source == 0 && g_is_sleepy && !g_is_sleepy(d.ieee));
+    return zhac_meter::stays_awake(d.power_source, d.logical_type);
 }
 
 // Look a device up once: its def's meter_poll, and only when it stays awake.
@@ -1850,7 +1850,7 @@ void meter_tick() {
         d = zhac_poll_device_t{};
         if (!g_poll_source(i, &d)) break;
         if (!d.ieee) continue;
-        { MeterLock l; if (!l.ok || g_meter.refresh(d.ieee, d.nwk)) continue; }
+        { MeterLock l; if (!l.ok || g_meter.refresh(d.ieee, d.nwk, stays_awake(d))) continue; }
         d.model_id[sizeof(d.model_id) - 1] = '\0';
         d.manufacturer_name[sizeof(d.manufacturer_name) - 1] = '\0';
         const std::uint8_t flags = meter_flags_for(d);
@@ -1899,8 +1899,9 @@ void meter_tick() {
         if (l.ok) g_meter.polled(due[i].ieee, now, kMeterIntervalMs);
     }
 
-    // Pinged and silent for kOfflineMs: offline, said once per silence until
-    // a frame brings it back through ping_heard (research 2026-11-18 B7).
+    // Silent too long -- an hour with its ping unanswered, or 48 h for a device
+    // that is not pinged: offline, said once per silence until a frame brings
+    // it back through ping_heard (research 2026-11-18 B7; owner 2026-11-27).
     std::uint64_t gone[4];
     std::size_t ng = 0;
     {
@@ -1908,7 +1909,7 @@ void meter_tick() {
         if (l.ok) ng = g_meter.take_offline(now, gone, 4);
     }
     for (std::size_t i = 0; i < ng; ++i) {
-        ESP_LOGW(TAG, "[ping] 0x%016llx did not answer -- offline until it is heard",
+        ESP_LOGW(TAG, "[offline] 0x%016llx silent too long -- offline until it is heard",
                  static_cast<unsigned long long>(gone[i]));
         if (g_offline_cb) g_offline_cb(gone[i]);
     }
@@ -2128,6 +2129,10 @@ extern "C" void zhac_adapter_unreachable(uint64_t ieee) {
     if (xSemaphoreTake(g_meter_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
     g_meter.unreachable(ieee, wake_now_ms());
     xSemaphoreGive(g_meter_mtx);
+}
+
+extern "C" void zhac_adapter_heard(uint64_t ieee) {
+    ping_heard(ieee);
 }
 
 extern "C" void zhac_adapter_register_seen(zhac_seen_fn_t fn) {

@@ -128,8 +128,9 @@ static ParseResult parse_trigger(const char* s, RuleTrigger* t) {
     // that as "match any attribute change on this device" and the script
     // hook receives the full event table so a Lua handler can inspect
     // `ev.key` / `ev.value` itself.
-    // Offline#<ref>: a mains device stopped answering its availability ping (research 2026-11-18 B7). The ref
-    // reads as below; there is no #<key>.
+    // Offline#<ref>: the device went offline -- a mains one silent for an hour with its availability ping
+    // unanswered, a battery one silent for 48 h (research 2026-11-18 B7; owner 2026-11-27). The ref reads as
+    // below; there is no #<key>.
     const bool offline = strncmp(s, "Offline#", 8) == 0;
     if (offline) s += 8;
     const char* hash = strchr(s, '#');

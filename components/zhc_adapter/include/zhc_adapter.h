@@ -135,9 +135,11 @@ void zhac_adapter_register_sleepy(zhac_is_sleepy_fn_t fn);
 // The platform lists its devices through this hook: fill `out` for the
 // index-th pool entry and return true, false past the end. A pool entry that
 // must not be polled (removed, no model yet) is returned with ieee 0.
-// The same walk drives availability pings: a device that stays awake and is
-// quiet for CONFIG_ZHAC_PING_S seconds gets a genBasic zclVersion read on
-// `ping_ep`, as zigbee2mqtt's availability does (see src/meter_poll.hpp).
+// The same walk drives availability: a device that stays awake (a router not
+// on battery, or single-phase mains: z2m's "active" devices) and is quiet for
+// CONFIG_ZHAC_PING_S seconds gets a genBasic zclVersion read on `ping_ep`, as
+// zigbee2mqtt's availability does, and every device gets offline verdicts
+// (see src/meter_poll.hpp).
 typedef struct {
     uint64_t ieee;
     uint16_t nwk;
@@ -145,30 +147,42 @@ typedef struct {
     char     model_id[34];
     char     manufacturer_name[34];
     uint8_t  ping_ep;                // endpoint pings go to; 0 = endpoint 1
+    uint8_t  logical_type;           // node descriptor: 1 router, 2 end device, 0 unknown
 } zhac_poll_device_t;
 typedef bool (*zhac_poll_device_fn_t)(uint16_t index, zhac_poll_device_t* out);
 void zhac_adapter_register_poll_source(zhac_poll_device_fn_t fn);
 
 // Called (on the RX path, keep it short) when a frame ends a silence of at
 // least CONFIG_ZHAC_PING_S -- in practice the answer to a ping, which changes
-// no state. The platform tells its listeners the device's last_seen moved, as
-// zigbee2mqtt publishes last_seen for such frames.
+// no state -- or brings an offline device back. The platform tells its
+// listeners the device's last_seen moved, as zigbee2mqtt publishes last_seen
+// for such frames.
 typedef void (*zhac_seen_fn_t)(uint64_t ieee);
 void zhac_adapter_register_seen(zhac_seen_fn_t fn);
 
-// Called (from the adapter's poll task) when a pinged device that stays awake
-// sent nothing for 30 s after the ping: offline, once per silence; the frame
-// that ends it calls the seen callback above (research 2026-11-18 B7).
+// Called (from the adapter's poll task) when a device goes offline: one that
+// stays awake has sent nothing for an hour and left its last ping unanswered,
+// one that sleeps (never pinged) has sent nothing for 48 hours. Once per
+// silence; the frame that ends it calls the seen callback above (research
+// 2026-11-18 B7; the hour and the 48 hours: owner, 2026-11-27).
 void zhac_adapter_register_offline(zhac_seen_fn_t fn);
 // That device is offline now. Takes the meter lock, a leaf (nothing else is
 // locked under it), so a caller may hold the device pool lock.
 bool zhac_adapter_device_offline(uint64_t ieee);
 
 // The backend could not deliver a frame to `ieee`, and nobody answered the
-// address lookup that followed (research 2026-11-18 B1): offline at the next
-// ping tick, as after an unanswered ping. Pinged (mains) devices only; safe to
-// call from the radio task (a short wait, a miss only delays the verdict).
+// address lookup that followed (research 2026-11-18 B1): as an unanswered
+// ping, offline at the first ping tick once it has been silent for an hour.
+// Pinged (mains) devices only; safe to call from the radio task (a short wait,
+// a miss only delays the verdict).
 void zhac_adapter_unreachable(uint64_t ieee);
+
+// The device sent something that never reaches zhac_adapter_try_decode, a
+// Device Announce (a light switched back on at the wall): like any frame from
+// it, it answers the availability ping and brings an offline device back
+// through the seen callback, as zigbee2mqtt counts an announce. From the radio
+// task, with no pool lock held.
+void zhac_adapter_heard(uint64_t ieee);
 
 // Tell the adapter the (ieee, nwk) tuple for the frame it's about to
 // decode. The radio bridge calls this once per inbound APS frame

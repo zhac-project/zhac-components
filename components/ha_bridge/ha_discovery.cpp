@@ -150,7 +150,7 @@ struct Writer {
         if (name) doc["name"] = name;
         else      doc["name"] = nullptr;
         // Hub online AND the device itself: ha_bridge sets the device topic "offline"
-        // after a day of silence (battery) or an unanswered availability ping (mains,
+        // after 48 h of silence (battery) or an unanswered availability ping (mains,
         // research 2026-11-18 B7).
         snprintf(buf, sizeof(buf), "%s/availability", c.root);
         JsonArray av = doc["availability"].to<JsonArray>();

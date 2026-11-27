@@ -17,7 +17,7 @@
 //                                                    taken with discovery off too)
 //   <root>/availability                              "online" / "offline" (LWT)
 //   <root>/devices/<IEEE>/availability               battery devices only: "offline"
-//                                                    after a day of silence (ha_bridge)
+//                                                    after 48 h of silence (ha_bridge)
 // <ieee> is 16 lower-case hex digits, <IEEE> the same upper-case, as the
 // existing <root>/devices/<IEEE>/state topic already uses.
 #pragma once
@@ -49,7 +49,7 @@ using EmitFn = void (*)(const char* component, const char* topic,
 // triggers are configs, not entities: not counted), or -1 when `exposes` is
 // not a JSON array. Every entity needs the hub's and the device's own
 // availability topic. `passive_out`, when given, says whether the device is
-// passive (battery): offline after a day of silence, not by the availability ping.
+// passive (battery): offline after 48 h of silence, not by the availability ping.
 //
 // Compositions, in this order, each consuming the exposes it uses:
 //   local_temperature + a writable heating setpoint   -> climate (+ system_mode, preset,

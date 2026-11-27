@@ -40,12 +40,14 @@ static void test_reads_carry_z2m_attrs() {
     assert(reads_for(0, r) == 0);
 }
 
-static void test_mains_only() {
-    assert(mains_powered(0x01) && mains_powered(0x02) && mains_powered(0x04));
-    assert(mains_powered(0x05) && mains_powered(0x06));
-    assert(mains_powered(0x81));             // mains with backup battery
-    assert(!mains_powered(0x03) && !mains_powered(0x83));   // battery
-    assert(!mains_powered(0x00));            // unknown: caller decides
+// z2m's "active" devices: a router not on battery, or single-phase mains.
+static void test_who_stays_awake() {
+    assert(stays_awake(0x01, 2) && stays_awake(0x81, 0));    // single-phase mains, also with a backup battery
+    assert(stays_awake(0x00, 1) && stays_awake(0x04, 1));    // a router: power source unknown, DC
+    assert(!stays_awake(0x03, 1) && !stays_awake(0x83, 1));  // battery, even as a router
+    assert(!stays_awake(0x00, 2));                           // end device, power source unknown (HOBEIAN ZG-102ZA)
+    assert(!stays_awake(0x00, 0));                           // the interview learnt neither
+    assert(!stays_awake(0x04, 2) && !stays_awake(0x02, 0));  // DC, 3-phase: only as a router
 }
 
 static void test_polls_every_interval() {
@@ -129,8 +131,8 @@ static void test_scan_sweeps_devices_gone_from_pool() {
     s.add(kPlug, 1, kBoth, 0, kMin);
     s.add(kPlug2, 2, kBoth, 0, kMin);
     s.begin_scan();
-    assert(s.refresh(kPlug2, 0x9999));             // still in the pool, new nwk
-    assert(!s.refresh(0xDEADull, 1));              // never added
+    assert(s.refresh(kPlug2, 0x9999, false));      // still in the pool, new nwk
+    assert(!s.refresh(0xDEADull, 1, false));       // never added
     s.end_scan();
     assert(!s.known(kPlug) && s.known(kPlug2));
     Due d[kMaxPerTick];
@@ -207,6 +209,25 @@ static void test_heard_device_is_not_pinged() {
     assert(ping(s, last + kPing + j) == 1);        // quiet since the last report
 }
 
+// A re-interview that learns the device's class applies at the next pool scan, without a restart (review
+// 2026-11-27): a router whose node descriptor the join missed is pinged once it is known.
+static void test_refresh_takes_the_class_again() {
+    Scheduler s;
+    assert(s.add(kPlug, 1, 0, 0, kMin, false, 1, kPing));             // class unknown: not pinged
+    assert(ping(s, 2 * kPing + kPingJitterMs) == 0);
+    s.begin_scan();
+    assert(s.refresh(kPlug, 1, true));                                 // a router after all
+    s.end_scan();
+    assert(ping(s, 2 * kPing + kPingJitterMs) == 1);                   // pinged from now on
+    s.begin_scan();
+    assert(s.refresh(kPlug, 1, false));                                // and an end device again
+    s.end_scan();
+    assert(ping(s, 10 * kPing) == 0);
+    Scheduler off;                                                     // availability off: never pinged
+    assert(off.add(kPlug2, 2, 0, 0, kMin, false, 1, 0));
+    assert(off.refresh(kPlug2, 2, true) && ping(off, 10 * kPing) == 0);
+}
+
 static void test_sleepy_device_is_never_pinged() {
     Scheduler s;
     assert(s.add(kPlug, 1, 0, 0, kMin, false, 1, kPing));
@@ -256,55 +277,59 @@ static void test_unanswered_ping_warns_once() {
     assert(s.pinged(kPlug, 0, kPing));             // a new silence warns again
 }
 
-// A pinged device that sends nothing within kOfflineMs is offline -- said
-// once per silence -- and anything heard from it brings it back, as z2m's
-// availability (research 2026-11-18 B7). Only devices that stay awake.
+// A pinged device is offline once it has sent nothing for kActiveOfflineMs (an hour) and left its last ping
+// unanswered for kOfflineMs -- said once per silence -- and anything heard from it brings it back, as z2m's
+// availability (research 2026-11-18 B7; the hour: owner, 2026-11-27).
 static void test_unanswered_ping_marks_offline() {
+    const std::uint32_t hour = kActiveOfflineMs;
     Scheduler s;
-    add_awake(s, kPlug);
+    add_awake(s, kPlug);                                             // heard (made) at 0
     std::uint64_t out[4];
-    assert(s.take_offline(1000, out, 4) == 0);                     // never pinged
-    s.pinged(kPlug, 1000, kPing);
-    assert(s.take_offline(1000 + kOfflineMs - 1, out, 4) == 0);    // still within the answer window
-    assert(!s.offline(kPlug));
-    assert(s.take_offline(1000 + kOfflineMs, out, 4) == 1 && out[0] == kPlug);
+    s.pinged(kPlug, kPing, kPing);                                   // the first ping, never answered
+    assert(s.take_offline(kPing + kOfflineMs, out, 4) == 0);         // silent for 10 min only
+    assert(s.take_offline(hour - 1, out, 4) == 0 && !s.offline(kPlug));
+    assert(s.take_offline(hour, out, 4) == 1 && out[0] == kPlug);    // an hour of silence
     assert(s.offline(kPlug));
-    assert(s.take_offline(1000 + 10 * kOfflineMs, out, 4) == 0);   // once per silence
-    s.pinged(kPlug, 2000000, kPing);                                 // the next, backed-off ping
-    assert(s.take_offline(2000000 + kOfflineMs, out, 4) == 0);      // still the same silence
-    s.heard(kPlug, 2100000, kPing);
+    assert(s.take_offline(10 * hour, out, 4) == 0);                  // once per silence
+    s.pinged(kPlug, 11 * hour, kPing);                               // the next, backed-off ping
+    assert(s.take_offline(11 * hour + kOfflineMs, out, 4) == 0);     // still the same silence
+    s.heard(kPlug, 11 * hour + kOfflineMs + 1000, kPing);
     assert(!s.offline(kPlug));                                       // back
 
-    s.pinged(kPlug, 3000000, kPing);
-    s.heard(kPlug, 3000000 + 5000, kPing);                           // answered in time
-    assert(s.take_offline(3000000 + kOfflineMs, out, 4) == 0 && !s.offline(kPlug));
-    s.pinged(kPlug, 4000000, kPing);                                 // a new silence
-    assert(s.take_offline(4000000 + kOfflineMs, out, 4) == 1 && s.offline(kPlug));
+    const std::uint32_t t = 12 * hour;
+    s.pinged(kPlug, t, kPing);
+    s.heard(kPlug, t + 5000, kPing);                                 // answered in time
+    assert(s.take_offline(t + 2 * hour, out, 4) == 0 && !s.offline(kPlug));   // silent, not pinged since
+    s.pinged(kPlug, t + 2 * hour, kPing);                            // a silence two hours old by now
+    assert(s.take_offline(t + 2 * hour + kOfflineMs - 1, out, 4) == 0);       // the ping's answer window
+    assert(s.take_offline(t + 2 * hour + kOfflineMs, out, 4) == 1 && s.offline(kPlug));
 
-    assert(s.add(kPlug2, 0x2222, 0, 0, kMin));                       // sleeps: never pinged, never offline
-    s.pinged(kPlug2, 5000000, kPing);
-    assert(s.take_offline(5000000 + kOfflineMs, out, 4) == 0 && !s.offline(kPlug2));
+    assert(s.add(kPlug2, 0x2222, 0, 0, kMin));                       // availability off: never offline
+    s.pinged(kPlug2, t, kPing);
+    assert(s.take_offline(t + 100 * hour, out, 4) == 0 && !s.offline(kPlug2));
     s.forget(kPlug);
     assert(!s.offline(kPlug));
 }
 
 // A command the device took neither at its address nor after the hub looked the address up again, with no answer to
-// the lookup, counts as an unanswered ping: offline at once, once per silence (research 2026-11-18 B1).
-static void test_unreachable_marks_offline_at_once() {
+// the lookup, counts as an unanswered ping (research 2026-11-18 B1): offline once the device has been silent for the
+// hour as well, once per silence.
+static void test_unreachable_counts_as_an_unanswered_ping() {
+    const std::uint32_t hour = kActiveOfflineMs;
     Scheduler s;
     add_awake(s, kPlug);
     std::uint64_t out[4];
     s.unreachable(kPlug, 5000);
-    assert(s.take_offline(5000, out, 4) == 1 && out[0] == kPlug && s.offline(kPlug));
-    s.unreachable(kPlug, 6000);                                      // the same silence
-    assert(s.take_offline(6000, out, 4) == 0);
-    s.heard(kPlug, 7000, kPing);
+    assert(s.take_offline(5000, out, 4) == 0);                       // heard (made) 5 s ago
+    assert(s.take_offline(hour, out, 4) == 1 && out[0] == kPlug && s.offline(kPlug));
+    s.unreachable(kPlug, hour + 1000);                               // the same silence
+    assert(s.take_offline(hour + 1000, out, 4) == 0);
+    s.heard(kPlug, hour + 2000, kPing);
     assert(!s.offline(kPlug));
-    assert(s.add(kPlug2, 0x2222, 0, 0, kMin));                       // sleeps: never offline from here either
-    s.unreachable(kPlug2, 8000);
-    assert(s.take_offline(8000, out, 4) == 0 && !s.offline(kPlug2));
-    s.unreachable(0xA4C13800000000FFull, 9000);                      // unknown device: nothing
-    assert(s.take_offline(9000, out, 4) == 0);
+    assert(s.add(kPlug2, 0x2222, 0, 0, kMin, false, 1, kPing));      // sleeps: unreachable says nothing of it
+    s.unreachable(kPlug2, hour + 3000);
+    s.unreachable(0xA4C13800000000FFull, hour + 4000);               // unknown device: nothing
+    assert(s.take_offline(2 * hour, out, 4) == 0 && !s.offline(kPlug2));
 }
 
 // A device back from offline always reports the end of its silence, also at the longest ping interval, where the
@@ -313,10 +338,32 @@ static void test_back_from_offline_is_reported_at_the_longest_interval() {
     Scheduler s;
     add_awake(s, kPlug);
     std::uint64_t out[4];
-    s.pinged(kPlug, 1000, kPingMaxMs);
-    assert(s.take_offline(1000 + kOfflineMs, out, 4) == 1);
-    assert(s.heard(kPlug, 1000 + kOfflineMs + 5000, kPingMaxMs));
+    s.pinged(kPlug, kActiveOfflineMs, kPingMaxMs);
+    assert(s.take_offline(kActiveOfflineMs + kOfflineMs, out, 4) == 1);
+    assert(s.heard(kPlug, kActiveOfflineMs + kOfflineMs + 5000, kPingMaxMs));
     assert(!s.offline(kPlug));
+}
+
+// A device that is not pinged (battery, asleep between its own reports) is offline once it has sent nothing for
+// kPassiveOfflineMs, 48 h (owner, 2026-11-27). Its next frame brings it back, and heard() says so, once.
+static void test_sleepy_device_is_offline_after_two_days() {
+    const std::uint32_t days2 = kPassiveOfflineMs;
+    Scheduler s;
+    assert(s.add(kPlug, 1, 0, 0, kMin, false, 1, kPing));
+    std::uint64_t out[4];
+    assert(!s.heard(kPlug, kMin, kPing));                            // reports, online: nothing to say
+    s.unreachable(kPlug, 2 * kMin);                                  // no ping verdicts for it
+    assert(s.take_offline(kMin + days2 - 1, out, 4) == 0 && !s.offline(kPlug));
+    assert(s.take_offline(kMin + days2, out, 4) == 1 && out[0] == kPlug && s.offline(kPlug));
+    assert(s.take_offline(kMin + 2 * days2, out, 4) == 0);           // once per silence
+    assert(s.heard(kPlug, kMin + 2 * days2, kPing));                 // back, and said so
+    assert(!s.offline(kPlug));
+    assert(!s.heard(kPlug, kMin + 2 * days2 + 1000, kPing));
+    assert(ping(s, kMin + 3 * days2) == 0);                          // and never pinged
+
+    Scheduler off;                                                   // availability off: never offline
+    assert(off.add(kPlug2, 2, 0, 0, kMin, false, 1, 0));
+    assert(off.take_offline(3 * days2, out, 4) == 0 && !off.offline(kPlug2));
 }
 
 // heard() says true for the frame that ends a silence of a ping interval or
@@ -357,7 +404,7 @@ static void test_ping_wraparound() {
 
 int main() {
     test_reads_carry_z2m_attrs();
-    test_mains_only();
+    test_who_stays_awake();
     test_polls_every_interval();
     test_failed_poll_backs_off_to_interval();
     test_failure_streak_warns_once();
@@ -371,13 +418,15 @@ int main() {
     test_quiet_device_is_pinged();
     test_heard_device_is_not_pinged();
     test_sleepy_device_is_never_pinged();
+    test_refresh_takes_the_class_again();
     test_unanswered_pings_back_off();
     test_answer_resets_the_backoff();
     test_unanswered_ping_warns_once();
     test_heard_reports_the_end_of_a_silence();
     test_unanswered_ping_marks_offline();
     test_back_from_offline_is_reported_at_the_longest_interval();
-    test_unreachable_marks_offline_at_once();
+    test_unreachable_counts_as_an_unanswered_ping();
+    test_sleepy_device_is_offline_after_two_days();
     test_pings_go_one_per_tick();
     test_ping_wraparound();
     std::puts("meter_poll: all passed");

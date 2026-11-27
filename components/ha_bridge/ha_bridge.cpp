@@ -37,11 +37,12 @@ constexpr int         kQueueDepth   = 24;
 // path. The stack is in PSRAM on the S31 and the S3 builds, internal RAM on
 // the wired P4 (see ha_bridge_init).
 constexpr uint32_t    kTaskStack    = 12288;
-// A battery device that has said nothing for this long is reported offline
-// (zigbee2mqtt's default for passive devices). Mains devices are never timed
-// out here: they only report on change, so silence proves nothing. The
-// availability ping decides for them (set_online).
-constexpr uint32_t    kPassiveSilenceS = 25 * 3600;
+// A battery device that has said nothing for this long is reported offline,
+// as on the hub (zhc_adapter's kPassiveOfflineMs; owner, 2026-11-27 --
+// zigbee2mqtt's default is 25 h). Mains devices are never timed out here:
+// they only report on change, so silence proves nothing. The availability
+// ping decides for them (set_online).
+constexpr uint32_t    kPassiveSilenceS = 48 * 3600;
 
 enum class Op : uint8_t { RepublishAll, Device, Removed, Command, RetractAll, Online, Offline };
 struct Msg {
@@ -57,7 +58,7 @@ struct Msg {
 struct Published {
     uint64_t ieee;
     char*    topics;
-    bool     passive;         // battery: offline after a day of silence, not by the ping
+    bool     passive;         // battery: offline after 48 h of silence, not by the ping
     bool     offline;         // what the device's availability topic says
     bool     avail_ok;        // the broker took it; until then the tick sends it again (review 2026-11-19 P3 #2)
     volatile uint32_t last_seen_s;   // written from the state publisher's task; 32-bit, atomic
@@ -213,7 +214,7 @@ void sync_availability(Published& s, bool passive, bool ping_offline) {
 }
 
 // The availability ping's verdict, from DEVICE_OFFLINE / DEVICE_SEEN (research 2026-11-18 B7). A battery device keeps
-// its day-of-silence rule; an answer only restarts that clock.
+// its 48-hour silence rule; an answer only restarts that clock.
 void set_online(uint64_t ieee, bool online) {
     Published* s = slot_for(ieee, false);
     if (!s) return;
@@ -273,7 +274,7 @@ void tick_availability() {
         if (!p.avail_ok) break;   // the broker takes nothing now, and each try waits 2 s: the next tick goes on
         if (changed) {
             ESP_LOGI(TAG, "0x%016llx %s", (unsigned long long)p.ieee,
-                     p.passive ? (off ? "silent for a day: offline" : "back: online")
+                     p.passive ? (off ? "silent for 48 h: offline" : "back: online")
                                : (off ? "ping unanswered: offline" : "answered again: online"));
         }
     }
@@ -467,9 +468,11 @@ void ha_bridge_device_online(uint64_t ieee, bool online) {
 }
 
 void ha_bridge_publish_state(uint64_t ieee, const char* key, const char* value_json) {
-    if (!s_enabled || !key || !value_json || key[0] == '_' || !mqtt_gw_is_connected()) return;
-    // Heard from: the bridge task notices a timed-out device is back.
+    if (!s_enabled || !key || !value_json || key[0] == '_') return;
+    // Heard from, also while the broker is away (else a long outage would publish every battery device offline at
+    // the reconnect): the bridge task notices a timed-out device is back.
     if (Published* s = slot_for(ieee, false)) s->last_seen_s = now_s();
+    if (!mqtt_gw_is_connected()) return;
     publish_value(ieee, key, value_json);
 }
 

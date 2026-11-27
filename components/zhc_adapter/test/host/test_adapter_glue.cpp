@@ -98,9 +98,10 @@ static std::uint32_t pinged_with(zhac_configure_read_fn_t radio) {
     return g_now;
 }
 
+// Long enough for an offline verdict: the ping's answer window, and an hour of silence.
 static std::size_t offline_after_wait(std::uint32_t ping_at) {
     std::uint64_t out[4];
-    return g_meter.take_offline(ping_at + zhac_meter::kOfflineMs, out, 4);
+    return g_meter.take_offline(ping_at + zhac_meter::kActiveOfflineMs, out, 4);
 }
 
 int main() {
@@ -133,7 +134,7 @@ int main() {
     at = pinged_with(nobody_answers);
     offline_after_wait(at);
     g_seen = 0;
-    g_now = at + zhac_meter::kOfflineMs + 1000;
+    g_now = at + zhac_meter::kActiveOfflineMs + 1000;
     frame_from(kPlug);
     expect("  and brings an offline device back", g_seen == kPlug && !g_meter.offline(kPlug));
 
@@ -149,8 +150,28 @@ int main() {
     g_now = 5000;
     zhac_adapter_unreachable(kPlug);
     std::uint64_t gone[4];
-    expect("a device nothing reaches, not even its address lookup, is offline at the next tick",
+    expect("a device nothing reaches, not even its address lookup, counts as an unanswered ping",
+           g_meter.take_offline(g_now, gone, 4) == 0);
+    g_now = zhac_meter::kActiveOfflineMs;
+    expect("  and is offline once it has been silent for the hour",
            g_meter.take_offline(g_now, gone, 4) == 1 && gone[0] == kPlug);
+
+    // Owner 2026-11-27: a battery device, never pinged, is offline after 48 h of silence; its next frame is reported.
+    g_meter.forget(kPlug);
+    g_meter.add(kPlug, 0x1234, 0, 0, 60u * 1000u, false, 1, kPingIntervalMs);
+    g_now = zhac_meter::kPassiveOfflineMs;
+    expect("a battery device silent for 48 h is offline", g_meter.take_offline(g_now, gone, 4) == 1 && gone[0] == kPlug);
+    g_seen = 0;
+    g_now += 1000;
+    frame_from(kPlug);
+    expect("  and its next frame brings it back", g_seen == kPlug && !g_meter.offline(kPlug));
+
+    // Review 2026-11-27: a Device Announce (a light switched back on at the wall), which never reaches the decoder.
+    at = pinged_with(nobody_answers);
+    offline_after_wait(at);
+    g_seen = 0;
+    zhac_adapter_heard(kPlug);
+    expect("a Device Announce brings an offline device back", g_seen == kPlug && !g_meter.offline(kPlug));
 
     std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "passed", g_fail);
     return g_fail;

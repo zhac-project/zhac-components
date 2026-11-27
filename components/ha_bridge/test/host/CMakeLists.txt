@@ -53,7 +53,7 @@ add_test(NAME ha_command_rx COMMAND ha_command_rx_host_test)
 set(AV_SLICE ${CMAKE_CURRENT_BINARY_DIR}/availability.inc)
 add_custom_command(
     OUTPUT ${AV_SLICE}
-    COMMAND sh -c "sed -n -e '/^struct Published {/,/^};/p' -e '/^void set_availability(/,/^}/p' -e '/^void sync_availability(/,/^}/p' -e '/^void set_online(/,/^}/p' -e '/^void tick_availability(/,/^}/p' \"$0\" > \"$1\"" ${HA_BRIDGE_CPP} ${AV_SLICE}
+    COMMAND sh -c "sed -n -e '/^struct Published {/,/^};/p' -e '/^void set_availability(/,/^}/p' -e '/^void sync_availability(/,/^}/p' -e '/^void set_online(/,/^}/p' -e '/^void tick_availability(/,/^}/p' -e '/^void ha_bridge_publish_state(/,/^}/p' \"$0\" > \"$1\"" ${HA_BRIDGE_CPP} ${AV_SLICE}
     DEPENDS ${HA_BRIDGE_CPP}
     VERBATIM)
 add_executable(ha_availability_host_test test_availability.cpp ${AV_SLICE})

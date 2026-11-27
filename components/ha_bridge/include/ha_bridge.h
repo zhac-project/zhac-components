@@ -26,7 +26,7 @@ struct HaDeviceSnapshot {
     const char* exposes;   // JSON array, as zhac_adapter_build_exposes_json emits
     const char* attrs;     // JSON object of current values ({"temperature":21.4}), or null
     bool        battery_powered;   // ZCL power source "battery"; such devices go "offline"
-                                   // after a day of silence
+                                   // after 48 h of silence
     bool        offline;           // mains: did not answer its availability ping
                                    // (zhac_adapter_device_offline)
 };

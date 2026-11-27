@@ -756,6 +756,7 @@ int main() {
         plug->ieee_addr = 0xA4C1380000000001ULL;
         plug->nwk_addr = 0x1234;
         plug->power_source = 0x01;
+        plug->device_type = 1;               // a router, from the node descriptor
         strcpy(plug->model_id, "TS011F");
         strcpy(plug->manufacturer_name, "_TZ3000_okaz9tjs");
         plug->endpoint_count = 2;
@@ -775,6 +776,7 @@ int main() {
               strcmp(pd.manufacturer_name, "_TZ3000_okaz9tjs") == 0,
               "live device listed with nwk, power source and identity");
         CHECK(pd.ping_ep == 11, "pings go to the first endpoint that is not Green Power");
+        CHECK(pd.logical_type == 1, "the node descriptor's logical type goes with it (pinged or not)");
         CHECK(g_stub_poll_source(1, &pd) && pd.ieee == 0, "removed device blanked");
         CHECK(g_stub_poll_source(2, &pd) && pd.ieee == 0, "device without model blanked");
         CHECK(!g_stub_poll_source(3, &pd), "false past the end");

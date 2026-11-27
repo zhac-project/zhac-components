@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // The device availability topic's state machine, cut out of ha_bridge.cpp (see CMakeLists.txt): battery devices go
-// offline after a day of silence, mains devices when the availability ping goes unanswered (research 2026-11-18 B7),
+// offline after 48 h of silence, mains devices when the availability ping goes unanswered (research 2026-11-18 B7),
 // and the tick repairs what an event or a publish lost (review 2026-11-19 P3 #2).
 #include <cstdint>
 #include <cstdio>
@@ -13,7 +13,7 @@
 
 #define ESP_LOGI(tag, ...) ((void)(tag))
 static const char* TAG = "ha_bridge";
-constexpr uint32_t kPassiveSilenceS = 25 * 3600;
+constexpr uint32_t kPassiveSilenceS = 48 * 3600;
 static uint32_t    g_now = 1000;
 static uint32_t    now_s() { return g_now; }
 static std::string g_pub;   // what reached the broker, "<ieee low byte>=online;..."
@@ -35,7 +35,9 @@ constexpr size_t kMaxDevices = 2;
 static bool      s_enabled = true;
 static Published* s_pub = nullptr;
 const HaBridgePlatform* s_plat = nullptr;
-static bool mqtt_gw_is_connected() { return true; }
+static bool g_connected = true;
+static bool mqtt_gw_is_connected() { return g_connected; }
+static void publish_value(uint64_t, const char*, const char*) {}   // for ha_bridge_publish_state
 static uint64_t g_offline_ieee = 0;   // the adapter's verdict: this mains device is offline
 static bool device_offline(uint64_t ieee) { return ieee == g_offline_ieee; }
 static const HaBridgePlatform kPlat = {"test", nullptr, nullptr, nullptr, device_offline};
@@ -88,7 +90,7 @@ int main() {
 
     g_now += 3600;
     set_online(0xB2, false);
-    expect("a battery device keeps its day-of-silence rule", took().empty() && !sensor.offline);
+    expect("a battery device keeps its 48-hour silence rule", took().empty() && !sensor.offline);
     set_online(0xB2, true);
     expect("  an answer restarts its silence clock", took().empty() && sensor.last_seen_s == g_now);
 
@@ -125,6 +127,16 @@ int main() {
     g_broker_ok = true;
     tick_availability();
     expect("  and the next tick sends both", took() == "A1=offline;B2=offline;");
+
+    // Review 2026-11-27: a report while the broker is away still counts, so a long outage does not leave every
+    // battery device offline at the reconnect.
+    g_connected = false;
+    g_now += 1000;
+    ha_bridge_publish_state(0xB2, "contact", "true");
+    g_connected = true;
+    tick_availability();
+    expect("a battery device's report while the broker is away restarts its clock",
+           took() == "B2=online;" && !sensor.offline && sensor.last_seen_s == g_now);
 
     std::printf("%s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;

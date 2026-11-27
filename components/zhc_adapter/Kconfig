@@ -18,12 +18,16 @@ config ZHAC_PING_S
     default 600
     range 0 86400
     help
-      A mains-powered device (or one that keeps its receiver on) the hub has
-      not heard from for this many seconds gets a ping, a read of Basic
-      zclVersion, like zigbee2mqtt's availability (active timeout, default
-      10 min). A device that answers keeps a fresh last_seen even when it
-      never reports, e.g. a light driven only by its own remote. Unanswered
-      pings back off as z2m's do: 1.5x, then twice as long each time, up to
-      a day. 0 turns pings off.
+      A device that keeps its receiver on (a router not on battery, or a
+      mains-powered one) the hub has not heard from for this many seconds
+      gets a ping, a read of Basic zclVersion, like zigbee2mqtt's
+      availability (active timeout, default 10 min). A device that answers
+      keeps a fresh last_seen even when it never reports, e.g. a light driven
+      only by its own remote. Unanswered pings back off as z2m's do: 1.5x,
+      then twice as long each time, up to a day. Such a device is offline
+      once it has sent nothing for an hour with its ping unanswered; a device
+      that is not pinged (battery) once it has sent nothing for 48 hours.
+      0 turns pings and the hub's offline verdicts off (Home Assistant still
+      marks a battery device unavailable after 48 hours of silence).
 
 endmenu
