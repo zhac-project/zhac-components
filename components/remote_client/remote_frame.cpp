@@ -11,12 +11,23 @@ bool remote_frame_reset(RemoteFrameAsm& a) {
     a.buf  = nullptr;
     a.len  = 0;
     a.held = 0;
+    a.lost = false;
     return had;
 }
 
 RemoteFrameStep remote_frame_feed(RemoteFrameAsm& a, uint8_t op_code, const char* data, int data_len,
                                   int payload_len, int payload_offset, bool fin) {
     RemoteFrameStep s;
+    if (a.lost) return s;
+    // A piece with no bytes in a frame that has some is a payload read that timed out (the transport's timeout
+    // code is 0). IDF v6.0's transport_ws then forgets where the frame ends and reads the rest of it as new frame
+    // headers, so the pieces after it, even at offset 0, may be bytes from inside the frame (HL-01, fix round 1).
+    // Nothing more is taken until the link reconnects; v6.1 keeps its place, but both boards reconnect.
+    if (data_len == 0 && payload_len > 0) {
+        remote_frame_reset(a);
+        a.lost = s.lost = true;
+        return s;
+    }
     if (payload_offset == 0) {
         // A new frame: one not yet whole can no longer be finished.
         s.broken = remote_frame_reset(a);

@@ -20,6 +20,7 @@ struct Fed {
     std::vector<std::string> frames;
     int too_large = 0;
     int broken = 0;
+    int lost = 0;
 };
 
 // One DATA event. A frame that comes out is kept, then released as task_remote releases it after the parse.
@@ -28,6 +29,7 @@ static void feed(RemoteFrameAsm& a, Fed& f, uint8_t op, const std::string& data,
     const RemoteFrameStep s = remote_frame_feed(a, op, data.data(), (int)data.size(), payload_len, offset, fin);
     f.too_large += s.too_large;
     f.broken += s.broken;
+    f.lost += s.lost;
     if (s.frame) {
         assert(s.frame[s.len] == '\0');
         f.frames.emplace_back(s.frame, s.len);
@@ -129,6 +131,28 @@ static void resetDropsPartial() {
     assert(f.frames.empty() && f.broken == 0 && !remote_frame_reset(a));
 }
 
+static void lostPlaceRefusedUntilReset() {
+    RemoteFrameAsm a{t_alloc, t_release};
+    Fed f;
+    const int n = (int)kCmd.size();
+    // A stalled read inside a frame comes as a piece with no bytes. IDF v6.0's transport then reads the rest of
+    // the frame as new frames, so everything after it is refused, even a whole frame at offset 0, until the reset.
+    feed(a, f, 0x01, kCmd.substr(0, 20), n, 0);
+    feed(a, f, 0x01, "", n, 20);                     // the stall
+    assert(f.lost == 1 && f.broken == 0 && s_live == 0);
+    feed(a, f, 0x01, kCmd.substr(20), n, 20);        // the same receive call goes on at that offset,
+    feed(a, f, 0x01, kCmd, n, 0);                    // the next one starts at offset 0
+    feed(a, f, 0x01, kCmd.substr(0, 20), n, 0);
+    assert(f.frames.empty() && f.lost == 1 && f.broken == 0 && f.too_large == 0 && s_live == 0);
+    assert(!remote_frame_reset(a));                  // nothing held; the reconnect clears the lost place
+    feed(a, f, 0x01, kCmd, n, 0);
+    assert(f.frames.size() == 1 && f.frames[0] == kCmd);
+    // A stall at a frame's first read counts the same (no "dropped" warning on top).
+    feed(a, f, 0x01, "", n, 0);
+    assert(f.lost == 2 && f.broken == 0 && s_live == 0);
+    remote_frame_reset(a);
+}
+
 static void otherFramesIgnored() {
     RemoteFrameAsm a{t_alloc, t_release};
     Fed f;
@@ -136,7 +160,7 @@ static void otherFramesIgnored() {
     feed(a, f, 0x02, kCmd, (int)kCmd.size(), 0);     // binary
     feed(a, f, 0x09, "", 0, 0);                      // ping
     feed(a, f, 0x00, kCmd, (int)kCmd.size(), 0);     // a continuation with no message before it
-    assert(f.frames.empty() && f.too_large == 0 && f.broken == 0 && s_live == 0);
+    assert(f.frames.empty() && f.too_large == 0 && f.broken == 0 && f.lost == 0 && s_live == 0);
 }
 
 // Where the parse ends when ArduinoJson reads through RemoteJsonReader, as handle_rx_frame does; SIZE_MAX on an error.
@@ -167,6 +191,7 @@ int main() {
     piecesThatDoNotFitRefused();
     newFrameRestarts();
     resetDropsPartial();
+    lostPlaceRefusedUntilReset();
     otherFramesIgnored();
     trailingBytesRefused();
     printf("remote_frame_tests: ok\n");

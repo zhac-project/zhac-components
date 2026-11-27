@@ -220,6 +220,8 @@ extern "C" size_t remote_client_tx_free(void) {
 // becomes. Only the websocket client's task touches it: stop_ws_client ends one client before the next starts.
 static void* rx_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
 static RemoteFrameAsm s_rx_frame{rx_alloc, heap_caps_free};
+// Set when the assembler finds the link lost its place in a frame; READY turns it into a reconnect (HL-01).
+static std::atomic<bool> s_rx_lost{false};
 
 // A new or a lost connection ends the frame being put together (HL-01).
 static void rx_frame_reset() {
@@ -264,6 +266,11 @@ static void ws_event_handler(void* /*arg*/, esp_event_base_t /*base*/,
             const RemoteFrameStep s = remote_frame_feed(s_rx_frame, d->op_code, d->data_ptr, d->data_len,
                                                         d->payload_len, d->payload_offset, d->fin);
             if (s.broken) ESP_LOGW(TAG, "rx: dropped a frame before it was whole");
+            if (s.lost) {   // a stalled read inside a frame: nothing after it can be trusted on this connection
+                ESP_LOGW("cloud", "the cloud link lost its place in a frame; reconnecting");
+                s_rx_lost.store(true);
+                xEventGroupSetBits(s_remote_evt, EVB_WSS_EVENT);
+            }
             // R20: one line per such frame, with no id (the frame was never parsed). "cloud" is not one of the
             // link's own log tags, so the line reaches the cloud in log.batch when Log to cloud takes warnings;
             // it always lands in the hub's log.
@@ -495,6 +502,9 @@ static void stop_ws_client() {
     esp_websocket_client_stop(s_ws);
     esp_websocket_client_destroy(s_ws);
     s_ws = nullptr;
+    // No partial frame or lost place outlives the client (HL-01); its task, the only other user, has ended.
+    rx_frame_reset();
+    s_rx_lost.store(false);
 }
 
 static void drain_tx_queue() {
@@ -647,7 +657,8 @@ static void task_remote_body(void*) {
                 // otherwise pin us in READY, retrying sends into a dead socket forever ("Websocket
                 // client is not connected") and forcing a manual remote.disconnect/connect. The
                 // ~1 s wait-bits timeout re-runs this, bounding recovery → BACKOFF → auto-reconnect.
-                if (s_ws && !esp_websocket_client_is_connected(s_ws)) {
+                // A link that lost its place in a frame (s_rx_lost, HL-01) takes the same way out.
+                if (s_ws && (s_rx_lost.load() || !esp_websocket_client_is_connected(s_ws))) {
                     step(REMOTE_EV_WSS_ERROR);
                     break;   // don't drain TX into a dead socket
                 }

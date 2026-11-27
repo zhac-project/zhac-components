@@ -17,6 +17,7 @@ struct RemoteFrameAsm {
     char* buf  = nullptr;   // payload_len + 1 bytes while a frame is put together
     int   len  = 0;         // that frame's payload_len
     int   held = 0;         // its bytes so far
+    bool  lost = false;     // the link lost its place in a frame; only remote_frame_reset clears it
 };
 
 // What one piece gave.
@@ -25,16 +26,19 @@ struct RemoteFrameStep {
     size_t len       = 0;
     bool   too_large = false;     // a text frame over 8,192 bytes, or the first of a message in several frames
     bool   broken    = false;     // a frame being put together was dropped before it was whole
+    bool   lost      = false;     // this piece showed the link lost its place: once, until remote_frame_reset
 };
 
 // Feeds one piece. A piece at payload_offset 0 starts a frame, after dropping one not yet whole; a text frame
 // (op_code 0x01), final, 1 to 8,192 bytes long, is put together. Each next piece must carry the same opcode, fin
 // and payload_len, at the offset of the bytes held so far; anything else drops the frame. Binary and control
-// frames, continuation frames (op_code 0x00) and empty frames are never taken.
+// frames, continuation frames (op_code 0x00) and empty frames are never taken. A piece with no bytes in a frame
+// that has some (a stalled read) marks the link lost: the frame is dropped and every piece refused until the reset.
 RemoteFrameStep remote_frame_feed(RemoteFrameAsm& a, uint8_t op_code, const char* data, int data_len,
                                   int payload_len, int payload_offset, bool fin);
 
-// Drops a frame being put together (the link connected, closed or failed). True when there was one.
+// Drops a frame being put together and clears a lost place (the link connected, closed or failed, or its client
+// was stopped). True when a frame was held.
 bool remote_frame_reset(RemoteFrameAsm& a);
 
 // True when only JSON whitespace (space, tab, CR, LF) follows the parsed value in buf[parsed_end, len).
