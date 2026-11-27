@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # components/tg_gw/CMakeLists.txt
 # A single-chip firmware (zhac-wired-core: P4, S31) sets ZHAC_MQTT_GW_LOCAL_CLIENT
 # (see mqtt_gw) and gets tg_gw_local.cpp: the hub posts to api.telegram.org

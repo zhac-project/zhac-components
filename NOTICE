@@ -1,10 +1,45 @@
 zhac-components — Shared ESP-IDF components for ZHAC
 Copyright © 2025–2026 Evgenij Cjura and project contributors.
 
-Per-component licensing is documented in `LICENSE`, in each
-component's own `LICENSE` file, and via SPDX headers on every source
-file. Components are a mix of Apache-2.0, AGPL-3.0-or-later, and
-MIT (vendored `arduinojson`).
+================================================================================
+Licensing
+================================================================================
+
+The components carry different licenses. Every ZHAC-authored file
+names its license in an `SPDX-License-Identifier:` header, and that
+header is authoritative; the vendored upstream sources keep their own
+notices. The license texts are `LICENSE` (AGPL-3.0), `LICENSE-APACHE`
+(Apache-2.0) and the files in `LICENSES/`.
+
+- Apache-2.0: `zap_common`, `metrics`.
+- MIT (vendored upstream code, see below): `arduinojson`, `lua_cjson`.
+  Their ZHAC build files and tests are AGPL-3.0-or-later.
+- AGPL-3.0-or-later: every other component — `cron_parser`,
+  `device_backend`, `device_cmd`, `device_shadow`, `event_bus`,
+  `ha_bridge`, `hap_json`, `hap_protocol`, `hap_session`,
+  `lua_engine`, `mqtt_gw`, `ntp_cfg`, `remote_client`, `rule_store`,
+  `simple_rules`, `tg_gw`, `ws_server`, `zap_store`, `zap_tls`,
+  `zhc_adapter`, `zigbee_mgr`, `znp_driver`. A few host-test shims in
+  these components are tagged Apache-2.0.
+
+Rationale for the split:
+
+- `zap_common` + `metrics` are portable utilities reused by
+  `embedded-zhc` (also Apache-2.0) and are valuable as a standalone
+  library outside ZHAC. Keeping them permissive preserves that
+  reusability.
+- Everything else is tightly coupled to ZHAC's architecture
+  (HAP wire format, device-shadow persistence, the ZHC bridge)
+  and carries ZHAC's copyleft terms.
+
+================================================================================
+Contributions
+================================================================================
+
+Contributions are accepted only under the Contributor License
+Agreement in `CLA.md`, which grants the project maintainer the
+right to sublicense contributed work under alternative terms —
+including proprietary licenses — for commercial offerings of ZHAC.
 
 ================================================================================
 Trademarks
@@ -31,6 +66,15 @@ Third-party components vendored in this repository
    `hap_json` (any firmware that pulls it from zhac-components) do
    not need to re-fetch it separately.
 
+2. lua-cjson 2.1.0.14 — components/lua_cjson/src/
+   Copyright © 2010-2012 Mark Pulford
+   Licensed under the MIT License.
+   Upstream: https://github.com/openresty/lua-cjson
+   See components/lua_cjson/src/LICENSE
+
+   lua-cjson gives the hub's Lua scripts JSON support; `lua_engine`
+   links it when CONFIG_LUA_ENGINE_WITH_CJSON=y.
+
 ================================================================================
 Third-party dependencies pulled at build time (not vendored)
 ================================================================================
@@ -44,9 +88,9 @@ Third-party dependencies pulled at build time (not vendored)
 License compatibility
 ================================================================================
 
-The MIT-licensed `arduinojson` is compatible with both Apache-2.0 and
-AGPL-3.0-or-later. The Apache-2.0 components (`zap_common`,
-`metrics`) are compatible with the AGPL-3.0-or-later ones in a
-combined firmware build: the combined work is distributed under
-AGPL-3.0-or-later; each upstream component retains its own license
+The MIT-licensed `arduinojson` and `lua_cjson` are compatible with
+both Apache-2.0 and AGPL-3.0-or-later. The Apache-2.0 components
+(`zap_common`, `metrics`) are compatible with the AGPL-3.0-or-later
+ones: a firmware build that links both is distributed as a combined
+work under AGPL-3.0-or-later; each component retains its own license
 when used in isolation.

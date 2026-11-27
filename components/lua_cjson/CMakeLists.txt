@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ESP-IDF component wrapper for openresty/lua-cjson 2.1.0.14.
 #
 # Upstream: https://github.com/openresty/lua-cjson

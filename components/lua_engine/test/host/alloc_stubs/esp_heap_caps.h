@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Host stand-in for esp_heap_caps.h, modelling the IDF heap choice lua_alloc.c relies on: two heaps, internal RAM
 // first for a request either may serve; heap_caps_realloc keeps a block in its own heap when that heap has every
 // asked cap and room (multi_heap_realloc), and otherwise allocates in the first heap that has them.

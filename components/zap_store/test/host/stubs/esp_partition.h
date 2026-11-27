@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include <cstdint>
 typedef enum { ESP_PARTITION_TYPE_APP = 0x00, ESP_PARTITION_TYPE_DATA = 0x01 } esp_partition_type_t;

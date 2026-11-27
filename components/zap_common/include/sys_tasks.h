@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //
 // sys_tasks — every FreeRTOS task with its CPU share, core, priority and stack
 // headroom, for the Diag page ("which task eats core 0?"). Header-only, like

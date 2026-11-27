@@ -75,15 +75,18 @@ cmake -B build -S . && cmake --build build && ctest --test-dir build
 - **zap_common / metrics** are Apache-2.0. They are portable utilities
   reused by `embedded-zhc` (also Apache) and should stay reusable
   outside ZHAC.
-- **`arduinojson`** retains its upstream **MIT** license — vendored
-  copy of bblanchon/ArduinoJson. See `components/arduinojson/LICENSE`.
+- **`arduinojson`** and **`lua_cjson`** keep their upstream **MIT**
+  licenses — vendored copies of bblanchon/ArduinoJson and
+  openresty/lua-cjson. See `components/arduinojson/LICENSE` and
+  `components/lua_cjson/src/LICENSE`.
 - **All other components** are AGPL-3.0-or-later. They are
   firmware-specific, tied to ZHAC's architecture.
 
 Combining Apache-2.0 + MIT + AGPL-3.0 code in a single firmware build is
 legal: the combined work is distributed under AGPL-3.0-or-later; the
 Apache-2.0 / MIT parts remain under their own licenses when used in
-isolation. See `LICENSE` for the umbrella overview and `NOTICE` for
+isolation. `LICENSE` is the AGPL-3.0 text and `LICENSE-APACHE` the
+Apache-2.0 text; `NOTICE` lists each component's license and the
 third-party attribution.
 
 ## Versioning

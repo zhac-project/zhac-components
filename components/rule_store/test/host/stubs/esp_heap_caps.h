@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 #include <cstdlib>
 #define MALLOC_CAP_SPIRAM 0x0400
