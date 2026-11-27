@@ -40,11 +40,24 @@ const char* remote_rule_refusal(const char* cmd, const char* dsl, const remote_p
 // The relay's answer to a command aimed at device `ieee` (its args.ieee, a member it lists, a group that holds it):
 // "alarm_off" when `ieee` is the Alarm device (remote_alarm_ieee(), non-zero), the alarm switch is off and the
 // command writes to it, else nullptr (HL-02, R19). Reads pass, and so does the one write that arms: device.attr.set
-// of `alarm_state` to armed_<id> or of a profile's own key to armed (zhac-wired-core alarm.cpp local_cmd).
+// of `alarm_state` to armed_<id> or of a profile's own key to armed (zhac-wired-core alarm.cpp local_cmd), when
+// remote_alarm_arm_replaces(<id>) says it stops no other profile (final review 2026-11-27 Critical 1).
 // `key`, `str_value`: a device.attr.set's args (`str_value` null when the value is not a string). A null `p` counts
 // as the switch off.
 const char* remote_target_refusal(const char* cmd, uint64_t ieee, const char* key, const char* str_value,
                                   const remote_policy_t* p);
+
+// rule.run of stored rule `id` (HL-02, final review 2026-11-27): "alarm_off" when the alarm switch is off and the
+// rule's stored text (remote_rule_text) writes to the Alarm device, read as a rule save is; nullptr otherwise, and
+// for a rule that is not stored, so the dispatcher answers as before. A null `p` counts as the switch off.
+const char* remote_rule_run_refusal(uint16_t id, const remote_policy_t* p);
+
+// True when rule text `dsl` writes to the Alarm device (remote_alarm_ieee(), non-zero), read as remote_rule_refusal
+// reads it. The relay raises the owner's alert for such a save it passed (R19).
+bool remote_rule_writes_alarm(const char* dsl);
+
+// An account id as the cloud sends one in args.by: 1-40 of [0-9a-f-].
+bool remote_account_id_ok(const char* by);
 
 // An IEEE in a command's args read as the firmware's dispatcher reads it (zhac-wired-core ws_bridge.cpp
 // parse_ieee): an optional 0x/0X, then strtoull base 16, so every spelling the dispatcher takes for a device is
@@ -75,9 +88,16 @@ size_t remote_alarm_name(char* out, size_t cap);
 // True when group `id` lists device `ieee`, so a group.cmd reaches it. Weak default: true (fails closed: a build
 // that names an Alarm device but cannot look into its groups treats every group as holding it).
 bool remote_group_has(uint16_t id, uint64_t ieee);
+// True when arming profile `id` of the Alarm device would stop another profile: an intrusion profile while another
+// intrusion profile is armed or arming (zhac-wired-core alarm.cpp alarm_arm_replaces). Weak default: true (fails
+// closed: a build that cannot ask refuses every arm with the alarm switch off).
+bool remote_alarm_arm_replaces(const char* id);
+// The stored text of rule `id` into `out` (`cap` bytes, always terminated); returns its full length, as snprintf
+// does, or 0 when no such rule is stored. Weak default: 0.
+size_t remote_rule_text(uint16_t id, char* out, size_t cap);
 // Called on task_remote after the hub took a cloud write to the Alarm device: a device.attr.set's or group.cmd's
 // key and string value (null when not a string), else the command's name and null. `by`: the account id the cloud
-// sent, unchecked. Weak default: nothing; zhac-wired-core raises a hub alert.
+// sent when remote_account_id_ok passes it, else "". Weak default: nothing; zhac-wired-core raises a hub alert.
 void remote_alarm_changed(const char* key, const char* value, const char* by);
 
 // True iff the event name should be mirrored to the remote sink now: remote_event_allowed_at(name,

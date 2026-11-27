@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 // CONFIG_ZHAC_REMOTE_ALLOW_PRIVILEGED. Nothing included sdkconfig.h here before, so the option never
 // took effect (fail-closed). Absent in the host tests.
 #if __has_include("sdkconfig.h")
@@ -199,15 +200,22 @@ bool rule_writes_alarm(const char* dsl, uint64_t alarm) {
     act += 4;
     const char* const end = std::strstr(act, "ENDON");
     if (!end) return false;
-    char name[32];
+    char name[32], hex[17];
     name[0] = '\0';
     remote_alarm_name(name, sizeof(name));
     name[sizeof(name) - 1] = '\0';
+    std::snprintf(hex, sizeof(hex), "%016llX", static_cast<unsigned long long>(alarm));
     for (const char* a = act; a < end;) {
         const char* semi = static_cast<const char*>(std::memchr(a, ';', static_cast<size_t>(end - a)));
         const char* const stop = semi ? semi : end;
         const char* v = skip_ws(a);
-        if (std::strncmp(v, "zigbee.", 7) == 0) {   // no blank, ';' or 'E' in it: a match lies inside this action
+        if (std::strncmp(v, "publish ", 8) == 0) {
+            // Final review 2026-11-27 Minor 1: ha_bridge drives a device from <root>/devices/<16 hex digits, either
+            // case>/<key>/set (parse_command_topic), so a topic holding the Alarm's IEEE writes to it.
+            const char* t = skip_ws(v + 8);
+            for (; t + 16 <= stop && *t != ' '; t++)
+                if (strncasecmp(t, hex, 16) == 0) return true;
+        } else if (std::strncmp(v, "zigbee.", 7) == 0) {   // no blank, ';' or 'E' in it: a match lies inside this action
             while (v < stop && *v != ' ') v++;          // the verb; the parser wants one space after it
             const char* w = v < stop ? skip_ws(v) : stop;
             const char* we = w;
@@ -238,6 +246,11 @@ extern "C" __attribute__((weak)) size_t remote_alarm_name(char* out, size_t cap)
     return 0;
 }
 extern "C" __attribute__((weak)) bool remote_group_has(uint16_t, uint64_t) { return true; }
+extern "C" __attribute__((weak)) bool remote_alarm_arm_replaces(const char*) { return true; }
+extern "C" __attribute__((weak)) size_t remote_rule_text(uint16_t, char* out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    return 0;
+}
 extern "C" __attribute__((weak)) void remote_alarm_changed(const char*, const char*, const char*) {}
 
 extern "C" const char* remote_cmd_refusal(const char* cmd, bool local_only_key, const remote_policy_t* p) {
@@ -265,16 +278,35 @@ extern "C" const char* remote_rule_refusal(const char* cmd, const char* dsl, con
     return nullptr;
 }
 
+extern "C" bool remote_rule_writes_alarm(const char* dsl) {
+    const uint64_t alarm = remote_alarm_ieee();
+    return alarm && dsl && rule_writes_alarm(dsl, alarm);
+}
+
+extern "C" const char* remote_rule_run_refusal(uint16_t id, const remote_policy_t* p) {
+    if ((p && p->alarm_on) || !remote_alarm_ieee()) return nullptr;
+    char dsl[512];   // rule_store keeps 500 bytes of text (zap_common.h RuleSlot)
+    const size_t n = remote_rule_text(id, dsl, sizeof(dsl));
+    if (n == 0) return nullptr;
+    // A text cut short has no ENDON for the check to find: it cannot tell, so it refuses.
+    return n >= sizeof(dsl) || remote_rule_writes_alarm(dsl) ? "alarm_off" : nullptr;
+}
+
+extern "C" bool remote_account_id_ok(const char* by) { return account_id_ok(by); }
+
 extern "C" const char* remote_target_refusal(const char* cmd, uint64_t ieee, const char* key, const char* str_value,
                                              const remote_policy_t* p) {
     if (!cmd || ieee == 0 || ieee != remote_alarm_ieee() || (p && p->alarm_on)) return nullptr;
     if (level_needed(cmd) == REMOTE_LEVEL_VIEW) return nullptr;   // a read
     // R19: the cloud may arm the Alarm device. alarm.cpp local_cmd arms on alarm_state = armed_<id> and on a
-    // profile's own key = armed; everything else it takes disarms or changes it.
-    if (std::strcmp(cmd, "device.attr.set") == 0 && key && str_value &&
-        (std::strcmp(key, "alarm_state") == 0 ? std::strncmp(str_value, "armed_", 6) == 0
-                                              : std::strcmp(str_value, "armed") == 0))
-        return nullptr;
+    // profile's own key = armed; everything else it takes disarms or changes it. But arming one intrusion profile
+    // stops every other one, from Away to a profile that guards less (final review 2026-11-27 Critical 1): only an
+    // arm that stops nothing passes.
+    if (std::strcmp(cmd, "device.attr.set") == 0 && key && str_value) {
+        const bool summary = std::strcmp(key, "alarm_state") == 0;
+        if (summary ? std::strncmp(str_value, "armed_", 6) == 0 : std::strcmp(str_value, "armed") == 0)
+            return remote_alarm_arm_replaces(summary ? str_value + 6 : key) ? "alarm_off" : nullptr;
+    }
     return "alarm_off";
 }
 

@@ -19,6 +19,18 @@ extern "C" uint64_t remote_alarm_ieee(void) { return g_alarm; }
 extern "C" size_t remote_alarm_name(char* out, size_t cap) {
     return static_cast<size_t>(std::snprintf(out, cap, "%s", g_alarm_name));
 }
+// The Alarm's "would this arm stop another profile?" (alarm.cpp alarm_arm_replaces) and the rule store (ws_bridge.cpp
+// remote_rule_text), set per case. Only rule 7 is stored.
+static bool g_replaces = false;
+static const char* g_replaces_id = nullptr;
+extern "C" bool remote_alarm_arm_replaces(const char* id) {
+    g_replaces_id = id;
+    return g_replaces;
+}
+static const char* g_rule7 = nullptr;
+extern "C" size_t remote_rule_text(uint16_t id, char* out, size_t cap) {
+    return id == 7 && g_rule7 ? static_cast<size_t>(std::snprintf(out, cap, "%s", g_rule7)) : 0;
+}
 
 static constexpr remote_level_t V = REMOTE_LEVEL_VIEW, D = REMOTE_LEVEL_DEVICES, F = REMOTE_LEVEL_FULL;
 static remote_policy_t pol(remote_level_t level, bool scripts_on = false, bool alarm_on = false) {
@@ -164,6 +176,57 @@ static void alarmArmAllowedWhenOff() {
         assert(remote_target_refusal(c, kAlarm, nullptr, nullptr, &p) == nullptr);
 }
 
+// Final review 2026-11-27 Critical 1: arming one intrusion profile stops every other one (Away armed, the cloud arms
+// Night, which guards less), so with the switch off an arm passes only when the Alarm says it stops nothing.
+static void alarmArmThatReplacesRefusedWhenOff() {
+    const remote_policy_t off = pol(D, false, false), on = pol(D, false, true);
+    g_replaces = true;
+    expect(remote_target_refusal("device.attr.set", kAlarm, "alarm_state", "armed_night", &off), "alarm_off",
+           "an arm that replaces", "device.attr.set", off);
+    assert(g_replaces_id && std::strcmp(g_replaces_id, "night") == 0);   // the profile, not "armed_night"
+    g_replaces_id = nullptr;
+    assert(is(remote_target_refusal("device.attr.set", kAlarm, "night", "armed", &off), "alarm_off"));
+    assert(g_replaces_id && std::strcmp(g_replaces_id, "night") == 0);
+    assert(remote_target_refusal("device.attr.set", kAlarm, "alarm_state", "armed_night", &on) == nullptr);
+    assert(remote_target_refusal("device.attr.set", kAlarm, "night", "armed", &on) == nullptr);
+    g_replaces = false;
+    assert(remote_target_refusal("device.attr.set", kAlarm, "alarm_state", "armed_night", &off) == nullptr);
+    assert(remote_target_refusal("device.attr.set", kAlarm, "night", "armed", &off) == nullptr);
+}
+
+// rule.run (final review 2026-11-27, Minor 4 re-graded): the rule's stored text, read as a rule save is.
+static void ruleRunOnAlarmRefusedWhenOff() {
+    const remote_policy_t off = pol(D, false, false), on = pol(D, false, true);
+    g_rule7 = "ON Time#Cron=0 7 * * * DO zigbee.set Alarm alarm_state disarmed ENDON";
+    assert(is(remote_rule_run_refusal(7, &off), "alarm_off"));
+    assert(is(remote_rule_run_refusal(7, nullptr), "alarm_off"));
+    assert(remote_rule_run_refusal(7, &on) == nullptr);
+    assert(remote_rule_run_refusal(8, &off) == nullptr);   // not stored: the dispatcher's "rule not found"
+    g_rule7 = "ON lamp#state DO zigbee.toggle lamp state ENDON";
+    assert(remote_rule_run_refusal(7, &off) == nullptr);
+    // A text longer than the check's buffer cannot be read to its end: refused (rule_store keeps 500 bytes).
+    static char big[700];
+    std::memset(big, ' ', sizeof(big) - 1);
+    std::memcpy(big, "ON a#b DO log x", 15);
+    g_rule7 = big;
+    assert(is(remote_rule_run_refusal(7, &off), "alarm_off"));
+    g_rule7 = nullptr;
+}
+
+// R19: a rule save the relay passed that writes to the Alarm raises the owner's alert, and its `by` is an account id.
+static void ruleWritesAlarmAndAccountId() {
+    assert(remote_rule_writes_alarm("ON a#b DO zigbee.set Alarm alarm_state disarmed ENDON"));
+    assert(!remote_rule_writes_alarm("ON a#b DO zigbee.set lamp state ON ENDON"));
+    assert(!remote_rule_writes_alarm(nullptr));
+    g_alarm = 0;
+    assert(!remote_rule_writes_alarm("ON a#b DO zigbee.set Alarm alarm_state disarmed ENDON"));
+    g_alarm = kAlarm;
+    assert(remote_account_id_ok("3f2a6b1c-0000-4000-8000-00000000abcd"));
+    for (const char* by : {"", "owner\nAlarm: Armed", "3F2A", "3f2a 6b1c", "00000000000000000000000000000000000000001"})
+        assert(!remote_account_id_ok(by));
+    assert(!remote_account_id_ok(nullptr));
+}
+
 static void alarmOptionsRefusedWhenOff() {
     const remote_policy_t p = pol(F, true, false);
     for (const char* c : kDeviceWrites) {
@@ -224,6 +287,7 @@ static void ruleActionOnAlarmRefusedWhenOff() {
                  "ON lamp#state DO zigbee.set lamp state ON; zigbee.set   Alarm alarm_state disarmed ENDON",
                  "  ON  lamp#state DO zigbee.toggle Alarm night;ENDON",
                  "ON lamp#state DO zigbee.set 0x25A484143414C00ENDON",   // the action ends at ENDON, not past it
+                 "ON lamp#state DO publish z/devices/025a484143414C00/x/set disarmed ENDON",   // ha_bridge's /set
                  "ON lamp#state DO zigbee.set 0x00000000000000000000000000025A484143414C00 x y ENDON"}) {   // too long
             if (!is(remote_rule_refusal(c, dsl, &p), "alarm_off")) std::printf("not refused: %s\n", dsl);
             assert(is(remote_rule_refusal(c, dsl, &p), "alarm_off"));
@@ -327,11 +391,14 @@ int main() {
     localOnlyKeys();
     alarmDisarmRefusedWhenOff();
     alarmArmAllowedWhenOff();
+    alarmArmThatReplacesRefusedWhenOff();
     alarmOptionsRefusedWhenOff();
     alarmAnyWriteAllowedWhenOn();
     otherDevicesUnaffected();
     ruleActionOnAlarmRefusedWhenOff();
     ruleTriggerOnAlarmAllowed();
+    ruleRunOnAlarmRefusedWhenOff();
+    ruleWritesAlarmAndAccountId();
     unrelatedRuleAllowed();
     weakDefaultsAreViewAndAlarmOff();
     ieeeArgReadAsTheDispatcher();

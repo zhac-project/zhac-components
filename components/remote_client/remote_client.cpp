@@ -420,7 +420,15 @@ static void handle_rx_frame(const char* data, size_t len) {
         if (!kv.value().isNull() && remote_is_local_only_key(kv.key().c_str())) local_only_key = true;
     const remote_policy_t policy = {remote_level_now(), remote_scripts_allowed(), remote_alarm_allowed()};
     const char* refusal = remote_cmd_refusal(cmd, local_only_key, &policy);
-    if (!refusal) refusal = remote_rule_refusal(cmd, doc["args"]["dsl"] | (const char*)nullptr, &policy);   // LU-04, HL-02
+    const char* dsl = doc["args"]["dsl"] | (const char*)nullptr;
+    if (!refusal) refusal = remote_rule_refusal(cmd, dsl, &policy);   // LU-04, HL-02
+    // HL-02: rule.run does what the stored rule says; its id as cmd_rule_run reads it (final review 2026-11-27).
+    if (!refusal && std::strcmp(cmd, "rule.run") == 0)
+        refusal = remote_rule_run_refusal(doc["args"]["id"] | (uint16_t)0, &policy);
+    // R19: a rule save that writes to the Alarm (the switch is on, or it was refused above) is a change the owner
+    // hears of, as each direct write is.
+    bool alarm_write = (std::strcmp(cmd, "rule.create") == 0 || std::strcmp(cmd, "rule.update") == 0) &&
+                       remote_rule_writes_alarm(dsl);
     // HL-02 (ruling R19): a write to the Alarm device -- named by args.ieee, listed as a member of a group, or
     // reached through a group.cmd to a group that holds it -- needs the alarm switch, but for an arm. A command the
     // view level passes is a read. remote_ieee_arg reads an IEEE as the dispatcher does.
@@ -428,14 +436,13 @@ static void handle_rx_frame(const char* data, size_t len) {
     const bool group_cmd = std::strcmp(cmd, "group.cmd") == 0;
     const char* key   = doc["args"]["key"] | (const char*)nullptr;
     const char* value = doc["args"][group_cmd ? "val" : "value"] | (const char*)nullptr;
-    bool alarm_write = false;
     if (!refusal && alarm) {
         bool to_alarm = remote_ieee_arg(doc["args"]["ieee"] | (const char*)nullptr) == alarm;
         for (JsonVariantConst m : doc["args"]["members"].as<JsonArrayConst>())
             if (remote_ieee_arg(m["ieee"] | (const char*)nullptr) == alarm) to_alarm = true;
         if (group_cmd && !to_alarm) to_alarm = remote_group_has(doc["args"]["id"] | (uint16_t)0, alarm);
         const remote_policy_t view = {REMOTE_LEVEL_VIEW, false, false};
-        alarm_write = to_alarm && remote_cmd_refusal(cmd, false, &view) != nullptr;
+        if (to_alarm && remote_cmd_refusal(cmd, false, &view) != nullptr) alarm_write = true;
         if (to_alarm) refusal = remote_target_refusal(cmd, alarm, key, value, &policy);
     }
     if (refusal) {
@@ -469,7 +476,9 @@ static void handle_rx_frame(const char* data, size_t len) {
     if (alarm_write) {
         s_alarm_watch_task.store(nullptr, std::memory_order_relaxed);
         const bool attr = group_cmd || std::strcmp(cmd, "device.attr.set") == 0;
-        if (s_alarm_taken) remote_alarm_changed(attr ? key : cmd, attr ? value : nullptr, doc["args"]["by"] | "");
+        const char* by = doc["args"]["by"] | "";
+        if (s_alarm_taken)   // the owner's alert names who did it (final review 2026-11-27 Minor 3)
+            remote_alarm_changed(attr ? key : cmd, attr ? value : nullptr, remote_account_id_ok(by) ? by : "");
     }
     s_last_event_at.store((uint32_t)(esp_log_timestamp() / 1000));
 }
