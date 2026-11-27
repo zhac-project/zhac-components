@@ -422,13 +422,18 @@ static void handle_rx_frame(const char* data, size_t len) {
     const char* refusal = remote_cmd_refusal(cmd, local_only_key, &policy);
     const char* dsl = doc["args"]["dsl"] | (const char*)nullptr;
     if (!refusal) refusal = remote_rule_refusal(cmd, dsl, &policy);   // LU-04, HL-02
-    // HL-02: rule.run does what the stored rule says; its id as cmd_rule_run reads it (final review 2026-11-27).
-    if (!refusal && std::strcmp(cmd, "rule.run") == 0)
-        refusal = remote_rule_run_refusal(doc["args"]["id"] | (uint16_t)0, &policy);
-    // R19: a rule save that writes to the Alarm (the switch is on, or it was refused above) is a change the owner
-    // hears of, as each direct write is.
-    bool alarm_write = (std::strcmp(cmd, "rule.create") == 0 || std::strcmp(cmd, "rule.update") == 0) &&
-                       remote_rule_writes_alarm(dsl);
+    // HL-02: rule.run does what the stored rule says, and an enabled rule does it on its own trigger; the id and
+    // `enabled` as cmd_rule_run and cmd_rule_enable read them (final review and re-review 2026-11-27).
+    const bool rule_run = std::strcmp(cmd, "rule.run") == 0;
+    const bool rule_on = std::strcmp(cmd, "rule.enable") == 0 && (doc["args"]["enabled"] | false);
+    const uint16_t rule_id = doc["args"]["id"] | (uint16_t)0;
+    if (!refusal && rule_run) refusal = remote_rule_run_refusal(rule_id, &policy);
+    if (!refusal && rule_on) refusal = remote_rule_enable_refusal(rule_id, true, &policy);
+    // R19: a rule save, run or enabling that writes to the Alarm (the switch is on: refused above otherwise) is a
+    // change the owner hears of, as each direct write is.
+    bool alarm_write = !refusal &&
+        (((std::strcmp(cmd, "rule.create") == 0 || std::strcmp(cmd, "rule.update") == 0) && remote_rule_writes_alarm(dsl)) ||
+         ((rule_run || rule_on) && remote_stored_rule_writes_alarm(rule_id)));
     // HL-02 (ruling R19): a write to the Alarm device -- named by args.ieee, listed as a member of a group, or
     // reached through a group.cmd to a group that holds it -- needs the alarm switch, but for an arm. A command the
     // view level passes is a read. remote_ieee_arg reads an IEEE as the dispatcher does.

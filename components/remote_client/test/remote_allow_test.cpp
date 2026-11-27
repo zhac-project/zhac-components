@@ -213,6 +213,30 @@ static void ruleRunOnAlarmRefusedWhenOff() {
     g_rule7 = nullptr;
 }
 
+// rule.enable (re-review 2026-11-27): an enabled rule runs on its own trigger, so enabling one that writes to the
+// Alarm needs the switch; disabling never does.
+static void ruleEnableOnAlarmRefusedWhenOff() {
+    const remote_policy_t off = pol(F, false, false), on = pol(F, false, true);
+    g_rule7 = "ON Time#Cron=0 7 * * * DO zigbee.set Alarm alarm_state disarmed ENDON";
+    assert(is(remote_rule_enable_refusal(7, true, &off), "alarm_off"));
+    assert(remote_rule_enable_refusal(7, true, &on) == nullptr);
+    assert(remote_rule_enable_refusal(7, false, &off) == nullptr);   // disabling
+    assert(remote_rule_enable_refusal(8, true, &off) == nullptr);    // not stored: the dispatcher's "rule not found"
+    g_rule7 = "ON lamp#state DO zigbee.toggle lamp state ENDON";
+    assert(remote_rule_enable_refusal(7, true, &off) == nullptr);
+    g_rule7 = nullptr;
+}
+
+// R19 with the switch on: the relay raises the owner's alert for a rule.run (or an enabling rule.enable) it passed
+// when the stored rule writes to the Alarm, whatever the switch says.
+static void storedRuleWritesAlarmForTheAlert() {
+    g_rule7 = "ON Time#Cron=0 7 * * * DO zigbee.set Alarm alarm_state disarmed ENDON";
+    assert(remote_stored_rule_writes_alarm(7) && !remote_stored_rule_writes_alarm(8));
+    g_rule7 = "ON lamp#state DO zigbee.toggle lamp state ENDON";
+    assert(!remote_stored_rule_writes_alarm(7));
+    g_rule7 = nullptr;
+}
+
 // R19: a rule save the relay passed that writes to the Alarm raises the owner's alert, and its `by` is an account id.
 static void ruleWritesAlarmAndAccountId() {
     assert(remote_rule_writes_alarm("ON a#b DO zigbee.set Alarm alarm_state disarmed ENDON"));
@@ -398,6 +422,8 @@ int main() {
     ruleActionOnAlarmRefusedWhenOff();
     ruleTriggerOnAlarmAllowed();
     ruleRunOnAlarmRefusedWhenOff();
+    ruleEnableOnAlarmRefusedWhenOff();
+    storedRuleWritesAlarmForTheAlert();
     ruleWritesAlarmAndAccountId();
     unrelatedRuleAllowed();
     weakDefaultsAreViewAndAlarmOff();

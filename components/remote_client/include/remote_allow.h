@@ -32,9 +32,10 @@ const char* remote_cmd_refusal(const char* cmd, bool local_only_key, const remot
 // The relay's answer to a rule save (rule.create / rule.update) whose text is `dsl`, asked once remote_cmd_refusal
 // passed: "scripts_off" when the text runs a stored script (a `script.run` action) while the script switch is off --
 // the cloud may not run Lua on the hub by way of a new rule either (review 2026-10-24 LU-04); "alarm_off" when an
-// action writes to the Alarm device (a zigbee.* action naming it by its IEEE or its name) while the alarm switch is
-// off (HL-02); else nullptr. A trigger or condition that reads the Alarm device passes. Rules already on the hub keep
-// running, rule.run included. A null `p` counts as both switches off.
+// action writes to the Alarm device (a zigbee.* action naming it by its IEEE or its name, or a publish to its MQTT
+// command topic) while the alarm switch is off (HL-02); else nullptr. A trigger or condition that reads the Alarm
+// device passes. A rule already on the hub keeps running on its own triggers; rule.run and an enabling rule.enable
+// of one are remote_rule_run_refusal's and remote_rule_enable_refusal's. A null `p` counts as both switches off.
 const char* remote_rule_refusal(const char* cmd, const char* dsl, const remote_policy_t* p);
 
 // The relay's answer to a command aimed at device `ieee` (its args.ieee, a member it lists, a group that holds it):
@@ -51,6 +52,12 @@ const char* remote_target_refusal(const char* cmd, uint64_t ieee, const char* ke
 // rule's stored text (remote_rule_text) writes to the Alarm device, read as a rule save is; nullptr otherwise, and
 // for a rule that is not stored, so the dispatcher answers as before. A null `p` counts as the switch off.
 const char* remote_rule_run_refusal(uint16_t id, const remote_policy_t* p);
+// rule.enable of stored rule `id` (re-review 2026-11-27): when `enabling` (its args.enabled, read as cmd_rule_enable
+// reads it), remote_rule_run_refusal's answer, since the rule then runs on its own trigger; nullptr for a disabling.
+const char* remote_rule_enable_refusal(uint16_t id, bool enabling, const remote_policy_t* p);
+// True when stored rule `id` writes to the Alarm device (or its text is too long to read to its end), whatever the
+// switches say: the relay raises the owner's alert for such a rule.run or enabling rule.enable it passed (R19).
+bool remote_stored_rule_writes_alarm(uint16_t id);
 
 // True when rule text `dsl` writes to the Alarm device (remote_alarm_ieee(), non-zero), read as remote_rule_refusal
 // reads it. The relay raises the owner's alert for such a save it passed (R19).

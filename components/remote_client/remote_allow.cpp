@@ -283,13 +283,20 @@ extern "C" bool remote_rule_writes_alarm(const char* dsl) {
     return alarm && dsl && rule_writes_alarm(dsl, alarm);
 }
 
-extern "C" const char* remote_rule_run_refusal(uint16_t id, const remote_policy_t* p) {
-    if ((p && p->alarm_on) || !remote_alarm_ieee()) return nullptr;
+extern "C" bool remote_stored_rule_writes_alarm(uint16_t id) {
+    if (!remote_alarm_ieee()) return false;
     char dsl[512];   // rule_store keeps 500 bytes of text (zap_common.h RuleSlot)
     const size_t n = remote_rule_text(id, dsl, sizeof(dsl));
-    if (n == 0) return nullptr;
-    // A text cut short has no ENDON for the check to find: it cannot tell, so it refuses.
-    return n >= sizeof(dsl) || remote_rule_writes_alarm(dsl) ? "alarm_off" : nullptr;
+    // A text cut short has no ENDON for the check to find: it cannot tell, so it counts as a write.
+    return n > 0 && (n >= sizeof(dsl) || remote_rule_writes_alarm(dsl));
+}
+
+extern "C" const char* remote_rule_run_refusal(uint16_t id, const remote_policy_t* p) {
+    return !(p && p->alarm_on) && remote_stored_rule_writes_alarm(id) ? "alarm_off" : nullptr;
+}
+
+extern "C" const char* remote_rule_enable_refusal(uint16_t id, bool enabling, const remote_policy_t* p) {
+    return enabling ? remote_rule_run_refusal(id, p) : nullptr;
 }
 
 extern "C" bool remote_account_id_ok(const char* by) { return account_id_ok(by); }
