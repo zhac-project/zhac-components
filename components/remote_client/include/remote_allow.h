@@ -80,8 +80,13 @@ bool remote_group_has(uint16_t id, uint64_t ieee);
 // sent, unchecked. Weak default: nothing; zhac-wired-core raises a hub alert.
 void remote_alarm_changed(const char* key, const char* value, const char* by);
 
-// True iff the event name should be mirrored to the remote sink.
+// True iff the event name should be mirrored to the remote sink now: remote_event_allowed_at(name,
+// remote_level_now()), read for every event, so a level change applies to the next one.
 bool remote_event_allowed(const char* name);
+// The same at `level`: a listed event, and for script.added / script.updated / script.error the full level, as
+// script.list needs (HL-03, R18): they carry its size, fingerprint and mtime, or Lua's error text, which can quote
+// anything a script holds. script.deleted carries the name only. A level outside the enum counts as view.
+bool remote_event_allowed_at(const char* name, remote_level_t level);
 
 // True iff the event waits in the send queue while the link is down (sent once it is READY): an
 // `alert`, the alarm panel's notification. Every other event is dropped then, because the next

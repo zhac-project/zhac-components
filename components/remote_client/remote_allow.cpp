@@ -129,6 +129,10 @@ constexpr const char* kRemoteAllowedEvents[] = {
     "log.batch", "log.tail",
 };
 
+// Of those, the ones only the full level gets, as script.list needs it (HL-03, R18): the script mirror's size,
+// fingerprint and mtime, and Lua's error text, which can quote anything a script holds.
+constexpr const char* kFullEvents[] = { "script.added", "script.updated", "script.error" };
+
 // settings.set keys only the hub's own page may change (the relay answers local_only): the level and the two
 // switches that set what the cloud may do (HL-03, HL-02), and whether the hub's log goes to it.
 constexpr const char* kRemoteLocalOnlyKeys[] = { "remote_scripts", "log_to_cloud", "remote_level", "remote_alarm" };
@@ -285,9 +289,12 @@ extern "C" bool remote_cmd_allowed(const char* cmd) {
     return remote_cmd_refusal(cmd, false, &p) == nullptr;
 }
 
-extern "C" bool remote_event_allowed(const char* name) {
-    return name && *name && listed(kRemoteAllowedEvents, name);
+extern "C" bool remote_event_allowed_at(const char* name, remote_level_t level) {
+    return name && *name && listed(kRemoteAllowedEvents, name) &&
+           (level == REMOTE_LEVEL_FULL || !listed(kFullEvents, name));
 }
+
+extern "C" bool remote_event_allowed(const char* name) { return remote_event_allowed_at(name, remote_level_now()); }
 
 extern "C" bool remote_event_held_offline(const char* name) {
     return name && std::strcmp(name, "alert") == 0;

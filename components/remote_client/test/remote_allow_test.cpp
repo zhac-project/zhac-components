@@ -293,6 +293,33 @@ static void ieeeArgReadAsTheDispatcher() {
     assert(remote_ieee_arg("zz") == 0);
 }
 
+// The hub's pushes to the cloud: device.* / rule.* / group.* / alert, the single-chip names, the script switch's
+// hub.caps and the cloud logs go at every level. The script mirror's events that carry what only script.list shows
+// (size, fingerprint, mtime) or Lua's error text need full, as script.list does (R18); script.deleted has the name only.
+static void eventsByLevel() {
+    for (const char* e : {"device.added", "device.attribute_change", "rule.fired", "group.changed", "alert",
+                          "attr.changed", "attr.bulk", "rule.updated", "rule.deleted", "group.updated",
+                          "group.deleted", "script.deleted", "hub.caps", "log.batch", "log.tail"}) {
+        for (remote_level_t l : {V, D, F}) assert(remote_event_allowed_at(e, l));
+        assert(remote_event_allowed(e));   // at the weak default level, view
+    }
+    for (const char* e : {"script.added", "script.updated", "script.error"}) {
+        assert(remote_event_allowed_at(e, F));
+        assert(!remote_event_allowed_at(e, D));
+        assert(!remote_event_allowed_at(e, V));
+        assert(!remote_event_allowed_at(e, static_cast<remote_level_t>(7)));   // outside the enum: view
+        assert(!remote_event_allowed(e));
+    }
+    // log / wifi / mqtt / bulk events stay LAN-only at every level; unknown ones too.
+    for (const char* e : {"log.line", "log.level", "wifi.connected", "mqtt.connected", "bulk.state", "", "nonsense",
+                          "script.added.x"}) {
+        for (remote_level_t l : {V, D, F}) assert(!remote_event_allowed_at(e, l));
+        assert(!remote_event_allowed(e));
+    }
+    assert(!remote_event_allowed_at(nullptr, F));
+    assert(!remote_event_allowed(nullptr));
+}
+
 int main() {
     levelTable();
     scriptSwitchAtFull();
@@ -308,18 +335,7 @@ int main() {
     unrelatedRuleAllowed();
     weakDefaultsAreViewAndAlarmOff();
     ieeeArgReadAsTheDispatcher();
-
-    // Events: device.* / rule.* / group.* / alert, the single-chip names, and remote editing's.
-    for (const char* e : {"device.added", "device.attribute_change", "rule.fired", "group.changed", "alert",
-                          "attr.changed", "attr.bulk", "rule.updated", "rule.deleted", "group.updated",
-                          "group.deleted", "script.added", "script.updated", "script.deleted",
-                          "script.error", "hub.caps"}) {
-        assert(remote_event_allowed(e));
-    }
-    // log / wifi / mqtt / bulk events stay LAN-only; unknown ones too.
-    for (const char* e : {"log.line", "log.level", "wifi.connected", "mqtt.connected", "bulk.state", "", "nonsense"}) {
-        assert(!remote_event_allowed(e));
-    }
+    eventsByLevel();
 
     // An alert (the alarm panel's) waits for the link; every other event is superseded by the next
     // reconnect's bootstrap and is dropped while the link is down.
@@ -363,10 +379,6 @@ int main() {
     for (const char* c : {"rule.list", "rule.check", "script.read", "script.check", "script.part", "status.get"}) {
         assert(!remote_change_log_line(c, "00000000-0000-4000-8000-000000000001", -1, "", line, sizeof line));
     }
-
-    // Cloud logs (spec 2026-10-06 §4.1, §4.3): the batches and the restart tail reach the cloud.
-    assert(remote_event_allowed("log.batch"));
-    assert(remote_event_allowed("log.tail"));
 
     printf("remote_allow_tests: ok\n");
     return 0;
