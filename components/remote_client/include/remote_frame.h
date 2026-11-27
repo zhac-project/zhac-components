@@ -2,20 +2,40 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 //
-// The cloud link takes whole frames only (review 2026-11-26 HL-01). Pure, host-tested in
+// The cloud link parses whole frames only (review 2026-11-26 HL-01). Pure, host-tested in
 // test/remote_frame_test.cpp.
 
 #include <cstddef>
 #include <cstdint>
 
-enum RemoteFrameVerdict { RF_ACCEPT, RF_DROP, RF_DROP_TOO_LARGE };
+// One text frame put back together from the pieces esp_websocket_client hands over as WEBSOCKET_EVENT_DATA when
+// the frame does not come in one read: each piece carries the frame's opcode, fin and payload_len, and its own
+// payload_offset. alloc/release: PSRAM on the hub, malloc in the host tests.
+struct RemoteFrameAsm {
+    void* (*alloc)(size_t);
+    void  (*release)(void*);
+    char* buf  = nullptr;   // payload_len + 1 bytes while a frame is put together
+    int   len  = 0;         // that frame's payload_len
+    int   held = 0;         // its bytes so far
+};
 
-// The receive handler's verdict on one WEBSOCKET_EVENT_DATA piece. RF_ACCEPT: the piece is a whole text frame
-// (op_code 0x01, fin, payload_offset 0, data_len == payload_len, 1 to 8,192 bytes). RF_DROP_TOO_LARGE: the
-// first piece of a text frame that is not whole (longer than the 8 KB buffer, fragmented, or split across
-// reads); the handler reports it once. RF_DROP: every other piece (a later piece, a continuation frame,
-// binary, control, empty), never reported.
-RemoteFrameVerdict remote_frame_verdict(uint8_t op_code, int data_len, int payload_len, int payload_offset, bool fin);
+// What one piece gave.
+struct RemoteFrameStep {
+    char*  frame     = nullptr;   // a whole frame, NUL-terminated, `len` bytes; the caller now owns it (release)
+    size_t len       = 0;
+    bool   too_large = false;     // a text frame over 8,192 bytes, or the first of a message in several frames
+    bool   broken    = false;     // a frame being put together was dropped before it was whole
+};
+
+// Feeds one piece. A piece at payload_offset 0 starts a frame, after dropping one not yet whole; a text frame
+// (op_code 0x01), final, 1 to 8,192 bytes long, is put together. Each next piece must carry the same opcode, fin
+// and payload_len, at the offset of the bytes held so far; anything else drops the frame. Binary and control
+// frames, continuation frames (op_code 0x00) and empty frames are never taken.
+RemoteFrameStep remote_frame_feed(RemoteFrameAsm& a, uint8_t op_code, const char* data, int data_len,
+                                  int payload_len, int payload_offset, bool fin);
+
+// Drops a frame being put together (the link connected, closed or failed). True when there was one.
+bool remote_frame_reset(RemoteFrameAsm& a);
 
 // True when only JSON whitespace (space, tab, CR, LF) follows the parsed value in buf[parsed_end, len).
 bool remote_json_only_trailing_space(const char* buf, size_t len, size_t parsed_end);
