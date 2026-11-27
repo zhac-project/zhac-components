@@ -61,3 +61,12 @@ add_test(NAME remote_xfer COMMAND remote_xfer_tests)
 add_executable(utf8_guard_tests utf8_guard_test.cpp)
 target_include_directories(utf8_guard_tests PRIVATE ../include ${WS_SERVER_INC})
 add_test(NAME utf8_guard COMMAND utf8_guard_tests)
+
+# Whole cloud frames only, nothing after the JSON value (review 2026-11-26 HL-01); the parse runs on the
+# header-only ArduinoJson, as in handle_rx_frame.
+add_executable(remote_frame_tests
+    remote_frame_test.cpp
+    ../remote_frame.cpp
+)
+target_include_directories(remote_frame_tests PRIVATE ../include ${CMAKE_CURRENT_SOURCE_DIR}/../../arduinojson/src)
+add_test(NAME remote_frame COMMAND remote_frame_tests)

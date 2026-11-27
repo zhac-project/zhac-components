@@ -16,6 +16,7 @@
 #include "remote_state.h"
 #include "remote_allow.h"
 #include "remote_backoff.h"
+#include "remote_frame.h"
 #include "remote_nvs.h"
 #include "utf8_seq.h"   // utf8_valid / utf8_scrub: the send guard (the header lives in ws_server)
 #include "sdkconfig.h"
@@ -229,28 +230,33 @@ static void ws_event_handler(void* /*arg*/, esp_event_base_t /*base*/,
             xEventGroupSetBits(s_remote_evt, EVB_WSS_EVENT);
             break;
         case WEBSOCKET_EVENT_DATA:
-            // INBOUND FRAME CONTRACT (FINDINGS §5, :199) — 8 KB single-frame cap.
+            // INBOUND FRAME CONTRACT (FINDINGS §5, :199; review 2026-11-26 HL-01) — whole text frames, 8 KB cap.
             //
-            // This handler dispatches ONLY complete, single text frames:
-            //   - op_code 0x01 (text). Binary (0x02) and, deliberately,
-            //     fragmentation continuation frames (op_code 0x00 with a
-            //     non-zero payload_offset) are dropped — reassembly across
-            //     CONTINUATION frames is NOT implemented in this batch.
-            //   - data_len in (0, 8192]. The esp_websocket_client buffer_size
-            //     is fixed at 8 KB (see start_ws_client) and the outbound
-            //     publish_event envelope shares the same 8 KB cap, so both
-            //     directions agree on the bound.
+            // esp_websocket_client hands a frame longer than its 8 KB buffer (start_ws_client) over as several
+            // DATA events, each with the frame's opcode and a growing payload_offset, and a short read splits a
+            // smaller frame the same way. Each piece used to be parsed as a frame of its own (HL-01), so text
+            // inside one long command could run as another. remote_frame_verdict() queues a piece only when it
+            // is the whole frame: op_code 0x01 (text), fin, payload_offset 0, data_len == payload_len, at most
+            // 8,192 bytes (the outbound publish_event envelope has the same cap). No other piece is ever parsed:
+            // binary and control frames, continuation frames (op_code 0x00; no reassembly), and every piece of
+            // a frame that did not come whole.
             //
-            // CONTRACT for the cloud: every device-bound message MUST fit in a
-            // single ≤ 8 KB text frame. Larger or fragmented payloads are
-            // silently discarded here and will never reach dispatch — the
-            // device-sync protocol must page/chunk to stay under the cap
-            // (cross-ref: project_hub_cloud_devicesync — remote device.list /
-            // events; the reconcile relist must not emit a >8 KB frame). If a
-            // future protocol revision needs larger frames, raise buffer_size
-            // AND implement continuation reassembly here together.
-            if (d->op_code != 0x01) break;
-            if (d->data_len == 0 || d->data_len > 8192) break;
+            // CONTRACT for the cloud: every device-bound message MUST fit in a single ≤ 8 KB text frame. A
+            // frame that does not come whole is dropped whole, and its first piece leaves one too_large
+            // warning (below). The device-sync protocol must page/chunk to stay under the cap (cross-ref:
+            // project_hub_cloud_devicesync — remote device.list / events; the reconcile relist must not emit
+            // a >8 KB frame). If a future protocol revision needs larger frames, raise buffer_size AND
+            // implement reassembly here together.
+            if (const RemoteFrameVerdict v = remote_frame_verdict(d->op_code, d->data_len, d->payload_len,
+                                                                  d->payload_offset, d->fin); v != RF_ACCEPT) {
+                // R20: one line per such frame, with no id (the frame was never parsed). "cloud" is not one of
+                // the link's own log tags, so the line reaches the cloud in log.batch when Log to cloud takes
+                // warnings; it always lands in the hub's log.
+                if (v == RF_DROP_TOO_LARGE)
+                    ESP_LOGW("cloud", "too_large: dropped a frame that did not come whole (%d of %d bytes, fin %d)",
+                             d->data_len, d->payload_len, d->fin);
+                break;
+            }
             {
                 char* copy = (char*)heap_caps_malloc(d->data_len + 1,
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -338,7 +344,11 @@ extern "C" void remote_client_send_reply(const char* json, size_t len) {
 static void handle_rx_frame(const char* data, size_t len) {
     // Allocate the parser doc in PSRAM (8 KB).
     JsonDocument doc;
-    auto err = deserializeJson(doc, data, len);
+    RemoteJsonReader in{data, len};
+    auto err = deserializeJson(doc, in);
+    // HL-01: ArduinoJson takes the first value and ignores what follows it; anything but whitespace after the
+    // value refuses the frame.
+    if (!err && !remote_json_only_trailing_space(data, len, in.pos)) err = DeserializationError::InvalidInput;
     if (err) {
         ESP_LOGW(TAG, "rx parse err: %s", err.c_str());
         return;
